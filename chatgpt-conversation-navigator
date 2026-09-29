@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://chatgpt.com/
-// @version      0.1.0
-// @description  在 ChatGPT 右侧显示长对话导航条；悬停预览用户消息和 ChatGPT 回复，点击跳转。
+// @version      0.2.0
+// @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
 // @author       YW
 // @match        https://chatgpt.com/*
 // @grant        none
@@ -15,6 +15,13 @@
     const RAIL_ID = 'yw-chatgpt-turn-rail';
     const PREVIEW_ID = 'yw-chatgpt-turn-preview';
     const STYLE_ID = 'yw-chatgpt-turn-nav-style';
+    const ASSISTANT_UNIT_SELECTOR =
+        '[data-content-search-unit-key$=":assistant"], ' +
+        '[data-chatgpt-search-unit-key*="assistant"]';
+    const TURN_NODE_SELECTOR =
+        '[data-turn-key], [data-content-search-turn-key], ' +
+        '[data-user-message-bubble="true"], ' +
+        ASSISTANT_UNIT_SELECTOR + ', h4[data-conversation-role="assistant"]';
 
     let rail = null;
     let preview = null;
@@ -28,6 +35,15 @@
     let rebuildTimer = null;
     let activeRAF = null;
     let hideTimer = null;
+
+    let currentChatIdentity = null;
+    let turnIdentitiesByChat = new Map();
+    let chatOwnersByTurnIdentity = new Map();
+    let newConversationSubmissionPending = false;
+    let newConversationSubmissionTimer = null;
+    let extendedScrollRange = null;
+    let assistantLabelRefreshTimer = null;
+    let pendingAssistantLabelUnits = new Map();
 
     /******************************************************************
      * CSS
@@ -254,6 +270,14 @@
                 overflow: hidden;
             }
 
+            #${PREVIEW_ID}.yw-assistant-only .yw-preview-user {
+                display: none;
+            }
+
+            #${PREVIEW_ID}.yw-assistant-only .yw-preview-assistant {
+                margin-top: 0;
+            }
+
             /* 小屏幕稍微靠边一点 */
             @media (max-width: 800px) {
                 #${RAIL_ID} {
@@ -313,7 +337,245 @@
 
 
     /******************************************************************
-     * 找到 ChatGPT 中的所有用户消息
+     * 跟踪 SPA 中当前对话
+     ******************************************************************/
+
+    function getChatIdentity() {
+        const pathname = window.location.pathname || '/';
+        const conversation = pathname.match(/(?:^|\/)c\/([^/]+)/);
+
+        return conversation
+            ? `conversation:${conversation[1]}`
+            : `route:${pathname}`;
+    }
+
+    function rememberTurnIdentity(chatIdentity, turnIdentity) {
+        if (!chatIdentity || !turnIdentity) return;
+
+        if (!turnIdentitiesByChat.has(chatIdentity)) {
+            turnIdentitiesByChat.set(chatIdentity, new Set());
+        }
+        turnIdentitiesByChat.get(chatIdentity).add(turnIdentity);
+
+        if (!chatOwnersByTurnIdentity.has(turnIdentity)) {
+            chatOwnersByTurnIdentity.set(turnIdentity, new Set());
+        }
+        chatOwnersByTurnIdentity.get(turnIdentity).add(chatIdentity);
+    }
+
+    function turnBelongsToAnotherChat(turnIdentity, chatIdentity) {
+        const owners = chatOwnersByTurnIdentity.get(turnIdentity);
+
+        return Boolean(owners?.size && !owners.has(chatIdentity));
+    }
+
+    function trackCurrentRouteTurn(turn) {
+        if (
+            turnBelongsToAnotherChat(turn.identity, currentChatIdentity)
+        ) {
+            return false;
+        }
+
+        rememberTurnIdentity(currentChatIdentity, turn.identity);
+
+        if (turn.kind === 'user' && turn.root?.querySelectorAll) {
+            for (const assistantUnit of turn.root.querySelectorAll(
+                ASSISTANT_UNIT_SELECTOR
+            )) {
+                const unitIdentity = getAssistantUnitIdentity(assistantUnit);
+                if (!unitIdentity) continue;
+
+                const assistantIdentity = `assistant:${unitIdentity}`;
+                if (
+                    turnIdentitiesByChat.get(currentChatIdentity)?.has(assistantIdentity) ||
+                    turnBelongsToAnotherChat(assistantIdentity, currentChatIdentity)
+                ) {
+                    continue;
+                }
+
+                rememberTurnIdentity(currentChatIdentity, assistantIdentity);
+            }
+        }
+
+        return true;
+    }
+
+    function transferChatTurnIdentities(fromIdentity, toIdentity) {
+        const turnIdentities = turnIdentitiesByChat.get(fromIdentity);
+        if (!turnIdentities) return;
+
+        for (const turnIdentity of turnIdentities) {
+            rememberTurnIdentity(toIdentity, turnIdentity);
+        }
+    }
+
+    function clearNavigation() {
+        clearExtendedScrollRange();
+
+        turns = [];
+        turnSignature = '';
+        activeIndex = -1;
+
+        if (activeRAF !== null) {
+            cancelAnimationFrame(activeRAF);
+            activeRAF = null;
+        }
+
+        if (rail) {
+            rail.replaceChildren();
+            rail.style.display = 'none';
+            rail.scrollTop = 0;
+        }
+
+        if (preview) {
+            preview.classList.remove('yw-visible');
+        }
+
+        if (previewUser) previewUser.textContent = '';
+        if (previewAssistant) previewAssistant.textContent = '';
+    }
+
+    function handleRouteChange() {
+        const identity = getChatIdentity();
+
+        if (currentChatIdentity === null) {
+            currentChatIdentity = identity;
+            return;
+        }
+
+        if (identity === currentChatIdentity) return;
+
+        /* 根页刚提交 composer 后生成的 /c/<id> 才保留当前新对话。 */
+        if (
+            newConversationSubmissionPending &&
+            isConversationUrlPromotion(currentChatIdentity, identity)
+        ) {
+            transferChatTurnIdentities(currentChatIdentity, identity);
+            currentChatIdentity = identity;
+            clearNewConversationSubmission();
+            return;
+        }
+
+        clearNewConversationSubmission();
+        currentChatIdentity = identity;
+
+        if (rebuildTimer !== null) {
+            clearTimeout(rebuildTimer);
+            rebuildTimer = null;
+        }
+
+        clearNavigation();
+    }
+
+    function isConversationUrlPromotion(previousIdentity, identity) {
+        if (
+            !previousIdentity?.startsWith('route:') ||
+            !identity?.startsWith('conversation:')
+        ) {
+            return false;
+        }
+
+        const match = window.location.pathname.match(/^(.*)\/c\/[^/]+\/?$/);
+        if (!match) return false;
+
+        const previousPath = previousIdentity
+            .slice('route:'.length)
+            .replace(/\/$/, '');
+        const conversationBase = match[1].replace(/\/$/, '');
+
+        return previousPath === conversationBase;
+    }
+
+    function clearNewConversationSubmission() {
+        newConversationSubmissionPending = false;
+
+        if (newConversationSubmissionTimer !== null) {
+            clearTimeout(newConversationSubmissionTimer);
+            newConversationSubmissionTimer = null;
+        }
+    }
+
+    function markNewConversationSubmissionPending() {
+        if (!currentChatIdentity?.startsWith('route:')) return;
+
+        clearNewConversationSubmission();
+        newConversationSubmissionPending = true;
+        newConversationSubmissionTimer = setTimeout(() => {
+            newConversationSubmissionPending = false;
+            newConversationSubmissionTimer = null;
+        }, 10000);
+    }
+
+    function observeNewConversationSubmissions() {
+        document.addEventListener('submit', event => {
+            if (!currentChatIdentity?.startsWith('route:')) return;
+
+            const form = event.target;
+
+            if (
+                !(form instanceof Element) ||
+                !form.matches('form') ||
+                !form.querySelector(
+                    '#prompt-textarea, [data-testid="prompt-textarea"], ' +
+                    '[data-testid="composer-text-input"], [contenteditable="true"]'
+                )
+            ) {
+                return;
+            }
+
+            markNewConversationSubmissionPending();
+        }, true);
+
+        document.addEventListener('click', event => {
+            const target = event.target;
+
+            if (!(target instanceof Element)) return;
+
+            if (target.closest(
+                '[data-testid="send-button"], ' +
+                'button[aria-label*="Send"], button[aria-label*="发送"]'
+            )) {
+                markNewConversationSubmissionPending();
+            } else if (
+                newConversationSubmissionPending &&
+                target.closest('a[href]')
+            ) {
+                clearNewConversationSubmission();
+            }
+        }, true);
+    }
+
+    function observeRouteChanges() {
+        for (const method of ['pushState', 'replaceState']) {
+            const original = history[method];
+
+            if (original.__ywConversationNavigatorWrapped) continue;
+
+            const wrapped = function (...args) {
+                const result = original.apply(this, args);
+                handleRouteChange();
+                return result;
+            };
+
+            Object.defineProperty(
+                wrapped,
+                '__ywConversationNavigatorWrapped',
+                { value: true }
+            );
+
+            history[method] = wrapped;
+        }
+
+        window.addEventListener('popstate', () => {
+            clearNewConversationSubmission();
+            handleRouteChange();
+        });
+        window.addEventListener('hashchange', handleRouteChange);
+    }
+
+
+    /******************************************************************
+     * 找到 ChatGPT 中可导航的消息
      ******************************************************************/
 
     function collectTurns() {
@@ -324,42 +586,83 @@
         const result = [];
         const seen = new Set();
 
-        for (const bubble of bubbles) {
-            /*
-             * 当前 ChatGPT DOM 中，
-             * 用户消息 + assistant 回复共同位于 data-turn-key wrapper。
-             */
-            let root = bubble.closest('[data-turn-key]');
+        if (bubbles.length > 0) {
+            for (const bubble of bubbles) {
+                /* 用户消息与 assistant 回复共用 turn wrapper。 */
+                const root = bubble.closest('[data-turn-key]') ||
+                    bubble.closest('[data-content-search-turn-key]');
+                if (!root) continue;
 
-            /*
-             * 为将来页面结构小改动留一个 fallback。
-             */
-            if (!root) {
-                root = bubble.closest('[data-content-search-turn-key]');
+                const key =
+                    root.getAttribute('data-turn-key') ||
+                    root.getAttribute('data-content-search-turn-key') ||
+                    bubble.getAttribute('data-chatgpt-search-message-ids') ||
+                    `turn-${result.length}`;
+                const stableIdentity =
+                    root.getAttribute('data-turn-key') ||
+                    root.getAttribute('data-content-search-turn-key') ||
+                    bubble.getAttribute('data-chatgpt-search-message-ids');
+                const identity = stableIdentity ||
+                    `${key}:${normalizeText(bubble.innerText || bubble.textContent || '')}`;
+
+                /* 嵌套的 outer / content-search wrapper 同 key 时只保留一轮。 */
+                if (seen.has(key)) continue;
+                seen.add(key);
+
+                result.push({
+                    key,
+                    identity,
+                    root,
+                    userBubble: bubble,
+                    kind: 'user'
+                });
             }
 
-            if (!root) continue;
+            if (result.some(turn =>
+                !turnBelongsToAnotherChat(turn.identity, currentChatIdentity)
+            )) {
+                return result;
+            }
 
-            const key =
-                root.getAttribute('data-turn-key') ||
-                root.getAttribute('data-content-search-turn-key') ||
-                bubble.getAttribute('data-chatgpt-search-message-ids') ||
-                `turn-${result.length}`;
+            /* 这些用户气泡都属于 outgoing chat，继续扫描当前 chat 的 assistant units。 */
+            result.length = 0;
+            seen.clear();
+        }
 
-            /*
-             * 防止某些 DOM 情况下同一轮被重复找到。
-             */
+        /* 没有任何用户消息时，以每个 assistant unit 作为独立导航项。 */
+        const assistantUnits = document.querySelectorAll(
+            ASSISTANT_UNIT_SELECTOR
+        );
+
+        for (const assistantUnit of assistantUnits) {
+            const unitIdentity = getAssistantUnitIdentity(assistantUnit);
+            if (!unitIdentity) continue;
+
+            const key = `assistant:${unitIdentity}`;
             if (seen.has(key)) continue;
             seen.add(key);
 
+            const messageTarget = assistantUnit.querySelector(
+                '[data-chatgpt-selection-message-id]'
+            ) || assistantUnit;
+
             result.push({
                 key,
-                root,
-                userBubble: bubble
+                identity: key,
+                root: messageTarget,
+                assistantUnit,
+                userBubble: null,
+                kind: 'assistant'
             });
         }
 
         return result;
+    }
+
+    function getAssistantUnitIdentity(assistantUnit) {
+        return assistantUnit.getAttribute('data-content-search-unit-key') ||
+            assistantUnit.getAttribute('data-chatgpt-search-unit-key') ||
+            '';
     }
 
 
@@ -397,13 +700,14 @@
     }
 
     function getAssistantText(turn) {
-        if (!turn?.root) return '';
+        const contentRoot = turn?.assistantUnit || turn?.root;
+        if (!contentRoot) return '';
 
         /*
          * 第一优先级：
          * ChatGPT 当前用于最终回复 Markdown 的语义属性。
          */
-        const markdownBlocks = turn.root.querySelectorAll(
+        const markdownBlocks = contentRoot.querySelectorAll(
             '[data-markdown-text-style="assistant-message"]'
         );
 
@@ -422,14 +726,17 @@
          * fallback：
          * 找 assistant unit。
          */
-        const assistantUnit = turn.root.querySelector(
-            '[data-chatgpt-search-unit-key*=":assistant"]'
-        );
+        const assistantUnit = contentRoot.matches?.(ASSISTANT_UNIT_SELECTOR)
+            ? contentRoot
+            : contentRoot.querySelector(ASSISTANT_UNIT_SELECTOR);
 
         if (assistantUnit) {
+            const messageContent = assistantUnit.querySelector(
+                '[data-chatgpt-selection-message-id]'
+            ) || assistantUnit;
             let text =
-                assistantUnit.innerText ||
-                assistantUnit.textContent ||
+                messageContent.innerText ||
+                messageContent.textContent ||
                 '';
 
             text = text.replace(
@@ -443,6 +750,19 @@
         return '';
     }
 
+    function getTurnBarLabel(turn, index) {
+        const isAssistant = turn.kind === 'assistant';
+        const text = isAssistant
+            ? getAssistantText(turn)
+            : getUserText(turn);
+        const label = shorten(text.replace(/\n/g, ' '), 42);
+        const description = isAssistant
+            ? `第 ${index + 1} 条 ChatGPT 回复`
+            : `第 ${index + 1} 轮对话`;
+
+        return `${description}${label ? `：${label}` : ''}`;
+    }
+
 
     /******************************************************************
      * Hover Preview
@@ -454,10 +774,13 @@
         const turn = turns[index];
         if (!turn) return;
 
+        const assistantOnly = turn.kind === 'assistant';
         let userText = getUserText(turn);
         let assistantText = getAssistantText(turn);
 
-        if (!userText) {
+        preview.classList.toggle('yw-assistant-only', assistantOnly);
+
+        if (!assistantOnly && !userText) {
             userText = '（用户消息尚未加载）';
         }
 
@@ -518,16 +841,231 @@
      * 点击：滚动到相应 turn
      ******************************************************************/
 
+    function clearExtendedScrollRange() {
+        if (!extendedScrollRange) return;
+
+        const {
+            container,
+            originalValue,
+            originalPriority,
+            appliedValue
+        } = extendedScrollRange;
+        const currentValue = container.style.getPropertyValue('padding-bottom');
+        const currentPriority = container.style.getPropertyPriority('padding-bottom');
+
+        if (
+            currentValue === appliedValue &&
+            currentPriority === 'important'
+        ) {
+            if (originalValue) {
+                container.style.setProperty(
+                    'padding-bottom',
+                    originalValue,
+                    originalPriority
+                );
+            } else {
+                container.style.removeProperty('padding-bottom');
+            }
+        }
+
+        extendedScrollRange = null;
+    }
+
+    function extendScrollRangeTo(container, desiredTop) {
+        const maxScrollTop = Math.max(
+            0,
+            container.scrollHeight - container.clientHeight
+        );
+
+        if (desiredTop <= maxScrollTop) return maxScrollTop;
+
+        /* 末尾消息的滚动范围不足时，临时增加底部 padding 以允许顶部对齐。 */
+        const originalValue = container.style.getPropertyValue('padding-bottom');
+        const originalPriority = container.style.getPropertyPriority('padding-bottom');
+        const computedPadding = parseFloat(
+            window.getComputedStyle(container).paddingBottom
+        ) || 0;
+        let appliedPadding = computedPadding + desiredTop - maxScrollTop + 2;
+
+        container.style.setProperty(
+            'padding-bottom',
+            `${appliedPadding}px`,
+            'important'
+        );
+
+        let extendedMaxScrollTop = Math.max(
+            0,
+            container.scrollHeight - container.clientHeight
+        );
+
+        if (extendedMaxScrollTop < desiredTop) {
+            appliedPadding += desiredTop - extendedMaxScrollTop + 2;
+            container.style.setProperty(
+                'padding-bottom',
+                `${appliedPadding}px`,
+                'important'
+            );
+            extendedMaxScrollTop = Math.max(
+                0,
+                container.scrollHeight - container.clientHeight
+            );
+        }
+
+        const appliedValue = `${appliedPadding}px`;
+        extendedScrollRange = {
+            container,
+            originalValue,
+            originalPriority,
+            appliedValue
+        };
+
+        return extendedMaxScrollTop;
+    }
+
+    function observeUserScrollIntent() {
+        for (const eventName of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
+            const target = eventName === 'keydown' ? window : document;
+            target.addEventListener(eventName, clearExtendedScrollRange, true);
+        }
+    }
+
+    function findScrollContainer(target) {
+        for (
+            let ancestor = target.parentElement;
+            ancestor && ancestor !== document.body;
+            ancestor = ancestor.parentElement
+        ) {
+            const style = window.getComputedStyle(ancestor);
+            const canScroll = /^(auto|scroll|overlay|hidden)$/.test(
+                style.overflowY
+            );
+
+            if (canScroll && ancestor.clientHeight > 0) {
+                return ancestor;
+            }
+        }
+
+        return document.scrollingElement || document.documentElement;
+    }
+
+    function getFixedHeaderInset(target, scrollContainer, isDocumentScroll) {
+        const viewportTop = isDocumentScroll
+            ? 0
+            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
+        const targetRect = target.getBoundingClientRect();
+        const targetX = targetRect.left + targetRect.width / 2;
+        let inset = 0;
+
+        for (const element of document.querySelectorAll(
+            'header, [role="banner"], [data-testid*="header"]'
+        )) {
+            const position = window.getComputedStyle(element).position;
+            if (position !== 'fixed' && position !== 'sticky') continue;
+
+            const rect = element.getBoundingClientRect();
+            if (
+                rect.left <= targetX && rect.right > targetX &&
+                rect.top <= viewportTop + 2 && rect.bottom > viewportTop
+            ) {
+                inset = Math.max(inset, rect.bottom - viewportTop);
+            }
+        }
+
+        return inset > 0 ? Math.ceil(inset + 8) : 0;
+    }
+
+    function scrollTurnMessageToTop(target, index) {
+        if (!target?.isConnected) return false;
+
+        clearExtendedScrollRange();
+
+        const scrollContainer = findScrollContainer(target);
+        const isDocumentScroll =
+            scrollContainer === document.scrollingElement ||
+            scrollContainer === document.documentElement ||
+            scrollContainer === document.body;
+        const viewportTop = isDocumentScroll
+            ? 0
+            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
+        const scrollTop = isDocumentScroll
+            ? (window.scrollY || scrollContainer.scrollTop)
+            : scrollContainer.scrollTop;
+        const headerInset = getFixedHeaderInset(
+            target,
+            scrollContainer,
+            isDocumentScroll
+        );
+
+        /* 最后一轮可能没有足够的末尾空间供浏览器将其顶端对齐。 */
+        if (index === turns.length - 1) {
+            const desiredTop = Math.max(
+                0,
+                target.getBoundingClientRect().top - viewportTop + scrollTop -
+                    headerInset
+            );
+            extendScrollRangeTo(scrollContainer, desiredTop);
+        }
+
+        /* 让浏览器处理真实的滚动祖先链，避免手算后滚错容器。 */
+        const originalMargin = target.style.getPropertyValue('scroll-margin-top');
+        const originalPriority = target.style.getPropertyPriority('scroll-margin-top');
+        if (headerInset > 0) {
+            const existingMargin = parseFloat(
+                window.getComputedStyle(target).scrollMarginTop
+            ) || 0;
+            target.style.setProperty(
+                'scroll-margin-top',
+                `${existingMargin + headerInset}px`,
+                'important'
+            );
+        }
+
+        try {
+            target.scrollIntoView({
+                behavior: 'smooth',
+                block: 'start',
+                inline: 'nearest'
+            });
+        } finally {
+            if (headerInset > 0) {
+                if (originalMargin) {
+                    target.style.setProperty(
+                        'scroll-margin-top',
+                        originalMargin,
+                        originalPriority
+                    );
+                } else {
+                    target.style.removeProperty('scroll-margin-top');
+                }
+            }
+        }
+
+        return true;
+    }
+
     function jumpToTurn(index) {
-        const turn = turns[index];
+        let turn = turns[index];
+        if (!turn) return;
 
-        if (!turn?.root?.isConnected) return;
+        /* 气泡可能被替换而 wrapper 仍连接，因此按 turn identity 刷新气泡。 */
+        if (!turn.userBubble?.isConnected) {
+            const replacement = collectTurns().find(candidate =>
+                candidate.identity === turn.identity &&
+                trackCurrentRouteTurn(candidate)
+            );
 
-        turn.root.scrollIntoView({
-            behavior: 'smooth',
-            block: 'center'
-        });
+            if (replacement) {
+                turns[index] = replacement;
+                turn = replacement;
+            }
+        }
 
+        const target = turn.userBubble?.isConnected
+            ? turn.userBubble
+            : turn.root;
+        if (!target?.isConnected) return;
+
+        if (!scrollTurnMessageToTop(target, index)) return;
         setActive(index);
     }
 
@@ -602,9 +1140,10 @@
      ******************************************************************/
 
     function renderTurns() {
+        handleRouteChange();
         ensureUI();
 
-        const newTurns = collectTurns();
+        const newTurns = collectTurns().filter(trackCurrentRouteTurn);
 
         const newSignature = newTurns
             .map(turn => turn.key)
@@ -621,8 +1160,29 @@
             newTurns.length === turns.length &&
             rail.children.length === newTurns.length
         ) {
+            const targetsChanged = newTurns.some((turn, index) =>
+                turn.root !== turns[index]?.root ||
+                turn.assistantUnit !== turns[index]?.assistantUnit ||
+                turn.userBubble !== turns[index]?.userBubble
+            );
+
             turns = newTurns;
             updateRailDensity();
+
+            if (targetsChanged) {
+                newTurns.forEach((turn, index) => {
+                    rail.children[index]?.setAttribute(
+                        'aria-label',
+                        getTurnBarLabel(turn, index)
+                    );
+                });
+            }
+
+            if (newTurns.length === 0) {
+                rail.style.display = 'none';
+                preview.classList.remove('yw-visible');
+            }
+
             scheduleActiveUpdate();
             return;
         }
@@ -646,15 +1206,7 @@
             bar.type = 'button';
             bar.className = 'yw-turn-bar';
 
-            const label = shorten(
-                getUserText(turn).replace(/\n/g, ' '),
-                42
-            );
-
-            bar.setAttribute(
-                'aria-label',
-                `第 ${index + 1} 轮对话${label ? `：${label}` : ''}`
-            );
+            bar.setAttribute('aria-label', getTurnBarLabel(turn, index));
 
             /*
              * 使用 index 而不是把 turn 对象锁死在 closure 中。
@@ -816,23 +1368,80 @@
     function nodeContainsTurn(node) {
         if (!(node instanceof Element)) return false;
 
-        if (
-            node.matches(
-                '[data-turn-key], [data-user-message-bubble="true"]'
-            )
-        ) {
-            return true;
+        if (node.matches(TURN_NODE_SELECTOR)) return true;
+
+        return Boolean(node.querySelector(TURN_NODE_SELECTOR));
+    }
+
+    function flushAssistantBarRefreshes() {
+        assistantLabelRefreshTimer = null;
+        const pending = Array.from(pendingAssistantLabelUnits.values());
+        pendingAssistantLabelUnits.clear();
+
+        let refreshed = false;
+
+        for (const { identity, assistantUnit, chatIdentity } of pending) {
+            if (
+                chatIdentity !== currentChatIdentity ||
+                !assistantUnit.isConnected
+            ) {
+                continue;
+            }
+
+            const index = turns.findIndex(turn =>
+                turn.kind === 'assistant' && turn.identity === identity
+            );
+            if (index < 0) continue;
+
+            const turn = turns[index];
+            turn.assistantUnit = assistantUnit;
+            turn.root = assistantUnit.querySelector(
+                '[data-chatgpt-selection-message-id]'
+            ) || assistantUnit;
+            rail?.children[index]?.setAttribute(
+                'aria-label',
+                getTurnBarLabel(turn, index)
+            );
+            refreshed = true;
         }
 
-        return Boolean(
-            node.querySelector(
-                '[data-turn-key], [data-user-message-bubble="true"]'
-            )
-        );
+        if (refreshed) scheduleActiveUpdate();
+    }
+
+    function queueAssistantBarRefresh(node) {
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (!element) return false;
+
+        const assistantUnit = element.matches(ASSISTANT_UNIT_SELECTOR)
+            ? element
+            : element.closest(ASSISTANT_UNIT_SELECTOR);
+        if (!assistantUnit) return false;
+
+        const unitIdentity = getAssistantUnitIdentity(assistantUnit);
+        if (!unitIdentity) return false;
+
+        const identity = `assistant:${unitIdentity}`;
+        pendingAssistantLabelUnits.set(identity, {
+            identity,
+            assistantUnit,
+            chatIdentity: currentChatIdentity
+        });
+
+        /* 每 250ms 合并一次文本流更新，避免每个字符都读取整段回复。 */
+        if (assistantLabelRefreshTimer === null) {
+            assistantLabelRefreshTimer = setTimeout(
+                flushAssistantBarRefreshes,
+                250
+            );
+        }
+
+        return true;
     }
 
     function observeChatChanges() {
         const observer = new MutationObserver(mutations => {
+            handleRouteChange();
+
             let relevant = false;
 
             for (const mutation of mutations) {
@@ -844,6 +1453,19 @@
                     preview?.contains(mutation.target)
                 ) {
                     continue;
+                }
+
+                if (mutation.type === 'characterData') {
+                    queueAssistantBarRefresh(mutation.target);
+                    continue;
+                }
+
+                if (
+                    mutation.type === 'attributes' &&
+                    nodeContainsTurn(mutation.target)
+                ) {
+                    relevant = true;
+                    break;
                 }
 
                 for (const node of mutation.addedNodes) {
@@ -863,16 +1485,32 @@
                 }
 
                 if (relevant) break;
+
+                if (mutation.type === 'childList') {
+                    queueAssistantBarRefresh(mutation.target);
+                }
             }
 
             if (relevant) {
+                collectTurns().forEach(trackCurrentRouteTurn);
+
                 scheduleRebuild();
             }
         });
 
         observer.observe(document.body, {
             childList: true,
-            subtree: true
+            subtree: true,
+            attributes: true,
+            characterData: true,
+            attributeFilter: [
+                'data-turn-key',
+                'data-content-search-turn-key',
+                'data-user-message-bubble',
+                'data-content-search-unit-key',
+                'data-chatgpt-search-unit-key',
+                'data-conversation-role'
+            ]
         });
     }
 
@@ -883,6 +1521,10 @@
 
     function init() {
         ensureUI();
+        currentChatIdentity = getChatIdentity();
+        observeRouteChanges();
+        observeNewConversationSubmissions();
+        observeUserScrollIntent();
         renderTurns();
         observeChatChanges();
 
@@ -900,11 +1542,6 @@
             updateRailDensity();
             scheduleActiveUpdate();
         });
-
-        window.addEventListener(
-            'popstate',
-            () => setTimeout(renderTurns, 250)
-        );
 
         /*
          * 低频兜底。
