@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://chatgpt.com/
-// @version      0.3.0
+// @version      0.3.1
 // @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
 // @author       YW
 // @match        https://chatgpt.com/*
@@ -18,6 +18,8 @@
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
+    const TURN_WRAPPER_SELECTOR =
+        '[data-turn-key], [data-content-search-turn-key]';
     const TURN_NODE_SELECTOR =
         '[data-turn-key], [data-content-search-turn-key], ' +
         '[data-user-message-bubble="true"], ' +
@@ -404,10 +406,8 @@
 
         rememberTurnIdentity(currentChatIdentity, turn.identity);
 
-        if (turn.kind === 'user' && turn.root?.querySelectorAll) {
-            for (const assistantUnit of turn.root.querySelectorAll(
-                ASSISTANT_UNIT_SELECTOR
-            )) {
+        if (turn.kind === 'user') {
+            for (const assistantUnit of getPairedAssistantUnits(turn)) {
                 const unitIdentity = getAssistantUnitIdentity(assistantUnit);
                 if (!unitIdentity) continue;
 
@@ -459,6 +459,28 @@
             if (targetStore.byIdentity.has(record.identity)) continue;
             targetStore.byIdentity.set(record.identity, record);
             insertTurnRecord(targetStore.turns, record);
+        }
+
+        for (const [assistantIdentity, userIdentity] of
+            sourceStore.pairedAssistantToUser
+        ) {
+            if (!targetStore.pairedAssistantToUser.has(assistantIdentity)) {
+                targetStore.pairedAssistantToUser.set(
+                    assistantIdentity,
+                    userIdentity
+                );
+            }
+        }
+
+        for (const [assistantIdentity, userIdentity] of
+            targetStore.pairedAssistantToUser
+        ) {
+            removePairedAssistantRecord(
+                targetStore,
+                assistantIdentity,
+                userIdentity,
+                toIdentity
+            );
         }
 
         /* Route identities such as `route:/` can be reused by later chats. */
@@ -657,61 +679,69 @@
             '[data-user-message-bubble="true"]'
         );
 
-        const result = [];
+        const userTurns = [];
         const seen = new Set();
 
-        if (bubbles.length > 0) {
-            for (const bubble of bubbles) {
-                /* 用户消息与 assistant 回复共用 turn wrapper。 */
-                const root = bubble.closest('[data-turn-key]') ||
-                    bubble.closest('[data-content-search-turn-key]');
-                if (!root) continue;
+        for (const bubble of bubbles) {
+            /* 用户消息与 assistant 回复共用 turn wrapper。 */
+            const root = bubble.closest('[data-turn-key]') ||
+                bubble.closest('[data-content-search-turn-key]');
+            if (!root) continue;
 
-                const rawStableIdentity =
-                    root.getAttribute('data-turn-key') ||
-                    root.getAttribute('data-content-search-turn-key') ||
-                    bubble.getAttribute('data-chatgpt-search-message-ids');
-                const fallbackKey = `turn-${result.length}`;
-                const stableIdentity = rawStableIdentity
-                    ? `user:${rawStableIdentity}`
-                    : '';
-                const identity = stableIdentity ||
-                    `fallback:${fallbackKey}:${normalizeText(
-                        bubble.innerText || bubble.textContent || ''
-                    )}`;
-                const key = stableIdentity || identity;
+            const rawStableIdentity =
+                root.getAttribute('data-turn-key') ||
+                root.getAttribute('data-content-search-turn-key') ||
+                bubble.getAttribute('data-chatgpt-search-message-ids');
+            const fallbackKey = `turn-${userTurns.length}`;
+            const stableIdentity = rawStableIdentity
+                ? `user:${rawStableIdentity}`
+                : '';
+            const identity = stableIdentity ||
+                `fallback:${fallbackKey}:${normalizeText(
+                    bubble.innerText || bubble.textContent || ''
+                )}`;
+            const key = stableIdentity || identity;
 
-                /* 嵌套的 outer / content-search wrapper 同 key 时只保留一轮。 */
-                if (seen.has(key)) continue;
-                seen.add(key);
+            /* 嵌套的 outer / content-search wrapper 同 key 时只保留一轮。 */
+            if (seen.has(key)) continue;
+            seen.add(key);
 
-                result.push({
-                    key,
-                    identity,
-                    root,
-                    userBubble: bubble,
-                    kind: 'user',
-                    stableIdentity: Boolean(stableIdentity)
-                });
-            }
+            const userTurn = {
+                key,
+                identity,
+                root,
+                userBubble: bubble,
+                kind: 'user',
+                stableIdentity: Boolean(stableIdentity)
+            };
+            const pairedAssistantIdentities = getPairedAssistantUnits(userTurn)
+                .map(getAssistantUnitIdentity)
+                .filter(Boolean)
+                .map(unitIdentity => `assistant:${unitIdentity}`)
+                .filter(assistantIdentity =>
+                    !turnBelongsToAnotherChat(
+                        assistantIdentity,
+                        currentChatIdentity
+                    )
+                );
 
-            if (result.some(turn =>
-                !turnBelongsToAnotherChat(turn.identity, currentChatIdentity) &&
-                !hasForeignFallbackOwner(turn, currentChatIdentity)
-            )) {
-                return result;
-            }
-
-            /* 这些用户气泡都属于 outgoing chat，继续扫描当前 chat 的 assistant units。 */
-            result.length = 0;
-            seen.clear();
+            userTurns.push({
+                ...userTurn,
+                pairedAssistantIdentities,
+            });
         }
 
-        const knownUserTurns = turnRecordsByChat
-            .get(currentChatIdentity)?.turns.some(turn => turn.kind === 'user');
-        if (knownUserTurns) return result;
+        const observedUserTurns = userTurns.filter(turn =>
+            !turnBelongsToAnotherChat(turn.identity, currentChatIdentity) &&
+            !hasForeignFallbackOwner(turn, currentChatIdentity)
+        );
+        const pairedAssistantIdentities = new Set(
+            observedUserTurns.flatMap(turn => turn.pairedAssistantIdentities)
+        );
+        const previouslyPairedAssistants =
+            turnRecordsByChat.get(currentChatIdentity)?.pairedAssistantToUser;
 
-        /* 没有任何用户消息时，以每个 assistant unit 作为独立导航项。 */
+        const result = observedUserTurns.slice();
         const assistantUnits = queryAllIncludingRoot(
             scope,
             ASSISTANT_UNIT_SELECTOR
@@ -722,7 +752,18 @@
             if (!unitIdentity) continue;
 
             const key = `assistant:${unitIdentity}`;
-            if (seen.has(key)) continue;
+            const isCurrentChatPair =
+                !turnBelongsToAnotherChat(key, currentChatIdentity) &&
+                (
+                    pairedAssistantIdentities.has(key) ||
+                    previouslyPairedAssistants?.has(key)
+                );
+            if (
+                seen.has(key) ||
+                isCurrentChatPair
+            ) {
+                continue;
+            }
             seen.add(key);
 
             const messageTarget = assistantUnit.querySelector(
@@ -740,12 +781,67 @@
             });
         }
 
+        result.sort((left, right) => {
+            const leftNode = left.kind === 'user'
+                ? left.root
+                : left.assistantUnit;
+            const rightNode = right.kind === 'user'
+                ? right.root
+                : right.assistantUnit;
+            if (!leftNode || !rightNode) return 0;
+
+            const position = leftNode.compareDocumentPosition(rightNode);
+            if (position & Node.DOCUMENT_POSITION_DISCONNECTED) return 0;
+            if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+
         return result;
     }
 
     function getAssistantUnitIdentity(assistantUnit) {
         return assistantUnit.getAttribute('data-content-search-unit-key') ||
             assistantUnit.getAttribute('data-chatgpt-search-unit-key') ||
+            '';
+    }
+
+    function getPairedAssistantUnits(turn) {
+        if (!turn?.root) return [];
+
+        return queryAllIncludingRoot(turn.root, ASSISTANT_UNIT_SELECTOR)
+            .filter(assistantUnit => {
+                if (!isPairedAssistantUnit(turn, assistantUnit)) return false;
+
+                const unitIdentity = getAssistantUnitIdentity(assistantUnit);
+                return !unitIdentity || !turnBelongsToAnotherChat(
+                    `assistant:${unitIdentity}`,
+                    currentChatIdentity
+                );
+            });
+    }
+
+    function isPairedAssistantUnit(turn, assistantUnit) {
+        if (turn?.kind !== 'user' || !turn.root || !assistantUnit) return false;
+
+        const nearestTurnWrapper = assistantUnit.closest(TURN_WRAPPER_SELECTOR);
+        const userTurnKey = getTurnWrapperKey(turn.root);
+
+        return Boolean(
+            turn.root.contains(assistantUnit) &&
+            (
+                nearestTurnWrapper === turn.root ||
+                (
+                    userTurnKey &&
+                    getTurnWrapperKey(nearestTurnWrapper) === userTurnKey
+                )
+            )
+        );
+    }
+
+    function getTurnWrapperKey(turnWrapper) {
+        return turnWrapper?.getAttribute('data-turn-key') ||
+            turnWrapper?.getAttribute('data-content-search-turn-key') ||
             '';
     }
 
@@ -784,7 +880,12 @@
     }
 
     function getAssistantText(turn) {
-        const contentRoot = turn?.assistantUnit || turn?.root;
+        const pairedAssistantUnit = turn?.kind === 'user'
+            ? getPairedAssistantUnits(turn)[0]
+            : null;
+        const contentRoot = turn?.kind === 'user'
+            ? pairedAssistantUnit
+            : turn?.assistantUnit || turn?.root;
         if (!contentRoot) return turn?.assistantText || '';
 
         /*
@@ -838,11 +939,35 @@
         if (!turnRecordsByChat.has(chatIdentity)) {
             turnRecordsByChat.set(chatIdentity, {
                 turns: [],
-                byIdentity: new Map()
+                byIdentity: new Map(),
+                pairedAssistantToUser: new Map()
             });
         }
 
         return turnRecordsByChat.get(chatIdentity);
+    }
+
+    function removePairedAssistantRecord(
+        store,
+        assistantIdentity,
+        userIdentity,
+        chatIdentity = currentChatIdentity
+    ) {
+        if (turnBelongsToAnotherChat(assistantIdentity, chatIdentity)) return;
+
+        if (
+            store.pairedAssistantToUser.get(assistantIdentity) !== userIdentity
+        ) {
+            return;
+        }
+
+        const record = store.byIdentity.get(assistantIdentity);
+        if (record?.kind !== 'assistant') return;
+
+        store.byIdentity.delete(assistantIdentity);
+        store.turns = store.turns.filter(turn =>
+            turn.identity !== assistantIdentity
+        );
     }
 
     function insertTurnRecord(records, record, observed = []) {
@@ -962,9 +1087,7 @@
             : null;
 
         if (!record.assistantUnit && record.kind === 'user') {
-            record.assistantUnit = record.root.querySelector(
-                ASSISTANT_UNIT_SELECTOR
-            );
+            record.assistantUnit = getPairedAssistantUnits(record)[0] || null;
         }
 
         const location = getTurnScrollLocation(record.root);
@@ -983,13 +1106,38 @@
             turn.stableIdentity && trackCurrentRouteTurn(turn)
         );
 
-        if (observed.some(turn => turn.kind === 'user')) {
-            for (const record of store.turns) {
-                if (record.kind === 'assistant') {
-                    store.byIdentity.delete(record.identity);
+        for (const turn of observed) {
+            if (turn.kind !== 'user') continue;
+
+            for (const assistantIdentity of turn.pairedAssistantIdentities || []) {
+                if (
+                    turnBelongsToAnotherChat(
+                        assistantIdentity,
+                        currentChatIdentity
+                    )
+                ) {
+                    continue;
                 }
+
+                const knownUserIdentity =
+                    store.pairedAssistantToUser.get(assistantIdentity);
+                if (
+                    knownUserIdentity &&
+                    knownUserIdentity !== turn.identity
+                ) {
+                    continue;
+                }
+
+                store.pairedAssistantToUser.set(
+                    assistantIdentity,
+                    turn.identity
+                );
+                removePairedAssistantRecord(
+                    store,
+                    assistantIdentity,
+                    turn.identity
+                );
             }
-            store.turns = store.turns.filter(record => record.kind !== 'assistant');
         }
 
         if (replaceNodeReferences) {
@@ -2024,7 +2172,7 @@
                 const isMatchingAssistant =
                     turn.kind === 'assistant' && turn.identity === identity;
                 const containsAssistant =
-                    turn.kind === 'user' && turn.root?.contains(assistantUnit);
+                    isPairedAssistantUnit(turn, assistantUnit);
                 if (!isMatchingAssistant && !containsAssistant) continue;
 
                 const observed = observedTurns.find(candidate =>
