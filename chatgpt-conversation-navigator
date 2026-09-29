@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://chatgpt.com/
-// @version      0.2.0
+// @version      0.3.0
 // @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
 // @author       YW
 // @match        https://chatgpt.com/*
@@ -31,6 +31,8 @@
     let turns = [];
     let turnSignature = '';
     let activeIndex = -1;
+    let turnRecordsByChat = new Map();
+    let activeJumpSearch = null;
 
     let rebuildTimer = null;
     let activeRAF = null;
@@ -39,6 +41,7 @@
     let currentChatIdentity = null;
     let turnIdentitiesByChat = new Map();
     let chatOwnersByTurnIdentity = new Map();
+    let fallbackTurnOwnersByNode = new WeakMap();
     let newConversationSubmissionPending = false;
     let newConversationSubmissionTimer = null;
     let extendedScrollRange = null;
@@ -369,7 +372,30 @@
         return Boolean(owners?.size && !owners.has(chatIdentity));
     }
 
+    function hasForeignFallbackOwner(turn, chatIdentity) {
+        const fallbackNodes = [turn.root, turn.userBubble].filter(node =>
+            node instanceof Element
+        );
+        return fallbackNodes.some(node => {
+            const owner = fallbackTurnOwnersByNode.get(node);
+            return owner && owner !== chatIdentity;
+        });
+    }
+
     function trackCurrentRouteTurn(turn) {
+        const fallbackNodes = [turn.root, turn.userBubble].filter(node =>
+            node instanceof Element
+        );
+        if (hasForeignFallbackOwner(turn, currentChatIdentity)) return false;
+
+        /* Unstable text/index fallbacks are usable only while currently mounted. */
+        if (!turn.stableIdentity) {
+            for (const node of fallbackNodes) {
+                fallbackTurnOwnersByNode.set(node, currentChatIdentity);
+            }
+            return true;
+        }
+
         if (
             turnBelongsToAnotherChat(turn.identity, currentChatIdentity)
         ) {
@@ -401,15 +427,46 @@
     }
 
     function transferChatTurnIdentities(fromIdentity, toIdentity) {
-        const turnIdentities = turnIdentitiesByChat.get(fromIdentity);
-        if (!turnIdentities) return;
+        for (const turn of turns) {
+            if (turn.stableIdentity) continue;
 
-        for (const turnIdentity of turnIdentities) {
-            rememberTurnIdentity(toIdentity, turnIdentity);
+            for (const node of [turn.root, turn.userBubble]) {
+                if (node instanceof Element && node.isConnected) {
+                    fallbackTurnOwnersByNode.set(node, toIdentity);
+                }
+            }
         }
+
+        const turnIdentities = turnIdentitiesByChat.get(fromIdentity);
+        if (turnIdentities) {
+            for (const turnIdentity of turnIdentities) {
+                rememberTurnIdentity(toIdentity, turnIdentity);
+
+                const owners = chatOwnersByTurnIdentity.get(turnIdentity);
+                owners?.delete(fromIdentity);
+                if (owners && owners.size === 0) {
+                    chatOwnersByTurnIdentity.delete(turnIdentity);
+                }
+            }
+            turnIdentitiesByChat.delete(fromIdentity);
+        }
+
+        const sourceStore = turnRecordsByChat.get(fromIdentity);
+        if (!sourceStore) return;
+
+        const targetStore = getTurnRecordStore(toIdentity);
+        for (const record of sourceStore.turns) {
+            if (targetStore.byIdentity.has(record.identity)) continue;
+            targetStore.byIdentity.set(record.identity, record);
+            insertTurnRecord(targetStore.turns, record);
+        }
+
+        /* Route identities such as `route:/` can be reused by later chats. */
+        turnRecordsByChat.delete(fromIdentity);
     }
 
     function clearNavigation() {
+        cancelJumpSearch();
         clearExtendedScrollRange();
 
         turns = [];
@@ -444,6 +501,8 @@
         }
 
         if (identity === currentChatIdentity) return;
+
+        cancelJumpSearch();
 
         /* 根页刚提交 composer 后生成的 /c/<id> 才保留当前新对话。 */
         if (
@@ -578,8 +637,23 @@
      * 找到 ChatGPT 中可导航的消息
      ******************************************************************/
 
-    function collectTurns() {
-        const bubbles = document.querySelectorAll(
+    function queryAllIncludingRoot(root, selector) {
+        const matches = [];
+
+        if (root instanceof Element && root.matches(selector)) {
+            matches.push(root);
+        }
+
+        if (root?.querySelectorAll) {
+            matches.push(...root.querySelectorAll(selector));
+        }
+
+        return matches;
+    }
+
+    function collectTurns(scope = document) {
+        const bubbles = queryAllIncludingRoot(
+            scope,
             '[data-user-message-bubble="true"]'
         );
 
@@ -593,17 +667,19 @@
                     bubble.closest('[data-content-search-turn-key]');
                 if (!root) continue;
 
-                const key =
-                    root.getAttribute('data-turn-key') ||
-                    root.getAttribute('data-content-search-turn-key') ||
-                    bubble.getAttribute('data-chatgpt-search-message-ids') ||
-                    `turn-${result.length}`;
-                const stableIdentity =
+                const rawStableIdentity =
                     root.getAttribute('data-turn-key') ||
                     root.getAttribute('data-content-search-turn-key') ||
                     bubble.getAttribute('data-chatgpt-search-message-ids');
+                const fallbackKey = `turn-${result.length}`;
+                const stableIdentity = rawStableIdentity
+                    ? `user:${rawStableIdentity}`
+                    : '';
                 const identity = stableIdentity ||
-                    `${key}:${normalizeText(bubble.innerText || bubble.textContent || '')}`;
+                    `fallback:${fallbackKey}:${normalizeText(
+                        bubble.innerText || bubble.textContent || ''
+                    )}`;
+                const key = stableIdentity || identity;
 
                 /* 嵌套的 outer / content-search wrapper 同 key 时只保留一轮。 */
                 if (seen.has(key)) continue;
@@ -614,12 +690,14 @@
                     identity,
                     root,
                     userBubble: bubble,
-                    kind: 'user'
+                    kind: 'user',
+                    stableIdentity: Boolean(stableIdentity)
                 });
             }
 
             if (result.some(turn =>
-                !turnBelongsToAnotherChat(turn.identity, currentChatIdentity)
+                !turnBelongsToAnotherChat(turn.identity, currentChatIdentity) &&
+                !hasForeignFallbackOwner(turn, currentChatIdentity)
             )) {
                 return result;
             }
@@ -629,8 +707,13 @@
             seen.clear();
         }
 
+        const knownUserTurns = turnRecordsByChat
+            .get(currentChatIdentity)?.turns.some(turn => turn.kind === 'user');
+        if (knownUserTurns) return result;
+
         /* 没有任何用户消息时，以每个 assistant unit 作为独立导航项。 */
-        const assistantUnits = document.querySelectorAll(
+        const assistantUnits = queryAllIncludingRoot(
+            scope,
             ASSISTANT_UNIT_SELECTOR
         );
 
@@ -652,7 +735,8 @@
                 root: messageTarget,
                 assistantUnit,
                 userBubble: null,
-                kind: 'assistant'
+                kind: 'assistant',
+                stableIdentity: true
             });
         }
 
@@ -689,19 +773,19 @@
     }
 
     function getUserText(turn) {
-        if (!turn?.userBubble) return '';
+        const liveText = turn?.userBubble
+            ? shorten(
+                turn.userBubble.innerText || turn.userBubble.textContent || '',
+                1000
+            )
+            : '';
 
-        return shorten(
-            turn.userBubble.innerText ||
-            turn.userBubble.textContent ||
-            '',
-            1000
-        );
+        return liveText || turn?.userText || '';
     }
 
     function getAssistantText(turn) {
         const contentRoot = turn?.assistantUnit || turn?.root;
-        if (!contentRoot) return '';
+        if (!contentRoot) return turn?.assistantText || '';
 
         /*
          * 第一优先级：
@@ -744,10 +828,263 @@
                 ''
             );
 
-            return shorten(text, 2200);
+            return shorten(text, 2200) || turn?.assistantText || '';
         }
 
-        return '';
+        return turn?.assistantText || '';
+    }
+
+    function getTurnRecordStore(chatIdentity) {
+        if (!turnRecordsByChat.has(chatIdentity)) {
+            turnRecordsByChat.set(chatIdentity, {
+                turns: [],
+                byIdentity: new Map()
+            });
+        }
+
+        return turnRecordsByChat.get(chatIdentity);
+    }
+
+    function insertTurnRecord(records, record, observed = []) {
+        const observedIndex = observed.findIndex(turn =>
+            turn.identity === record.identity
+        );
+        let previousAnchorIndex = -1;
+        let nextAnchorIndex = -1;
+        let previousAnchorIdentity = null;
+        let nextAnchorIdentity = null;
+
+        for (let index = observedIndex - 1; index >= 0; index--) {
+            previousAnchorIndex = records.findIndex(existing =>
+                existing.identity === observed[index].identity
+            );
+            if (previousAnchorIndex >= 0) {
+                previousAnchorIdentity = observed[index].identity;
+                break;
+            }
+        }
+
+        for (let index = observedIndex + 1; index < observed.length; index++) {
+            nextAnchorIndex = records.findIndex(existing =>
+                existing.identity === observed[index].identity
+            );
+            if (nextAnchorIndex >= 0) {
+                nextAnchorIdentity = observed[index].identity;
+                break;
+            }
+        }
+
+        /* Current DOM order wins if earlier observations placed the anchors oppositely. */
+        if (
+            previousAnchorIndex >= 0 &&
+            nextAnchorIndex >= 0 &&
+            previousAnchorIndex >= nextAnchorIndex
+        ) {
+            const [nextAnchor] = records.splice(nextAnchorIndex, 1);
+            previousAnchorIndex = records.findIndex(existing =>
+                existing.identity === previousAnchorIdentity
+            );
+            records.splice(previousAnchorIndex + 1, 0, nextAnchor);
+            nextAnchorIndex = previousAnchorIndex + 1;
+        }
+
+        const lowerBound = previousAnchorIndex >= 0
+            ? previousAnchorIndex + 1
+            : 0;
+        const upperBound = nextAnchorIndex >= 0
+            ? nextAnchorIndex
+            : records.length;
+        let positionIndex = upperBound;
+        if (Number.isFinite(record.orderPosition)) {
+            const positionedIndex = records.findIndex(existing =>
+                Number.isFinite(existing.orderPosition) &&
+                existing.orderPosition > record.orderPosition
+            );
+            if (
+                positionedIndex >= 0 ||
+                (previousAnchorIndex < 0 && nextAnchorIndex < 0)
+            ) {
+                positionIndex = positionedIndex >= 0
+                    ? positionedIndex
+                    : records.length;
+            }
+        }
+
+        const insertionIndex = Math.max(
+            lowerBound,
+            Math.min(upperBound, positionIndex)
+        );
+        records.splice(insertionIndex, 0, record);
+    }
+
+    function enforceObservedTurnOrder(records, observed) {
+        let previousIdentity = null;
+
+        for (const turn of observed) {
+            let turnIndex = records.findIndex(record =>
+                record.identity === turn.identity
+            );
+            if (turnIndex < 0) continue;
+
+            if (previousIdentity) {
+                const previousIndex = records.findIndex(record =>
+                    record.identity === previousIdentity
+                );
+
+                if (previousIndex >= 0 && turnIndex <= previousIndex) {
+                    const [record] = records.splice(turnIndex, 1);
+                    const updatedPreviousIndex = records.findIndex(item =>
+                        item.identity === previousIdentity
+                    );
+                    turnIndex = updatedPreviousIndex + 1;
+                    records.splice(turnIndex, 0, record);
+                }
+            }
+
+            previousIdentity = turn.identity;
+        }
+    }
+
+    function updateTurnRecord(record, observed, includeNodeReferences) {
+        const userText = getUserText(observed);
+        const assistantText = getAssistantText(observed);
+        if (userText) record.userText = userText;
+        if (assistantText) record.assistantText = assistantText;
+
+        if (!includeNodeReferences || !observed.root?.isConnected) return;
+
+        record.root = observed.root;
+        record.userBubble = observed.userBubble?.isConnected
+            ? observed.userBubble
+            : null;
+        record.assistantUnit = observed.assistantUnit?.isConnected
+            ? observed.assistantUnit
+            : null;
+
+        if (!record.assistantUnit && record.kind === 'user') {
+            record.assistantUnit = record.root.querySelector(
+                ASSISTANT_UNIT_SELECTOR
+            );
+        }
+
+        const location = getTurnScrollLocation(record.root);
+        if (location) {
+            record.lastScrollTop = location.scrollTop;
+            record.scrollIsDocument = location.isDocumentScroll;
+            record.orderPosition = location.orderPosition;
+        }
+    }
+
+    function mergeObservedTurnRecords(observedTurns, replaceNodeReferences) {
+        if (!currentChatIdentity) return;
+
+        const store = getTurnRecordStore(currentChatIdentity);
+        const observed = observedTurns.filter(turn =>
+            turn.stableIdentity && trackCurrentRouteTurn(turn)
+        );
+
+        if (observed.some(turn => turn.kind === 'user')) {
+            for (const record of store.turns) {
+                if (record.kind === 'assistant') {
+                    store.byIdentity.delete(record.identity);
+                }
+            }
+            store.turns = store.turns.filter(record => record.kind !== 'assistant');
+        }
+
+        if (replaceNodeReferences) {
+            for (const record of store.turns) {
+                record.root = null;
+                record.userBubble = null;
+                record.assistantUnit = null;
+            }
+        }
+
+        const newRecords = [];
+        for (const turn of observed) {
+            let record = store.byIdentity.get(turn.identity);
+            if (!record) {
+                record = {
+                    key: turn.key,
+                    identity: turn.identity,
+                    kind: turn.kind,
+                    stableIdentity: true,
+                    persistent: true,
+                    root: null,
+                    userBubble: null,
+                    assistantUnit: null,
+                    userText: '',
+                    assistantText: '',
+                    lastScrollTop: null,
+                    scrollIsDocument: null,
+                    orderPosition: null
+                };
+                store.byIdentity.set(turn.identity, record);
+                newRecords.push(record);
+            }
+
+            record.key = turn.key;
+            record.kind = turn.kind;
+            updateTurnRecord(record, turn, replaceNodeReferences);
+        }
+
+        enforceObservedTurnOrder(store.turns, observed);
+
+        for (const record of newRecords) {
+            insertTurnRecord(store.turns, record, observed);
+        }
+    }
+
+    function buildRenderedTurns(observedTurns) {
+        const store = getTurnRecordStore(currentChatIdentity);
+        const rendered = store.turns.slice();
+        const placements = [];
+
+        if (!store.turns.length) {
+            return observedTurns.filter(turn => !turn.stableIdentity);
+        }
+
+        observedTurns.forEach((turn, observedIndex) => {
+            if (turn.stableIdentity) return;
+
+            let insertionIndex = -1;
+
+            for (let index = observedIndex - 1; index >= 0; index--) {
+                const anchorIndex = rendered.findIndex(record =>
+                    record.identity === observedTurns[index].identity
+                );
+                if (anchorIndex >= 0) {
+                    insertionIndex = anchorIndex + 1;
+                    break;
+                }
+            }
+
+            if (insertionIndex < 0) {
+                for (let index = observedIndex + 1; index < observedTurns.length; index++) {
+                    const anchorIndex = rendered.findIndex(record =>
+                        record.identity === observedTurns[index].identity
+                    );
+                    if (anchorIndex >= 0) {
+                        insertionIndex = anchorIndex;
+                        break;
+                    }
+                }
+            }
+
+            if (insertionIndex < 0) insertionIndex = rendered.length;
+            placements.push({ turn, insertionIndex, observedIndex });
+        });
+
+        placements.sort((a, b) =>
+            a.insertionIndex - b.insertionIndex ||
+            a.observedIndex - b.observedIndex
+        );
+
+        placements.forEach(({ turn, insertionIndex }, index) => {
+            rendered.splice(insertionIndex + index, 0, turn);
+        });
+
+        return rendered;
     }
 
     function getTurnBarLabel(turn, index) {
@@ -925,7 +1262,10 @@
     function observeUserScrollIntent() {
         for (const eventName of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
             const target = eventName === 'keydown' ? window : document;
-            target.addEventListener(eventName, clearExtendedScrollRange, true);
+            target.addEventListener(eventName, () => {
+                cancelJumpSearch();
+                clearExtendedScrollRange();
+            }, true);
         }
     }
 
@@ -946,6 +1286,240 @@
         }
 
         return document.scrollingElement || document.documentElement;
+    }
+
+    function getTurnScrollLocation(target) {
+        if (!target?.isConnected) return null;
+
+        const scrollContainer = findScrollContainer(target);
+        const isDocumentScroll =
+            scrollContainer === document.scrollingElement ||
+            scrollContainer === document.documentElement ||
+            scrollContainer === document.body;
+        const viewportTop = isDocumentScroll
+            ? 0
+            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
+        const scrollTop = isDocumentScroll
+            ? (window.scrollY || scrollContainer.scrollTop)
+            : scrollContainer.scrollTop;
+
+        return {
+            scrollTop,
+            isDocumentScroll,
+            orderPosition: scrollTop +
+                target.getBoundingClientRect().top - viewportTop
+        };
+    }
+
+    function cancelJumpSearch() {
+        if (activeJumpSearch) {
+            activeJumpSearch.cancelled = true;
+            activeJumpSearch = null;
+        }
+    }
+
+    function isCurrentJumpSearch(search) {
+        return Boolean(
+            search &&
+            activeJumpSearch === search &&
+            !search.cancelled &&
+            currentChatIdentity === search.chatIdentity &&
+            getChatIdentity() === search.chatIdentity
+        );
+    }
+
+    function waitForAnimationFrame() {
+        return new Promise(resolve => requestAnimationFrame(resolve));
+    }
+
+    function getScrollTop(container, isDocumentScroll) {
+        return isDocumentScroll
+            ? (window.scrollY || container.scrollTop)
+            : container.scrollTop;
+    }
+
+    function setScrollTop(container, isDocumentScroll, value) {
+        container.scrollTop = value;
+        if (isDocumentScroll && window.scrollY !== value) {
+            window.scrollTo(0, value);
+        }
+    }
+
+    function findMountedTurn(identity, chatIdentity) {
+        if (
+            currentChatIdentity !== chatIdentity ||
+            getChatIdentity() !== chatIdentity
+        ) {
+            return null;
+        }
+
+        return collectTurns().find(turn =>
+            turn.identity === identity &&
+            turn.root?.isConnected &&
+            trackCurrentRouteTurn(turn)
+        ) || null;
+    }
+
+    function findMountedStableTurn(identity, chatIdentity) {
+        const turn = findMountedTurn(identity, chatIdentity);
+        return turn?.stableIdentity ? turn : null;
+    }
+
+    async function waitForBoundarySettle(
+        container,
+        isDocumentScroll,
+        identity,
+        search,
+        previousTop,
+        previousMaxScrollTop,
+        searchDeadline
+    ) {
+        const deadline = Math.min(Date.now() + 2000, searchDeadline);
+        const initialVisibleTurns = collectTurns()
+            .filter(turn => turn.stableIdentity)
+            .map(turn => turn.identity)
+            .join('|');
+
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            if (!isCurrentJumpSearch(search)) return { cancelled: true };
+
+            const mounted = findMountedStableTurn(identity, search.chatIdentity);
+            if (mounted) return { mounted };
+
+            const currentTop = getScrollTop(container, isDocumentScroll);
+            const currentMaxScrollTop = Math.max(
+                0,
+                container.scrollHeight - container.clientHeight
+            );
+            const currentVisibleTurns = collectTurns()
+                .filter(turn => turn.stableIdentity)
+                .map(turn => turn.identity)
+                .join('|');
+            if (
+                currentTop !== previousTop ||
+                currentMaxScrollTop !== previousMaxScrollTop ||
+                currentVisibleTurns !== initialVisibleTurns
+            ) {
+                return { changed: true };
+            }
+        }
+
+        return { changed: false };
+    }
+
+    async function searchForTurn(record, search) {
+        const chatStore = turnRecordsByChat.get(search.chatIdentity);
+        const connectedTurn = turns.find(turn => turn.root?.isConnected);
+        const currentTurn = connectedTurn
+            ? collectTurns().find(turn =>
+                turn.root?.isConnected &&
+                turn.identity === connectedTurn.identity
+            )
+            : null;
+        const scrollTarget = currentTurn?.root || connectedTurn?.root;
+        if (!scrollTarget) return null;
+
+        const container = findScrollContainer(scrollTarget);
+        const isDocumentScroll =
+            container === document.scrollingElement ||
+            container === document.documentElement ||
+            container === document.body;
+        const maxScrollTop = () => Math.max(
+            0,
+            container.scrollHeight - container.clientHeight
+        );
+        const currentTop = () => getScrollTop(container, isDocumentScroll);
+        const setTop = value => setScrollTop(
+            container,
+            isDocumentScroll,
+            Math.max(0, Math.min(maxScrollTop(), value))
+        );
+        const step = Math.max(
+            240,
+            Math.floor((container.clientHeight || window.innerHeight) * 0.7)
+        );
+        const hasCompatibleLocation =
+            record.scrollIsDocument === isDocumentScroll;
+
+        clearExtendedScrollRange();
+
+        const cachedTop = record.lastScrollTop;
+        if (hasCompatibleLocation && Number.isFinite(cachedTop)) {
+            setTop(cachedTop);
+        }
+
+        await waitForAnimationFrame();
+        await waitForAnimationFrame();
+        if (!isCurrentJumpSearch(search)) return null;
+
+        let mounted = findMountedStableTurn(record.identity, search.chatIdentity);
+        if (mounted) return mounted;
+
+        let direction = 1;
+        if (
+            hasCompatibleLocation &&
+            Number.isFinite(record.orderPosition)
+        ) {
+            const top = currentTop();
+            const viewportMiddle = top +
+                (container.clientHeight || window.innerHeight) / 2;
+            direction = record.orderPosition < viewportMiddle ? -1 : 1;
+        } else if (chatStore) {
+            const targetIndex = chatStore.turns.findIndex(turn =>
+                turn.identity === record.identity
+            );
+            const visibleIndex = chatStore.turns.findIndex(turn =>
+                turn.root?.isConnected
+            );
+            direction = targetIndex < visibleIndex ? -1 : 1;
+        }
+
+        const maxSteps = 240;
+        const startedAt = Date.now();
+        let reversed = false;
+
+        for (let attempt = 0; attempt < maxSteps; attempt++) {
+            if (
+                !isCurrentJumpSearch(search) ||
+                Date.now() - startedAt > 12000
+            ) {
+                return null;
+            }
+
+            const before = currentTop();
+            const maxBefore = maxScrollTop();
+            setTop(before + direction * step);
+            const after = currentTop();
+
+            if (after === before) {
+                const boundary = await waitForBoundarySettle(
+                    container,
+                    isDocumentScroll,
+                    record.identity,
+                    search,
+                    before,
+                    maxBefore,
+                    startedAt + 12000
+                );
+                if (boundary.cancelled) return null;
+                if (boundary.mounted) return boundary.mounted;
+                if (boundary.changed) continue;
+                if (reversed) return null;
+                direction *= -1;
+                reversed = true;
+                continue;
+            }
+
+            await waitForAnimationFrame();
+            await waitForAnimationFrame();
+            if (!isCurrentJumpSearch(search)) return null;
+
+            mounted = findMountedStableTurn(record.identity, search.chatIdentity);
+            if (mounted) return mounted;
+        }
+
+        return null;
     }
 
     function getFixedHeaderInset(target, scrollContainer, isDocumentScroll) {
@@ -1043,30 +1617,78 @@
         return true;
     }
 
-    function jumpToTurn(index) {
-        let turn = turns[index];
-        if (!turn) return;
+    async function jumpToTurn(index) {
+        const selectedTurn = turns[index];
+        if (!selectedTurn) return;
 
-        /* 气泡可能被替换而 wrapper 仍连接，因此按 turn identity 刷新气泡。 */
-        if (!turn.userBubble?.isConnected) {
-            const replacement = collectTurns().find(candidate =>
-                candidate.identity === turn.identity &&
-                trackCurrentRouteTurn(candidate)
+        const chatIdentity = currentChatIdentity;
+        const identity = selectedTurn.identity;
+        const stableIdentity = selectedTurn.stableIdentity;
+        const store = turnRecordsByChat.get(chatIdentity);
+        const record = store?.byIdentity.get(identity) || selectedTurn;
+
+        cancelJumpSearch();
+        const search = { chatIdentity, identity, cancelled: false };
+        activeJumpSearch = search;
+
+        try {
+            let mounted = findMountedTurn(identity, chatIdentity);
+
+            if (!mounted && !stableIdentity) {
+                /* Fallback text/index identities cannot safely locate an unmounted node. */
+                return;
+            }
+
+            if (
+                !stableIdentity &&
+                (mounted?.root !== selectedTurn.root ||
+                    mounted?.userBubble !== selectedTurn.userBubble)
+            ) {
+                return;
+            }
+
+            if (!mounted && stableIdentity) {
+                mounted = await searchForTurn(record, search);
+            }
+
+            if (!mounted || !isCurrentJumpSearch(search)) return;
+
+            mergeObservedTurnRecords([mounted], false);
+            renderTurns();
+
+            /* Reconfirm the exact identity after any virtualizer remount. */
+            const verified = findMountedTurn(identity, chatIdentity);
+            if (!verified?.root?.isConnected) return;
+            if (
+                !stableIdentity &&
+                (verified.root !== selectedTurn.root ||
+                    verified.userBubble !== selectedTurn.userBubble)
+            ) {
+                return;
+            }
+
+            const verifiedRecord = turnRecordsByChat
+                .get(chatIdentity)?.byIdentity.get(identity);
+            const target = verified.userBubble?.isConnected
+                ? verified.userBubble
+                : verified.root;
+            const currentIndex = turns.findIndex(turn =>
+                turn.identity === identity
             );
 
-            if (replacement) {
-                turns[index] = replacement;
-                turn = replacement;
+            if (
+                currentIndex < 0 ||
+                (stableIdentity && !verifiedRecord) ||
+                !target?.isConnected ||
+                !scrollTurnMessageToTop(target, currentIndex)
+            ) {
+                return;
             }
+
+            setActive(currentIndex);
+        } finally {
+            if (activeJumpSearch === search) activeJumpSearch = null;
         }
-
-        const target = turn.userBubble?.isConnected
-            ? turn.userBubble
-            : turn.root;
-        if (!target?.isConnected) return;
-
-        if (!scrollTurnMessageToTop(target, index)) return;
-        setActive(index);
     }
 
 
@@ -1143,10 +1765,17 @@
         handleRouteChange();
         ensureUI();
 
-        const newTurns = collectTurns().filter(trackCurrentRouteTurn);
+        const previousTargets = turns.map(turn => ({
+            root: turn.root,
+            assistantUnit: turn.assistantUnit,
+            userBubble: turn.userBubble
+        }));
+        const observedTurns = collectTurns().filter(trackCurrentRouteTurn);
+        mergeObservedTurnRecords(observedTurns, true);
+        const newTurns = buildRenderedTurns(observedTurns);
 
         const newSignature = newTurns
-            .map(turn => turn.key)
+            .map(turn => turn.identity || turn.key)
             .join('|');
 
         /*
@@ -1161,15 +1790,15 @@
             rail.children.length === newTurns.length
         ) {
             const targetsChanged = newTurns.some((turn, index) =>
-                turn.root !== turns[index]?.root ||
-                turn.assistantUnit !== turns[index]?.assistantUnit ||
-                turn.userBubble !== turns[index]?.userBubble
+                turn.root !== previousTargets[index]?.root ||
+                turn.assistantUnit !== previousTargets[index]?.assistantUnit ||
+                turn.userBubble !== previousTargets[index]?.userBubble
             );
 
             turns = newTurns;
             updateRailDensity();
 
-            if (targetsChanged) {
+            if (targetsChanged || newTurns.length) {
                 newTurns.forEach((turn, index) => {
                     rail.children[index]?.setAttribute(
                         'aria-label',
@@ -1189,6 +1818,7 @@
 
         turns = newTurns;
         turnSignature = newSignature;
+        activeIndex = -1;
 
         rail.replaceChildren();
 
@@ -1388,21 +2018,45 @@
                 continue;
             }
 
-            const index = turns.findIndex(turn =>
-                turn.kind === 'assistant' && turn.identity === identity
-            );
-            if (index < 0) continue;
+            const observedTurns = collectTurns();
+            for (let index = 0; index < turns.length; index++) {
+                const turn = turns[index];
+                const isMatchingAssistant =
+                    turn.kind === 'assistant' && turn.identity === identity;
+                const containsAssistant =
+                    turn.kind === 'user' && turn.root?.contains(assistantUnit);
+                if (!isMatchingAssistant && !containsAssistant) continue;
 
-            const turn = turns[index];
-            turn.assistantUnit = assistantUnit;
-            turn.root = assistantUnit.querySelector(
-                '[data-chatgpt-selection-message-id]'
-            ) || assistantUnit;
-            rail?.children[index]?.setAttribute(
-                'aria-label',
-                getTurnBarLabel(turn, index)
-            );
-            refreshed = true;
+                const observed = observedTurns.find(candidate =>
+                    candidate.identity === turn.identity &&
+                    candidate.stableIdentity
+                );
+                const record = turnRecordsByChat
+                    .get(chatIdentity)?.byIdentity.get(turn.identity);
+                if (record && observed) {
+                    updateTurnRecord(record, observed, true);
+                } else if (record) {
+                    record.assistantUnit = assistantUnit;
+                    record.root = turn.kind === 'assistant'
+                        ? assistantUnit.querySelector(
+                            '[data-chatgpt-selection-message-id]'
+                        ) || assistantUnit
+                        : turn.root;
+                    const assistantText = getAssistantText(record);
+                    if (assistantText) record.assistantText = assistantText;
+                } else {
+                    turn.assistantUnit = assistantUnit;
+                    turn.root = assistantUnit.querySelector(
+                        '[data-chatgpt-selection-message-id]'
+                    ) || assistantUnit;
+                }
+
+                rail?.children[index]?.setAttribute(
+                    'aria-label',
+                    getTurnBarLabel(turn, index)
+                );
+                refreshed = true;
+            }
         }
 
         if (refreshed) scheduleActiveUpdate();
@@ -1440,9 +2094,12 @@
 
     function observeChatChanges() {
         const observer = new MutationObserver(mutations => {
+            const previousChatIdentity = currentChatIdentity;
             handleRouteChange();
+            const routeChanged = previousChatIdentity !== currentChatIdentity;
 
             let relevant = false;
+            const removedTurnSnapshots = [];
 
             for (const mutation of mutations) {
                 /*
@@ -1460,12 +2117,18 @@
                     continue;
                 }
 
+                for (const node of mutation.removedNodes) {
+                    if (nodeContainsTurn(node)) {
+                        removedTurnSnapshots.push(...collectTurns(node));
+                        relevant = true;
+                    }
+                }
+
                 if (
                     mutation.type === 'attributes' &&
                     nodeContainsTurn(mutation.target)
                 ) {
                     relevant = true;
-                    break;
                 }
 
                 for (const node of mutation.addedNodes) {
@@ -1477,18 +2140,13 @@
 
                 if (relevant) break;
 
-                for (const node of mutation.removedNodes) {
-                    if (nodeContainsTurn(node)) {
-                        relevant = true;
-                        break;
-                    }
-                }
-
-                if (relevant) break;
-
                 if (mutation.type === 'childList') {
                     queueAssistantBarRefresh(mutation.target);
                 }
+            }
+
+            if (removedTurnSnapshots.length && !routeChanged) {
+                mergeObservedTurnRecords(removedTurnSnapshots, false);
             }
 
             if (relevant) {
