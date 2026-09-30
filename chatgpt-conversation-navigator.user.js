@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
-// @namespace    https://chatgpt.com/
-// @version      0.3.4
-// @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
-// @author       YW
+// @namespace    https://github.com/Fucose
+// @version      0.3.6
+// @description  ChatGPT 对话导航：悬停预览，点击跳转。
+// @author       Fucose
+// @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
+// @supportURL   https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7#comments
+// @updateURL    https://gist.githubusercontent.com/Fucose/fc9f1963666d75e7f93a5edceae137c7/raw/chatgpt-conversation-navigator.user.js
+// @downloadURL  https://gist.githubusercontent.com/Fucose/fc9f1963666d75e7f93a5edceae137c7/raw/chatgpt-conversation-navigator.user.js
 // @match        https://chatgpt.com/*
 // @grant        none
 // @run-at       document-idle
@@ -689,6 +693,25 @@
         return matches;
     }
 
+    function isInHiddenSubtree(element) {
+        /* Removed nodes are still collected briefly to preserve turn history. */
+        if (!(element instanceof Element) || !element.isConnected) return false;
+
+        for (
+            let ancestor = element;
+            ancestor instanceof Element;
+            ancestor = ancestor.parentElement
+        ) {
+            if (ancestor.hasAttribute('hidden')) return true;
+
+            const style = window.getComputedStyle(ancestor);
+            if (style.display === 'none') return true;
+        }
+
+        const visibility = window.getComputedStyle(element).visibility;
+        return visibility === 'hidden' || visibility === 'collapse';
+    }
+
     function collectTurns(scope = document) {
         const bubbles = queryAllIncludingRoot(
             scope,
@@ -699,6 +722,8 @@
         const seen = new Set();
 
         for (const bubble of bubbles) {
+            if (isInHiddenSubtree(bubble)) continue;
+
             /* 用户消息与 assistant 回复共用 turn wrapper。 */
             const root = getLogicalTurnWrapper(bubble);
             if (!root) continue;
@@ -765,6 +790,8 @@
         );
 
         for (const assistantUnit of assistantUnits) {
+            if (isInHiddenSubtree(assistantUnit)) continue;
+
             const unitIdentity = getAssistantUnitIdentity(assistantUnit);
             if (!unitIdentity) continue;
 
@@ -1542,6 +1569,15 @@
             container === document.scrollingElement ||
             container === document.documentElement ||
             container === document.body;
+        const containerStyle = isDocumentScroll
+            ? null
+            : window.getComputedStyle(container);
+        const isReverseFlexScroll = Boolean(
+            containerStyle &&
+            (containerStyle.display === 'flex' ||
+                containerStyle.display === 'inline-flex') &&
+            containerStyle.flexDirection === 'column-reverse'
+        );
         const maxTop = () => Math.max(
             0,
             container.scrollHeight - container.clientHeight
@@ -1555,10 +1591,20 @@
                     ? 0
                     : container.getBoundingClientRect().top + container.clientTop;
             },
-            getTop: () => getScrollTop(container, isDocumentScroll),
+            getTop: () => {
+                const rawTop = getScrollTop(container, isDocumentScroll);
+                return isReverseFlexScroll ? rawTop + maxTop() : rawTop;
+            },
             setTop: value => {
-                const boundedTop = Math.max(0, Math.min(maxTop(), value));
-                setScrollTop(container, isDocumentScroll, boundedTop);
+                const currentMaxTop = maxTop();
+                const boundedTop = Math.max(
+                    0,
+                    Math.min(currentMaxTop, value)
+                );
+                const rawTop = isReverseFlexScroll
+                    ? boundedTop - currentMaxTop
+                    : boundedTop;
+                setScrollTop(container, isDocumentScroll, rawTop);
                 return boundedTop;
             },
             maxTop
@@ -1652,14 +1698,10 @@
 
     async function searchForTurn(record, search) {
         const chatStore = turnRecordsByChat.get(search.chatIdentity);
-        const connectedTurn = turns.find(turn => turn.root?.isConnected);
-        const currentTurnRoot = connectedTurn
-            ? collectTurns().find(turn =>
-                turn.root?.isConnected &&
-                turn.identity === connectedTurn.identity
-            )?.root
-            : null;
-        const scrollTarget = currentTurnRoot || connectedTurn?.root;
+        const currentMountedTurn = collectTurns().find(turn =>
+            turn.root?.isConnected && trackCurrentRouteTurn(turn)
+        );
+        const scrollTarget = currentMountedTurn?.root;
         if (!scrollTarget) return null;
 
         const scrollContext = createScrollContext(scrollTarget);
@@ -1704,9 +1746,11 @@
                 turn.identity === record.identity
             );
             const visibleIndex = chatStore.turns.findIndex(turn =>
-                turn.root?.isConnected
+                turn.identity === currentMountedTurn.identity
             );
-            direction = targetIndex < visibleIndex ? -1 : 1;
+            if (targetIndex >= 0 && visibleIndex >= 0) {
+                direction = targetIndex < visibleIndex ? -1 : 1;
+            }
         }
 
         const maxSteps = 240;
@@ -2255,6 +2299,44 @@
         return Boolean(node.querySelector(TURN_NODE_SELECTOR));
     }
 
+    function isKnownCurrentChatTurn(turn) {
+        if (!turn) return false;
+
+        if (turn.stableIdentity) {
+            const knownInCurrentChat =
+                turnRecordsByChat.get(currentChatIdentity)
+                    ?.byIdentity.has(turn.identity) ||
+                chatOwnersByTurnIdentity.get(turn.identity)
+                    ?.has(currentChatIdentity);
+            return Boolean(
+                knownInCurrentChat && trackCurrentRouteTurn(turn)
+            );
+        }
+
+        const knownFallbackNode = [turn.root, turn.userBubble].some(node =>
+            node instanceof Element &&
+            fallbackTurnOwnersByNode.get(node) === currentChatIdentity
+        );
+        return Boolean(knownFallbackNode && trackCurrentRouteTurn(turn));
+    }
+
+    function visibilityMutationAffectsCurrentChat(target) {
+        const targetContainsTurn = turn =>
+            [turn.root, turn.userBubble, turn.assistantUnit].some(node =>
+                node instanceof Element &&
+                node.isConnected &&
+                (target === node || target.contains(node))
+            );
+
+        if (turns.some(turn =>
+            targetContainsTurn(turn) && isKnownCurrentChatTurn(turn)
+        )) {
+            return true;
+        }
+
+        return collectTurns(target).some(isKnownCurrentChatTurn);
+    }
+
     function flushAssistantBarRefreshes() {
         assistantLabelRefreshTimer = null;
         const pending = Array.from(pendingAssistantLabelUnits.values());
@@ -2369,6 +2451,18 @@
                     continue;
                 }
 
+                if (
+                    mutation.type === 'attributes' &&
+                    ['style', 'class', 'hidden'].includes(
+                        mutation.attributeName
+                    )
+                ) {
+                    if (visibilityMutationAffectsCurrentChat(mutation.target)) {
+                        relevant = true;
+                    }
+                    continue;
+                }
+
                 for (const node of mutation.removedNodes) {
                     if (nodeContainsTurn(node)) {
                         removedTurnSnapshots.push(...collectTurns(node));
@@ -2419,7 +2513,10 @@
                 'data-user-message-bubble',
                 'data-content-search-unit-key',
                 'data-chatgpt-search-unit-key',
-                'data-conversation-role'
+                'data-conversation-role',
+                'style',
+                'class',
+                'hidden'
             ]
         });
     }
