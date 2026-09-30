@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://chatgpt.com/
-// @version      0.3.3
+// @version      0.3.4
 // @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
 // @author       YW
 // @match        https://chatgpt.com/*
@@ -77,7 +77,7 @@
                 display: flex;
                 flex-direction: column;
                 align-items: flex-end;
-                gap: var(--yw-nav-gap, 6px);
+                gap: var(--yw-nav-gap, 8px);
 
                 overflow-y: auto;
                 overflow-x: visible;
@@ -104,9 +104,11 @@
                 flex: 0 0 auto;
                 position: relative;
                 overflow: visible;
+                box-sizing: border-box;
 
-                width: 12px;
-                height: var(--yw-nav-bar-height, 3px);
+                width: 16px;
+                height: var(--yw-nav-bar-height, 4px);
+                min-height: 0;
 
                 margin: 0 0 0 auto;
                 padding: 0;
@@ -115,14 +117,14 @@
                 border-radius: 999px;
 
                 background: rgba(120, 120, 120, 0.34);
+                transform: translateY(var(--yw-nav-bar-offset, 0px));
 
                 cursor: pointer;
 
                 transition:
                     width 120ms ease,
                     background-color 120ms ease,
-                    opacity 120ms ease,
-                    transform 120ms ease;
+                    opacity 120ms ease;
 
                 outline: none;
             }
@@ -133,7 +135,7 @@
                 top: 50%;
                 right: 0;
                 width: var(--yw-nav-hit-width, 44px);
-                height: calc(100% + var(--yw-nav-gap, 6px));
+                height: calc(100% + var(--yw-nav-gap, 8px));
                 transform: translateY(-50%);
                 pointer-events: auto;
             }
@@ -1921,7 +1923,7 @@
      * 根据消息数量调节 bar 间距
      *
      * 普通对话：
-     *   3px bar + 6px gap
+     *   4px bar + 8px gap
      *
      * 超长对话：
      *   自动压缩
@@ -1939,8 +1941,8 @@
             Math.floor(window.innerHeight * 0.72)
         );
 
-        let barHeight = 3;
-        let gap = 6;
+        let barHeight = 4;
+        let gap = 8;
 
         const normalHeight =
             count * barHeight +
@@ -1948,11 +1950,11 @@
 
         if (normalHeight > available) {
             if (count < 100) {
-                gap = 3;
+                gap = 6;
             } else if (count < 180) {
-                gap = 2;
+                gap = 4;
             } else {
-                gap = 1;
+                gap = 3;
             }
 
             barHeight = Math.floor(
@@ -1963,22 +1965,45 @@
             );
 
             barHeight = Math.max(
-                1,
-                Math.min(3, barHeight)
+                2,
+                Math.min(4, barHeight)
             );
         }
 
+        const pixelRatio = window.devicePixelRatio || 1;
+        const snapSize = size => Math.round(size * pixelRatio) / pixelRatio;
+
         rail.style.setProperty(
             '--yw-nav-bar-height',
-            `${barHeight}px`
+            `${snapSize(barHeight)}px`
         );
 
         rail.style.setProperty(
             '--yw-nav-gap',
-            `${gap}px`
+            `${snapSize(gap)}px`
         );
 
         rail.style.maxHeight = `${available}px`;
+
+        /*
+         * 页面缩放及容器居中会让横条落在小数物理像素上，造成粗细交替。
+         * 批量读取位置后再写入偏移，避免反复布局；扣除旧偏移防止累积。
+         */
+        const offsets = Array.from(rail.children, bar => {
+            const previousOffset = parseFloat(
+                bar.style.getPropertyValue('--yw-nav-bar-offset')
+            ) || 0;
+            const top = bar.getBoundingClientRect().top - previousOffset;
+
+            return Math.round(top * pixelRatio) / pixelRatio - top;
+        });
+
+        offsets.forEach((offset, index) => {
+            rail.children[index].style.setProperty(
+                '--yw-nav-bar-offset',
+                `${offset}px`
+            );
+        });
     }
 
 
