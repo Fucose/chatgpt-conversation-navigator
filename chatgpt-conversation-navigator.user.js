@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://chatgpt.com/
-// @version      0.3.1
+// @version      0.3.3
 // @description  在 ChatGPT 右侧显示长对话导航条；悬停预览消息，点击跳转。
 // @author       YW
 // @match        https://chatgpt.com/*
@@ -18,8 +18,6 @@
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
-    const TURN_WRAPPER_SELECTOR =
-        '[data-turn-key], [data-content-search-turn-key]';
     const TURN_NODE_SELECTOR =
         '[data-turn-key], [data-content-search-turn-key], ' +
         '[data-user-message-bubble="true"], ' +
@@ -44,6 +42,7 @@
     let turnIdentitiesByChat = new Map();
     let chatOwnersByTurnIdentity = new Map();
     let fallbackTurnOwnersByNode = new WeakMap();
+    let assistantIdentitiesByNode = new WeakMap();
     let newConversationSubmissionPending = false;
     let newConversationSubmissionTimer = null;
     let extendedScrollRange = null;
@@ -73,6 +72,7 @@
 
                 width: 44px;
                 max-height: 72vh;
+                --yw-nav-hit-width: 44px;
 
                 display: flex;
                 flex-direction: column;
@@ -102,6 +102,8 @@
 
                 display: block;
                 flex: 0 0 auto;
+                position: relative;
+                overflow: visible;
 
                 width: 12px;
                 height: var(--yw-nav-bar-height, 3px);
@@ -123,6 +125,17 @@
                     transform 120ms ease;
 
                 outline: none;
+            }
+
+            #${RAIL_ID} .yw-turn-bar::before {
+                content: '';
+                position: absolute;
+                top: 50%;
+                right: 0;
+                width: var(--yw-nav-hit-width, 44px);
+                height: calc(100% + var(--yw-nav-gap, 6px));
+                transform: translateY(-50%);
+                pointer-events: auto;
             }
 
             /* hover：向左伸长 */
@@ -288,6 +301,7 @@
                 #${RAIL_ID} {
                     right: 6px;
                     width: 38px;
+                    --yw-nav-hit-width: 38px;
                 }
 
                 #${PREVIEW_ID} {
@@ -684,8 +698,7 @@
 
         for (const bubble of bubbles) {
             /* 用户消息与 assistant 回复共用 turn wrapper。 */
-            const root = bubble.closest('[data-turn-key]') ||
-                bubble.closest('[data-content-search-turn-key]');
+            const root = getLogicalTurnWrapper(bubble);
             if (!root) continue;
 
             const rawStableIdentity =
@@ -714,7 +727,8 @@
                 kind: 'user',
                 stableIdentity: Boolean(stableIdentity)
             };
-            const pairedAssistantIdentities = getPairedAssistantUnits(userTurn)
+            const pairedAssistantUnits = getPairedAssistantUnits(userTurn);
+            const pairedAssistantIdentities = pairedAssistantUnits
                 .map(getAssistantUnitIdentity)
                 .filter(Boolean)
                 .map(unitIdentity => `assistant:${unitIdentity}`)
@@ -727,6 +741,7 @@
 
             userTurns.push({
                 ...userTurn,
+                pairedAssistantUnits,
                 pairedAssistantIdentities,
             });
         }
@@ -801,15 +816,45 @@
     }
 
     function getAssistantUnitIdentity(assistantUnit) {
-        return assistantUnit.getAttribute('data-content-search-unit-key') ||
+        const rawUnitIdentity =
+            assistantUnit.getAttribute('data-content-search-unit-key') ||
             assistantUnit.getAttribute('data-chatgpt-search-unit-key') ||
             '';
+        if (!rawUnitIdentity) return '';
+
+        const previous = assistantIdentitiesByNode.get(assistantUnit);
+        if (
+            !assistantUnit.isConnected &&
+            previous?.rawUnitIdentity === rawUnitIdentity
+        ) {
+            return previous.identity;
+        }
+
+        const logicalWrapper = getLogicalTurnWrapper(assistantUnit);
+        const logicalTurnKey = getTurnWrapperKey(logicalWrapper);
+        if (logicalTurnKey) {
+            const identity = `round:${JSON.stringify([
+                logicalTurnKey,
+                rawUnitIdentity
+            ])}`;
+            assistantIdentitiesByNode.set(assistantUnit, {
+                rawUnitIdentity,
+                identity
+            });
+            return identity;
+        }
+
+        return rawUnitIdentity;
     }
 
     function getPairedAssistantUnits(turn) {
         if (!turn?.root) return [];
 
-        return queryAllIncludingRoot(turn.root, ASSISTANT_UNIT_SELECTOR)
+        const assistantUnits = Array.isArray(turn.pairedAssistantUnits)
+            ? turn.pairedAssistantUnits
+            : queryAllIncludingRoot(turn.root, ASSISTANT_UNIT_SELECTOR);
+
+        return assistantUnits
             .filter(assistantUnit => {
                 if (!isPairedAssistantUnit(turn, assistantUnit)) return false;
 
@@ -824,7 +869,7 @@
     function isPairedAssistantUnit(turn, assistantUnit) {
         if (turn?.kind !== 'user' || !turn.root || !assistantUnit) return false;
 
-        const nearestTurnWrapper = assistantUnit.closest(TURN_WRAPPER_SELECTOR);
+        const nearestTurnWrapper = getLogicalTurnWrapper(assistantUnit);
         const userTurnKey = getTurnWrapperKey(turn.root);
 
         return Boolean(
@@ -843,6 +888,13 @@
         return turnWrapper?.getAttribute('data-turn-key') ||
             turnWrapper?.getAttribute('data-content-search-turn-key') ||
             '';
+    }
+
+    function getLogicalTurnWrapper(node) {
+        /* The outer turn key identifies the round; inner content-search keys can differ. */
+        return node?.closest('[data-turn-key]') ||
+            node?.closest('[data-content-search-turn-key]') ||
+            null;
     }
 
 
@@ -976,15 +1028,12 @@
         );
         let previousAnchorIndex = -1;
         let nextAnchorIndex = -1;
-        let previousAnchorIdentity = null;
-        let nextAnchorIdentity = null;
 
         for (let index = observedIndex - 1; index >= 0; index--) {
             previousAnchorIndex = records.findIndex(existing =>
                 existing.identity === observed[index].identity
             );
             if (previousAnchorIndex >= 0) {
-                previousAnchorIdentity = observed[index].identity;
                 break;
             }
         }
@@ -994,23 +1043,8 @@
                 existing.identity === observed[index].identity
             );
             if (nextAnchorIndex >= 0) {
-                nextAnchorIdentity = observed[index].identity;
                 break;
             }
-        }
-
-        /* Current DOM order wins if earlier observations placed the anchors oppositely. */
-        if (
-            previousAnchorIndex >= 0 &&
-            nextAnchorIndex >= 0 &&
-            previousAnchorIndex >= nextAnchorIndex
-        ) {
-            const [nextAnchor] = records.splice(nextAnchorIndex, 1);
-            previousAnchorIndex = records.findIndex(existing =>
-                existing.identity === previousAnchorIdentity
-            );
-            records.splice(previousAnchorIndex + 1, 0, nextAnchor);
-            nextAnchorIndex = previousAnchorIndex + 1;
         }
 
         const lowerBound = previousAnchorIndex >= 0
@@ -1087,7 +1121,8 @@
             : null;
 
         if (!record.assistantUnit && record.kind === 'user') {
-            record.assistantUnit = getPairedAssistantUnits(record)[0] || null;
+            record.assistantUnit =
+                getPairedAssistantUnits(observed)[0] || null;
         }
 
         const location = getTurnScrollLocation(record.root);
@@ -1098,13 +1133,35 @@
         }
     }
 
-    function mergeObservedTurnRecords(observedTurns, replaceNodeReferences) {
+    function mergeObservedTurnRecords(
+        observedTurns,
+        replaceNodeReferences,
+        alreadyTracked = false
+    ) {
         if (!currentChatIdentity) return;
 
         const store = getTurnRecordStore(currentChatIdentity);
-        const observed = observedTurns.filter(turn =>
-            turn.stableIdentity && trackCurrentRouteTurn(turn)
-        );
+        const observed = observedTurns.filter(turn => {
+            if (!turn.stableIdentity) return false;
+
+            if (turn.kind === 'user' &&
+                !Array.isArray(turn.pairedAssistantUnits)) {
+                const pairedAssistantUnits = getPairedAssistantUnits(turn);
+                turn.pairedAssistantUnits = pairedAssistantUnits;
+                turn.pairedAssistantIdentities = pairedAssistantUnits
+                    .map(getAssistantUnitIdentity)
+                    .filter(Boolean)
+                    .map(unitIdentity => `assistant:${unitIdentity}`)
+                    .filter(assistantIdentity =>
+                        !turnBelongsToAnotherChat(
+                            assistantIdentity,
+                            currentChatIdentity
+                        )
+                    );
+            }
+
+            return alreadyTracked || trackCurrentRouteTurn(turn);
+        });
 
         for (const turn of observed) {
             if (turn.kind !== 'user') continue;
@@ -1153,11 +1210,9 @@
             let record = store.byIdentity.get(turn.identity);
             if (!record) {
                 record = {
-                    key: turn.key,
                     identity: turn.identity,
                     kind: turn.kind,
                     stableIdentity: true,
-                    persistent: true,
                     root: null,
                     userBubble: null,
                     assistantUnit: null,
@@ -1171,7 +1226,6 @@
                 newRecords.push(record);
             }
 
-            record.key = turn.key;
             record.kind = turn.kind;
             updateTurnRecord(record, turn, replaceNodeReferences);
         }
@@ -1235,11 +1289,14 @@
         return rendered;
     }
 
-    function getTurnBarLabel(turn, index) {
+    function getTurnBarLabel(turn, index, contentTurn = turn) {
         const isAssistant = turn.kind === 'assistant';
-        const text = isAssistant
-            ? getAssistantText(turn)
-            : getUserText(turn);
+        const liveText = isAssistant
+            ? getAssistantText(contentTurn)
+            : getUserText(contentTurn);
+        const text = liveText || (isAssistant
+            ? turn.assistantText || ''
+            : turn.userText || '');
         const label = shorten(text.replace(/\n/g, ' '), 42);
         const description = isAssistant
             ? `第 ${index + 1} 条 ChatGPT 回复`
@@ -1356,11 +1413,9 @@
         extendedScrollRange = null;
     }
 
-    function extendScrollRangeTo(container, desiredTop) {
-        const maxScrollTop = Math.max(
-            0,
-            container.scrollHeight - container.clientHeight
-        );
+    function extendScrollRangeTo(scrollContext, desiredTop) {
+        const { container } = scrollContext;
+        const maxScrollTop = scrollContext.maxTop();
 
         if (desiredTop <= maxScrollTop) return maxScrollTop;
 
@@ -1378,10 +1433,7 @@
             'important'
         );
 
-        let extendedMaxScrollTop = Math.max(
-            0,
-            container.scrollHeight - container.clientHeight
-        );
+        let extendedMaxScrollTop = scrollContext.maxTop();
 
         if (extendedMaxScrollTop < desiredTop) {
             appliedPadding += desiredTop - extendedMaxScrollTop + 2;
@@ -1390,10 +1442,7 @@
                 `${appliedPadding}px`,
                 'important'
             );
-            extendedMaxScrollTop = Math.max(
-                0,
-                container.scrollHeight - container.clientHeight
-            );
+            extendedMaxScrollTop = scrollContext.maxTop();
         }
 
         const appliedValue = `${appliedPadding}px`;
@@ -1439,21 +1488,13 @@
     function getTurnScrollLocation(target) {
         if (!target?.isConnected) return null;
 
-        const scrollContainer = findScrollContainer(target);
-        const isDocumentScroll =
-            scrollContainer === document.scrollingElement ||
-            scrollContainer === document.documentElement ||
-            scrollContainer === document.body;
-        const viewportTop = isDocumentScroll
-            ? 0
-            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
-        const scrollTop = isDocumentScroll
-            ? (window.scrollY || scrollContainer.scrollTop)
-            : scrollContainer.scrollTop;
+        const scrollContext = createScrollContext(target);
+        const viewportTop = scrollContext.viewportTop;
+        const scrollTop = scrollContext.getTop();
 
         return {
             scrollTop,
-            isDocumentScroll,
+            isDocumentScroll: scrollContext.isDocumentScroll,
             orderPosition: scrollTop +
                 target.getBoundingClientRect().top - viewportTop
         };
@@ -1493,7 +1534,41 @@
         }
     }
 
-    function findMountedTurn(identity, chatIdentity) {
+    function createScrollContext(target) {
+        const container = findScrollContainer(target);
+        const isDocumentScroll =
+            container === document.scrollingElement ||
+            container === document.documentElement ||
+            container === document.body;
+        const maxTop = () => Math.max(
+            0,
+            container.scrollHeight - container.clientHeight
+        );
+
+        return {
+            container,
+            isDocumentScroll,
+            get viewportTop() {
+                return isDocumentScroll
+                    ? 0
+                    : container.getBoundingClientRect().top + container.clientTop;
+            },
+            getTop: () => getScrollTop(container, isDocumentScroll),
+            setTop: value => {
+                const boundedTop = Math.max(0, Math.min(maxTop(), value));
+                setScrollTop(container, isDocumentScroll, boundedTop);
+                return boundedTop;
+            },
+            maxTop
+        };
+    }
+
+    function findMountedTurn(
+        identity,
+        chatIdentity,
+        observedTurns = null,
+        discardPairSnapshot = false
+    ) {
         if (
             currentChatIdentity !== chatIdentity ||
             getChatIdentity() !== chatIdentity
@@ -1501,21 +1576,35 @@
             return null;
         }
 
-        return collectTurns().find(turn =>
+        const mounted = (observedTurns || collectTurns()).find(turn =>
             turn.identity === identity &&
             turn.root?.isConnected &&
             trackCurrentRouteTurn(turn)
         ) || null;
+        if (mounted && discardPairSnapshot) {
+            delete mounted.pairedAssistantUnits;
+            delete mounted.pairedAssistantIdentities;
+        }
+        return mounted;
     }
 
-    function findMountedStableTurn(identity, chatIdentity) {
-        const turn = findMountedTurn(identity, chatIdentity);
+    function findMountedStableTurn(
+        identity,
+        chatIdentity,
+        observedTurns = null,
+        discardPairSnapshot = false
+    ) {
+        const turn = findMountedTurn(
+            identity,
+            chatIdentity,
+            observedTurns,
+            discardPairSnapshot
+        );
         return turn?.stableIdentity ? turn : null;
     }
 
     async function waitForBoundarySettle(
-        container,
-        isDocumentScroll,
+        scrollContext,
         identity,
         search,
         previousTop,
@@ -1532,15 +1621,18 @@
             await new Promise(resolve => setTimeout(resolve, 100));
             if (!isCurrentJumpSearch(search)) return { cancelled: true };
 
-            const mounted = findMountedStableTurn(identity, search.chatIdentity);
+            const currentTurns = collectTurns();
+            const mounted = findMountedStableTurn(
+                identity,
+                search.chatIdentity,
+                currentTurns,
+                true
+            );
             if (mounted) return { mounted };
 
-            const currentTop = getScrollTop(container, isDocumentScroll);
-            const currentMaxScrollTop = Math.max(
-                0,
-                container.scrollHeight - container.clientHeight
-            );
-            const currentVisibleTurns = collectTurns()
+            const currentTop = scrollContext.getTop();
+            const currentMaxScrollTop = scrollContext.maxTop();
+            const currentVisibleTurns = currentTurns
                 .filter(turn => turn.stableIdentity)
                 .map(turn => turn.identity)
                 .join('|');
@@ -1559,30 +1651,17 @@
     async function searchForTurn(record, search) {
         const chatStore = turnRecordsByChat.get(search.chatIdentity);
         const connectedTurn = turns.find(turn => turn.root?.isConnected);
-        const currentTurn = connectedTurn
+        const currentTurnRoot = connectedTurn
             ? collectTurns().find(turn =>
                 turn.root?.isConnected &&
                 turn.identity === connectedTurn.identity
-            )
+            )?.root
             : null;
-        const scrollTarget = currentTurn?.root || connectedTurn?.root;
+        const scrollTarget = currentTurnRoot || connectedTurn?.root;
         if (!scrollTarget) return null;
 
-        const container = findScrollContainer(scrollTarget);
-        const isDocumentScroll =
-            container === document.scrollingElement ||
-            container === document.documentElement ||
-            container === document.body;
-        const maxScrollTop = () => Math.max(
-            0,
-            container.scrollHeight - container.clientHeight
-        );
-        const currentTop = () => getScrollTop(container, isDocumentScroll);
-        const setTop = value => setScrollTop(
-            container,
-            isDocumentScroll,
-            Math.max(0, Math.min(maxScrollTop(), value))
-        );
+        const scrollContext = createScrollContext(scrollTarget);
+        const { container, isDocumentScroll } = scrollContext;
         const step = Math.max(
             240,
             Math.floor((container.clientHeight || window.innerHeight) * 0.7)
@@ -1594,14 +1673,19 @@
 
         const cachedTop = record.lastScrollTop;
         if (hasCompatibleLocation && Number.isFinite(cachedTop)) {
-            setTop(cachedTop);
+            scrollContext.setTop(cachedTop);
         }
 
         await waitForAnimationFrame();
         await waitForAnimationFrame();
         if (!isCurrentJumpSearch(search)) return null;
 
-        let mounted = findMountedStableTurn(record.identity, search.chatIdentity);
+        let mounted = findMountedStableTurn(
+            record.identity,
+            search.chatIdentity,
+            null,
+            true
+        );
         if (mounted) return mounted;
 
         let direction = 1;
@@ -1609,7 +1693,7 @@
             hasCompatibleLocation &&
             Number.isFinite(record.orderPosition)
         ) {
-            const top = currentTop();
+            const top = scrollContext.getTop();
             const viewportMiddle = top +
                 (container.clientHeight || window.innerHeight) / 2;
             direction = record.orderPosition < viewportMiddle ? -1 : 1;
@@ -1635,15 +1719,14 @@
                 return null;
             }
 
-            const before = currentTop();
-            const maxBefore = maxScrollTop();
-            setTop(before + direction * step);
-            const after = currentTop();
+            const before = scrollContext.getTop();
+            const maxBefore = scrollContext.maxTop();
+            scrollContext.setTop(before + direction * step);
+            const after = scrollContext.getTop();
 
             if (after === before) {
                 const boundary = await waitForBoundarySettle(
-                    container,
-                    isDocumentScroll,
+                    scrollContext,
                     record.identity,
                     search,
                     before,
@@ -1663,17 +1746,20 @@
             await waitForAnimationFrame();
             if (!isCurrentJumpSearch(search)) return null;
 
-            mounted = findMountedStableTurn(record.identity, search.chatIdentity);
+            mounted = findMountedStableTurn(
+                record.identity,
+                search.chatIdentity,
+                null,
+                true
+            );
             if (mounted) return mounted;
         }
 
         return null;
     }
 
-    function getFixedHeaderInset(target, scrollContainer, isDocumentScroll) {
-        const viewportTop = isDocumentScroll
-            ? 0
-            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
+    function getFixedHeaderInset(target, scrollContext) {
+        const viewportTop = scrollContext.viewportTop;
         const targetRect = target.getBoundingClientRect();
         const targetX = targetRect.left + targetRect.width / 2;
         let inset = 0;
@@ -1701,21 +1787,12 @@
 
         clearExtendedScrollRange();
 
-        const scrollContainer = findScrollContainer(target);
-        const isDocumentScroll =
-            scrollContainer === document.scrollingElement ||
-            scrollContainer === document.documentElement ||
-            scrollContainer === document.body;
-        const viewportTop = isDocumentScroll
-            ? 0
-            : scrollContainer.getBoundingClientRect().top + scrollContainer.clientTop;
-        const scrollTop = isDocumentScroll
-            ? (window.scrollY || scrollContainer.scrollTop)
-            : scrollContainer.scrollTop;
+        const scrollContext = createScrollContext(target);
+        const viewportTop = scrollContext.viewportTop;
+        const scrollTop = scrollContext.getTop();
         const headerInset = getFixedHeaderInset(
             target,
-            scrollContainer,
-            isDocumentScroll
+            scrollContext
         );
 
         /* 最后一轮可能没有足够的末尾空间供浏览器将其顶端对齐。 */
@@ -1725,7 +1802,7 @@
                 target.getBoundingClientRect().top - viewportTop + scrollTop -
                     headerInset
             );
-            extendScrollRangeTo(scrollContainer, desiredTop);
+            extendScrollRangeTo(scrollContext, desiredTop);
         }
 
         /* 让浏览器处理真实的滚动祖先链，避免手算后滚错容器。 */
@@ -1913,17 +1990,16 @@
         handleRouteChange();
         ensureUI();
 
-        const previousTargets = turns.map(turn => ({
-            root: turn.root,
-            assistantUnit: turn.assistantUnit,
-            userBubble: turn.userBubble
-        }));
         const observedTurns = collectTurns().filter(trackCurrentRouteTurn);
-        mergeObservedTurnRecords(observedTurns, true);
+        mergeObservedTurnRecords(observedTurns, true, true);
         const newTurns = buildRenderedTurns(observedTurns);
+        const labelSources = new Map(observedTurns.map(turn => [
+            turn.identity,
+            turn
+        ]));
 
         const newSignature = newTurns
-            .map(turn => turn.identity || turn.key)
+            .map(turn => turn.identity)
             .join('|');
 
         /*
@@ -1937,23 +2013,19 @@
             newTurns.length === turns.length &&
             rail.children.length === newTurns.length
         ) {
-            const targetsChanged = newTurns.some((turn, index) =>
-                turn.root !== previousTargets[index]?.root ||
-                turn.assistantUnit !== previousTargets[index]?.assistantUnit ||
-                turn.userBubble !== previousTargets[index]?.userBubble
-            );
-
             turns = newTurns;
             updateRailDensity();
 
-            if (targetsChanged || newTurns.length) {
-                newTurns.forEach((turn, index) => {
-                    rail.children[index]?.setAttribute(
-                        'aria-label',
-                        getTurnBarLabel(turn, index)
-                    );
-                });
-            }
+            newTurns.forEach((turn, index) => {
+                rail.children[index]?.setAttribute(
+                    'aria-label',
+                    getTurnBarLabel(
+                        turn,
+                        index,
+                        labelSources.get(turn.identity) || turn
+                    )
+                );
+            });
 
             if (newTurns.length === 0) {
                 rail.style.display = 'none';
@@ -1984,7 +2056,14 @@
             bar.type = 'button';
             bar.className = 'yw-turn-bar';
 
-            bar.setAttribute('aria-label', getTurnBarLabel(turn, index));
+            bar.setAttribute(
+                'aria-label',
+                getTurnBarLabel(
+                    turn,
+                    index,
+                    labelSources.get(turn.identity) || turn
+                )
+            );
 
             /*
              * 使用 index 而不是把 turn 对象锁死在 closure 中。
@@ -2155,6 +2234,7 @@
         assistantLabelRefreshTimer = null;
         const pending = Array.from(pendingAssistantLabelUnits.values());
         pendingAssistantLabelUnits.clear();
+        const observedTurns = collectTurns();
 
         let refreshed = false;
 
@@ -2166,7 +2246,6 @@
                 continue;
             }
 
-            const observedTurns = collectTurns();
             for (let index = 0; index < turns.length; index++) {
                 const turn = turns[index];
                 const isMatchingAssistant =
@@ -2201,7 +2280,7 @@
 
                 rail?.children[index]?.setAttribute(
                     'aria-label',
-                    getTurnBarLabel(turn, index)
+                    getTurnBarLabel(turn, index, observed || turn)
                 );
                 refreshed = true;
             }
