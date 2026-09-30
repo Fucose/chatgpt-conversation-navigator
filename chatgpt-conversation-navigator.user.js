@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.3.6
+// @version      0.3.7
 // @description  ChatGPT 对话导航：悬停预览，点击跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -26,6 +26,8 @@
         '[data-turn-key], [data-content-search-turn-key], ' +
         '[data-user-message-bubble="true"], ' +
         ASSISTANT_UNIT_SELECTOR + ', h4[data-conversation-role="assistant"]';
+    const INLINE_USER_EDITOR_SELECTOR =
+        'textarea, [contenteditable="true"], [contenteditable=""]';
 
     let rail = null;
     let preview = null;
@@ -45,6 +47,7 @@
     let currentChatIdentity = null;
     let turnIdentitiesByChat = new Map();
     let chatOwnersByTurnIdentity = new Map();
+    let userEditCandidates = new Map();
     let fallbackTurnOwnersByNode = new WeakMap();
     let assistantIdentitiesByNode = new WeakMap();
     let newConversationSubmissionPending = false;
@@ -545,6 +548,7 @@
         if (identity === currentChatIdentity) return;
 
         cancelJumpSearch();
+        userEditCandidates.clear();
 
         /* 根页刚提交 composer 后生成的 /c/<id> 才保留当前新对话。 */
         if (
@@ -949,13 +953,16 @@
         return text.slice(0, maxLength).trimEnd() + '…';
     }
 
-    function getUserText(turn) {
-        const liveText = turn?.userBubble
-            ? shorten(
-                turn.userBubble.innerText || turn.userBubble.textContent || '',
-                1000
+    function getFullUserText(turn) {
+        return turn?.userBubble
+            ? normalizeText(
+                turn.userBubble.innerText || turn.userBubble.textContent || ''
             )
             : '';
+    }
+
+    function getUserText(turn) {
+        const liveText = shorten(getFullUserText(turn), 1000);
 
         return liveText || turn?.userText || '';
     }
@@ -1021,7 +1028,8 @@
             turnRecordsByChat.set(chatIdentity, {
                 turns: [],
                 byIdentity: new Map(),
-                pairedAssistantToUser: new Map()
+                pairedAssistantToUser: new Map(),
+                suppressedRemovedIdentities: new Map()
             });
         }
 
@@ -1134,10 +1142,29 @@
     }
 
     function updateTurnRecord(record, observed, includeNodeReferences) {
-        const userText = getUserText(observed);
+        const liveObservation = Boolean(observed.root?.isConnected);
+        const liveRecord = Boolean(record.root?.isConnected);
+        const fullUserText = getFullUserText(observed);
+        const userText = shorten(fullUserText, 1000);
         const assistantText = getAssistantText(observed);
-        if (userText) record.userText = userText;
-        if (assistantText) record.assistantText = assistantText;
+        if (
+            observed.kind === 'user' &&
+            observed.userBubble &&
+            (
+                liveObservation ||
+                (!record.preserveCommittedUserText && !record.userTextSnapshot)
+            )
+        ) {
+            record.userTextSnapshot = fullUserText;
+            if (userText) record.userText = userText;
+            if (liveObservation) record.preserveCommittedUserText = false;
+        }
+        if (
+            assistantText &&
+            (liveObservation || (!liveRecord && !record.assistantText))
+        ) {
+            record.assistantText = assistantText;
+        }
 
         if (!includeNodeReferences || !observed.root?.isConnected) return;
 
@@ -1162,16 +1189,396 @@
         }
     }
 
+    function asElement(node) {
+        return node instanceof Element ? node : node?.parentElement || null;
+    }
+
+    function findKnownUserTurnContainingNode(node) {
+        const element = asElement(node);
+        if (!element || !currentChatIdentity) return null;
+
+        const store = turnRecordsByChat.get(currentChatIdentity);
+        const wrapper = getLogicalTurnWrapper(element);
+        const bubble = element.closest('[data-user-message-bubble="true"]');
+        const rawIdentity = getTurnWrapperKey(wrapper) ||
+            bubble?.getAttribute('data-chatgpt-search-message-ids');
+        const record = rawIdentity
+            ? store?.byIdentity.get(`user:${rawIdentity}`)
+            : null;
+        if (record?.kind !== 'user') return null;
+
+        return {
+            ...record,
+            root: wrapper || bubble,
+            userBubble: wrapper?.querySelector(
+                '[data-user-message-bubble="true"]'
+            ) || bubble
+        };
+    }
+
+    function findKnownUserContentTurn(node) {
+        const element = asElement(node);
+        const userBubble = element?.closest(
+            '[data-user-message-bubble="true"]'
+        );
+        if (userBubble) return findKnownUserTurnContainingNode(userBubble);
+
+        const editor = element?.matches(INLINE_USER_EDITOR_SELECTOR)
+            ? element
+            : element?.closest(INLINE_USER_EDITOR_SELECTOR);
+        return editor ? findKnownUserTurnContainingNode(editor) : null;
+    }
+
+    function getInlineUserEditors(root) {
+        if (!(root instanceof Element)) return [];
+
+        const editors = [];
+        if (root.matches(INLINE_USER_EDITOR_SELECTOR)) editors.push(root);
+        editors.push(...root.querySelectorAll(INLINE_USER_EDITOR_SELECTOR));
+        return editors;
+    }
+
+    function getInlineEditorText(editor) {
+        if (!(editor instanceof Element)) return '';
+        const text = 'value' in editor
+            ? editor.value
+            : editor.innerText || editor.textContent || '';
+        return normalizeText(text);
+    }
+
+    function rememberUserEditCandidate(turn, editor) {
+        if (!turn?.stableIdentity || turn.kind !== 'user') return;
+
+        const store = turnRecordsByChat.get(currentChatIdentity);
+        const pivotIndex = store?.turns.findIndex(record =>
+            record.identity === turn.identity
+        ) ?? -1;
+        const record = store?.byIdentity.get(turn.identity);
+        if (!record || pivotIndex < 0) return;
+
+        let candidate = userEditCandidates.get(turn.identity);
+        if (!candidate) {
+            let previousUserIdentity = null;
+            for (let index = pivotIndex - 1; index >= 0; index--) {
+                if (store.turns[index].kind === 'user') {
+                    previousUserIdentity = store.turns[index].identity;
+                    break;
+                }
+            }
+
+            candidate = {
+                chatIdentity: currentChatIdentity,
+                identity: turn.identity,
+                baselineText: record.userTextSnapshot || getFullUserText(turn),
+                previousUserIdentity,
+                root: turn.root,
+                userBubble: turn.userBubble,
+                editor: null
+            };
+            userEditCandidates.set(turn.identity, candidate);
+        }
+
+        if (editor) {
+            candidate.editor = editor;
+            if (editor.isConnected || candidate.latestEditorText === undefined) {
+                candidate.latestEditorText = getInlineEditorText(editor);
+            }
+        }
+        if (turn.root?.isConnected) candidate.root = turn.root;
+        if (turn.userBubble?.isConnected) candidate.userBubble = turn.userBubble;
+    }
+
+    function captureUserEditCandidatesFromMutation(mutation) {
+        const boundaryTurn = findKnownUserTurnContainingNode(mutation.target);
+        const nodes = [
+            ...(boundaryTurn ? [mutation.target] : []),
+            ...Array.from(mutation.addedNodes || []),
+            ...Array.from(mutation.removedNodes || [])
+        ];
+
+        for (const node of nodes) {
+            const element = asElement(node);
+            if (!element) continue;
+
+            const turn = findKnownUserTurnContainingNode(element) || boundaryTurn;
+            if (!turn) continue;
+
+            const editors = [];
+            const enclosingEditor = element.matches(INLINE_USER_EDITOR_SELECTOR)
+                ? element
+                : element.closest(INLINE_USER_EDITOR_SELECTOR);
+            if (enclosingEditor) editors.push(enclosingEditor);
+            if (element.matches(INLINE_USER_EDITOR_SELECTOR)) {
+                editors.push(element);
+            }
+            editors.push(...element.querySelectorAll(INLINE_USER_EDITOR_SELECTOR));
+            for (const editor of editors) {
+                rememberUserEditCandidate(turn, editor);
+            }
+        }
+    }
+
+    function turnMatchesEditRoot(turn, candidate) {
+        const root = candidate.root;
+        return Boolean(
+            root?.isConnected &&
+            turn?.root?.isConnected &&
+            (
+                root === turn.root ||
+                root.contains(turn.root) ||
+                turn.root.contains(root) ||
+                root.contains(turn.userBubble) ||
+                turn.root.contains(candidate.userBubble)
+            )
+        );
+    }
+
+    function findEditReplacement(candidate, store, observed) {
+        const users = observed.filter(turn =>
+            turn.kind === 'user' && turn.stableIdentity
+        );
+
+        const sameRootReplacement = users.find(turn =>
+            turn.identity !== candidate.identity &&
+            turnMatchesEditRoot(turn, candidate)
+        );
+        if (sameRootReplacement) return sameRootReplacement;
+
+        if (
+            candidate.latestEditorText &&
+            candidate.latestEditorText !== candidate.baselineText
+        ) {
+            const editedTextReplacement = users.find(turn =>
+                turn.identity !== candidate.identity &&
+                !store.byIdentity.has(turn.identity) &&
+                getFullUserText(turn) === candidate.latestEditorText
+            );
+            if (editedTextReplacement) return editedTextReplacement;
+        }
+
+        for (let index = 0; index < users.length; index++) {
+            const turn = users[index];
+            if (
+                turn.identity === candidate.identity ||
+                store.byIdentity.has(turn.identity)
+            ) {
+                continue;
+            }
+
+            const previousIdentity = users[index - 1]?.identity || null;
+            const atKnownBoundary = candidate.previousUserIdentity
+                ? previousIdentity === candidate.previousUserIdentity
+                : index === 0;
+            if (atKnownBoundary) return turn;
+        }
+
+        return null;
+    }
+
+    function resetPreviewAfterEdit() {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+        preview?.classList.remove('yw-visible', 'yw-assistant-only');
+        if (previewUser) previewUser.textContent = '';
+        if (previewAssistant) previewAssistant.textContent = '';
+    }
+
+    function reconcileEditedBranch(
+        store,
+        identity,
+        keepPivot,
+        observed,
+        replacementIdentity = null
+    ) {
+        const boundary = store.turns.findIndex(record =>
+            record.identity === identity
+        );
+        if (boundary < 0) return null;
+
+        const retainedIdentity = keepPivot ? identity : replacementIdentity;
+        const keepRecord = retainedIdentity
+            ? store.byIdentity.get(retainedIdentity)
+            : null;
+        const removedRecords = store.turns.slice(boundary).filter(record =>
+            record !== keepRecord
+        );
+        const removedIdentities = new Set(
+            removedRecords.map(record => record.identity)
+        );
+
+        if (keepPivot && keepRecord) {
+            keepRecord.preserveCommittedUserText = true;
+            keepRecord.assistantText = '';
+            keepRecord.assistantUnit = null;
+        }
+
+        for (const [assistantIdentity, userIdentity] of
+            Array.from(store.pairedAssistantToUser)
+        ) {
+            if (
+                removedIdentities.has(assistantIdentity) ||
+                removedIdentities.has(userIdentity) ||
+                (keepPivot && userIdentity === identity)
+            ) {
+                store.pairedAssistantToUser.delete(assistantIdentity);
+                const assistantRecord = store.byIdentity.get(assistantIdentity);
+                if (assistantRecord?.kind === 'assistant') {
+                    removedIdentities.add(assistantIdentity);
+                    store.byIdentity.delete(assistantIdentity);
+                }
+            }
+        }
+
+        for (const removedIdentity of removedIdentities) {
+            store.byIdentity.delete(removedIdentity);
+            store.suppressedRemovedIdentities.set(removedIdentity, {
+                awaitingUnmount: observed.some(turn =>
+                    turn.identity === removedIdentity
+                )
+            });
+        }
+
+        const retainedPrefix = store.turns.slice(0, boundary).filter(record =>
+            record !== keepRecord
+        );
+        store.turns = retainedPrefix;
+        if (keepRecord) store.turns.push(keepRecord);
+
+        cancelJumpSearch();
+        resetPreviewAfterEdit();
+        userEditCandidates.clear();
+        return {
+            removedIdentities,
+            replacementIdentity: keepPivot ? null : replacementIdentity,
+            insertionIndex: retainedPrefix.length
+        };
+    }
+
+    function reconcileObservedEdits(store, observed) {
+        for (const turn of observed) {
+            if (turn.kind !== 'user' || !turn.stableIdentity) continue;
+            for (const editor of getInlineUserEditors(turn.root)) {
+                rememberUserEditCandidate(turn, editor);
+            }
+        }
+
+        for (const [identity, candidate] of userEditCandidates) {
+            if (candidate.chatIdentity !== currentChatIdentity) {
+                userEditCandidates.delete(identity);
+                continue;
+            }
+
+            const oldTurn = observed.find(turn =>
+                turn.identity === candidate.identity && turn.kind === 'user'
+            );
+            const hasEditor = Boolean(
+                (
+                    candidate.editor?.isConnected &&
+                    candidate.editor.matches(INLINE_USER_EDITOR_SELECTOR)
+                ) ||
+                (
+                    candidate.root?.isConnected &&
+                    getInlineUserEditors(candidate.root).length
+                ) ||
+                (
+                    oldTurn?.root?.isConnected &&
+                    getInlineUserEditors(oldTurn.root).length
+                )
+            );
+            if (hasEditor) continue;
+
+            const replacement = findEditReplacement(candidate, store, observed);
+            if (replacement) {
+                return reconcileEditedBranch(
+                    store,
+                    candidate.identity,
+                    false,
+                    observed,
+                    replacement.identity
+                );
+            }
+
+            if (oldTurn) {
+                if (getFullUserText(oldTurn) !== candidate.baselineText) {
+                    return reconcileEditedBranch(
+                        store,
+                        candidate.identity,
+                        true,
+                        observed
+                    );
+                }
+
+                /* The editor closed without changing the committed user turn. */
+                userEditCandidates.delete(identity);
+            }
+        }
+
+        for (const turn of observed) {
+            if (turn.kind !== 'user' || !turn.stableIdentity) continue;
+            const record = store.byIdentity.get(turn.identity);
+            if (!record || typeof record.userTextSnapshot !== 'string') continue;
+
+            if (
+                getFullUserText(turn) !== record.userTextSnapshot &&
+                getInlineUserEditors(turn.root).length === 0
+            ) {
+                return reconcileEditedBranch(
+                    store,
+                    turn.identity,
+                    true,
+                    observed
+                );
+            }
+        }
+
+        return null;
+    }
+
     function mergeObservedTurnRecords(
         observedTurns,
         replaceNodeReferences,
-        alreadyTracked = false
+        alreadyTracked = false,
+        allowBranchReconciliation = false
     ) {
         if (!currentChatIdentity) return;
 
         const store = getTurnRecordStore(currentChatIdentity);
-        const observed = observedTurns.filter(turn => {
+        if (!store.suppressedRemovedIdentities) {
+            store.suppressedRemovedIdentities = new Map();
+        }
+
+        if (allowBranchReconciliation) {
+            const liveIdentities = new Set(observedTurns
+                .filter(turn => turn.root?.isConnected)
+                .map(turn => turn.identity));
+            for (const [identity, suppression] of
+                store.suppressedRemovedIdentities
+            ) {
+                if (
+                    suppression.awaitingUnmount &&
+                    !liveIdentities.has(identity)
+                ) {
+                    suppression.awaitingUnmount = false;
+                }
+            }
+        }
+
+        let observed = observedTurns.filter(turn => {
             if (!turn.stableIdentity) return false;
+
+            if (store.suppressedRemovedIdentities.has(turn.identity)) {
+                if (
+                    !turn.root?.isConnected ||
+                    store.suppressedRemovedIdentities.get(
+                        turn.identity
+                    ).awaitingUnmount
+                ) {
+                    return false;
+                }
+
+                /* A later live remount is allowed to establish the identity again. */
+                store.suppressedRemovedIdentities.delete(turn.identity);
+            }
 
             if (turn.kind === 'user' &&
                 !Array.isArray(turn.pairedAssistantUnits)) {
@@ -1191,6 +1598,17 @@
 
             return alreadyTracked || trackCurrentRouteTurn(turn);
         });
+
+        const editReconciliation = allowBranchReconciliation
+            ? reconcileObservedEdits(store, observed)
+            : null;
+        const prunedIdentities = editReconciliation?.removedIdentities ||
+            new Set();
+        if (prunedIdentities.size) {
+            observed = observed.filter(turn =>
+                !prunedIdentities.has(turn.identity)
+            );
+        }
 
         for (const turn of observed) {
             if (turn.kind !== 'user') continue;
@@ -1246,6 +1664,7 @@
                     userBubble: null,
                     assistantUnit: null,
                     userText: '',
+                    userTextSnapshot: '',
                     assistantText: '',
                     lastScrollTop: null,
                     scrollIsDocument: null,
@@ -1262,7 +1681,20 @@
         enforceObservedTurnOrder(store.turns, observed);
 
         for (const record of newRecords) {
-            insertTurnRecord(store.turns, record, observed);
+            if (
+                editReconciliation?.replacementIdentity === record.identity
+            ) {
+                const insertionIndex = Math.max(
+                    0,
+                    Math.min(
+                        editReconciliation.insertionIndex,
+                        store.turns.length
+                    )
+                );
+                store.turns.splice(insertionIndex, 0, record);
+            } else {
+                insertTurnRecord(store.turns, record, observed);
+            }
         }
     }
 
@@ -2060,7 +2492,7 @@
         ensureUI();
 
         const observedTurns = collectTurns().filter(trackCurrentRouteTurn);
-        mergeObservedTurnRecords(observedTurns, true, true);
+        mergeObservedTurnRecords(observedTurns, true, true, true);
         const newTurns = buildRenderedTurns(observedTurns);
         const labelSources = new Map(observedTurns.map(turn => [
             turn.identity,
@@ -2427,6 +2859,14 @@
     }
 
     function observeChatChanges() {
+        document.addEventListener('input', event => {
+            captureUserEditCandidatesFromMutation({
+                target: event.target,
+                addedNodes: [],
+                removedNodes: []
+            });
+        }, true);
+
         const observer = new MutationObserver(mutations => {
             const previousChatIdentity = currentChatIdentity;
             handleRouteChange();
@@ -2446,8 +2886,13 @@
                     continue;
                 }
 
+                captureUserEditCandidatesFromMutation(mutation);
+
                 if (mutation.type === 'characterData') {
                     queueAssistantBarRefresh(mutation.target);
+                    if (findKnownUserContentTurn(mutation.target)) {
+                        relevant = true;
+                    }
                     continue;
                 }
 
@@ -2461,6 +2906,10 @@
                         relevant = true;
                     }
                     continue;
+                }
+
+                if (findKnownUserContentTurn(mutation.target)) {
+                    relevant = true;
                 }
 
                 for (const node of mutation.removedNodes) {
@@ -2480,11 +2929,8 @@
                 for (const node of mutation.addedNodes) {
                     if (nodeContainsTurn(node)) {
                         relevant = true;
-                        break;
                     }
                 }
-
-                if (relevant) break;
 
                 if (mutation.type === 'childList') {
                     queueAssistantBarRefresh(mutation.target);
