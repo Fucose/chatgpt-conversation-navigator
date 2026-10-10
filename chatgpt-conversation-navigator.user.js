@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.2
+// @version      0.4.3
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史并回到回复顶部。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -1515,16 +1515,50 @@
                 stroke-linejoin: round;
             }
 
-            #${RAIL_ID} .yw-sr-only {
+            #${RAIL_ID} .yw-history-tooltip {
                 position: absolute;
-                width: 1px;
-                height: 1px;
-                padding: 0;
-                margin: -1px;
-                overflow: hidden;
-                clip: rect(0, 0, 0, 0);
-                white-space: nowrap;
+                right: calc(100% + 8px);
+                top: 0;
+                display: flex;
+                align-items: center;
+                width: max-content;
+                max-width: calc(100vw - 80px);
+                height: var(--yw-nav-control-size, 32px);
+                padding: 0 16px;
+                margin: 0;
+                box-sizing: border-box;
                 border: 0;
+                border-radius: 999px;
+                background: #0D0D0D;
+                color: #FFFFFF;
+                font-size: 14px;
+                line-height: 1.5;
+                font-weight: 700;
+                white-space: nowrap;
+                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+                opacity: 0;
+                visibility: hidden;
+                transform: translateX(4px);
+                transition: opacity 100ms ease, transform 100ms ease,
+                    visibility 100ms ease;
+                pointer-events: none;
+            }
+
+            #${RAIL_ID} .yw-history-tooltip-text {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            #${RAIL_ID} .yw-history-tooltip-detail {
+                font-weight: 400;
+            }
+
+            #${RAIL_ID} .yw-nav-toolbar:hover .yw-history-tooltip,
+            #${RAIL_ID} .yw-history-control:focus-visible ~ .yw-history-tooltip {
+                opacity: 1;
+                visibility: visible;
+                transform: translateX(0);
             }
 
             .yw-reply-top {
@@ -1862,7 +1896,8 @@
             toolbar.appendChild(historyControl);
 
             const status = document.createElement('span');
-            status.className = 'yw-sr-only';
+            status.className = 'yw-history-tooltip';
+            status.setAttribute('role', 'tooltip');
             status.setAttribute('aria-live', 'polite');
             status.id = `${RAIL_ID}-status`;
             toolbar.appendChild(status);
@@ -1980,8 +2015,21 @@
         historyControl.classList.toggle('yw-history-loading', Boolean(state?.running));
         historyControl.setAttribute('aria-busy', String(busy));
         historyControl.setAttribute('aria-label', label);
-        historyControl.title = title;
-        if (status) status.textContent = title;
+        historyControl.removeAttribute('title');
+        if (status && (!status.firstElementChild || status.textContent !== title)) {
+            const text = document.createElement('span');
+            text.className = 'yw-history-tooltip-text';
+            for (const part of title.split(/(（[^（）]*）)/u)) {
+                if (!part) continue;
+                const segment = document.createElement('span');
+                if (part.startsWith('（') && part.endsWith('）')) {
+                    segment.className = 'yw-history-tooltip-detail';
+                }
+                segment.textContent = part;
+                text.appendChild(segment);
+            }
+            status.replaceChildren(text);
+        }
     }
 
     function toggleHistoryLoading() {
