@@ -293,8 +293,7 @@
             cursor: null,
             hasError: false,
             error: null,
-            pagesLoaded: 0,
-            message: 'Ready'
+            pagesLoaded: 0
         };
 
         function snapshotSignature(snapshot) {
@@ -316,14 +315,13 @@
             return id === runId && getChatIdentity() === chatIdentity;
         }
 
-        async function run(mode = 'start') {
+        async function run() {
             if (runningPromise) return runningPromise;
             if (typeof readSnapshot !== 'function' ||
                 typeof loadPreviousPage !== 'function') {
                 state.status = 'error';
                 state.hasError = true;
                 state.error = new Error('History loader is not configured');
-                state.message = state.error.message;
                 return getState();
             }
 
@@ -334,16 +332,12 @@
             state.running = true;
             state.hasError = false;
             state.error = null;
-            state.message = mode === 'refresh'
-                ? 'Refreshing history…'
-                : 'Loading history…';
 
             const operation = Promise.resolve().then(async () => {
                 try {
                     let snapshot = await readSnapshot();
                     if (!isCurrent(id, chatIdentity)) {
                         state.status = 'stale';
-                        state.message = 'Conversation changed';
                         return getState();
                     }
                     updateFromSnapshot(snapshot);
@@ -391,9 +385,6 @@
                         if (nextCursor !== null) seenCursors.add(nextCursor);
                         if (!progressed || repeatedSignature || repeatedCursor) {
                             state.status = 'stopped';
-                            state.message = !progressed
-                                ? 'Stopped: no new history was loaded'
-                                : 'Stopped: history pagination repeated a cursor';
                             break;
                         }
                         if (stopRequested) break;
@@ -401,19 +392,14 @@
 
                     if (!isCurrent(id, chatIdentity)) {
                         state.status = 'stale';
-                        state.message = 'Conversation changed';
                     } else if (state.hasError) {
                         state.status = 'error';
-                        state.message = state.error?.message || 'History loading failed';
                     } else if (state.complete) {
                         state.status = 'complete';
-                        state.message = 'History is complete';
                     } else if (stopRequested && state.status !== 'stopped') {
                         state.status = 'stopped';
-                        state.message = 'History loading stopped';
                     } else if (state.status === 'loading') {
                         state.status = 'stopped';
-                        state.message = 'History loading paused';
                     }
                     return getState();
                 } catch (error) {
@@ -421,10 +407,8 @@
                         state.status = 'error';
                         state.hasError = true;
                         state.error = error;
-                        state.message = error?.message || 'History loading failed';
                     } else {
                         state.status = 'stale';
-                        state.message = 'Conversation changed';
                     }
                     return getState();
                 } finally {
@@ -444,13 +428,10 @@
         }
 
         return {
-            start: () => run('start'),
-            refresh: () => run('refresh'),
-            retry: () => run('retry'),
+            start: () => run(),
             stop: () => {
                 if (!state.running) return false;
                 stopRequested = true;
-                state.message = 'Stopping after the current page…';
                 return true;
             },
             getState
@@ -1022,50 +1003,30 @@
             if (rawPagination == null) {
                 return {
                     available: false,
-                    pending: true,
                     complete: false,
-                    nativeComplete: false,
                     cursor: null,
                     hasError: false,
                     isLoading: false,
-                    hasLoadedOlderPages: undefined,
-                    canLoadPrevious: false,
-                    completionReason: 'pagination-not-initialized',
+                    canLoadPrevious: false
                 };
             }
 
             const hasError = rawPagination.hasError === true;
             const isLoading = rawPagination.isLoading === true;
             const cursor = rawPagination.cursor ?? null;
-            const hasLoadedOlderPages = rawPagination.hasLoadedOlderPages;
             const canUseTerminalCursor = cursor === null &&
-                hasLoadedOlderPages === true;
+                rawPagination.hasLoadedOlderPages === true;
             const complete = !hasError && !isLoading &&
                 (rawPagination.complete === true || canUseTerminalCursor);
-            const completionReason = hasError
-                ? 'error'
-                : (isLoading
-                    ? 'loading'
-                    : (rawPagination.complete
-                        ? 'native-complete'
-                        : (canUseTerminalCursor
-                            ? 'older-pages-exhausted'
-                            : (cursor === null
-                                ? 'cursor-unproven'
-                                : 'cursor-available'))));
 
             return {
                 available: true,
-                pending: false,
                 complete,
-                nativeComplete: rawPagination.complete,
                 cursor,
                 hasError,
                 isLoading,
-                hasLoadedOlderPages,
                 canLoadPrevious: !isLoading && !complete &&
-                    typeof cursor === 'string',
-                completionReason,
+                    typeof cursor === 'string'
             };
         }
 
@@ -1417,7 +1378,6 @@
         'WINDOW_UNAVAILABLE',
         'ROUTER_MANIFEST_UNAVAILABLE',
         'CURRENT_ROUTE_UNAVAILABLE',
-        'MODULE_PRELOADS_UNAVAILABLE',
         'CURRENT_RUNTIME_UNAVAILABLE',
         'SUPPORTED_RUNTIME_NOT_FOUND',
         'SUPPORTED_MODULES_UNAVAILABLE',
@@ -1429,8 +1389,7 @@
         'APP_SCOPE_BINDING_UNAVAILABLE',
         'AMBIGUOUS_APP_SCOPE_BINDING',
         'NATIVE_CONVERSATION_STATE_UNAVAILABLE',
-        'NATIVE_PAGINATION_UNAVAILABLE',
-        'NATIVE_PAGINATION_UNINITIALIZED'
+        'NATIVE_PAGINATION_UNAVAILABLE'
     ]);
     const isRetryableNativeBindingError = error =>
         RETRYABLE_NATIVE_BINDING_CODES.has(error?.code);
@@ -2155,8 +2114,7 @@
         adapterConnecting,
         adapterError,
         loaderState,
-        pagination,
-        countLabel
+        pagination
     }) {
         const state = loaderState || {};
         const complete = pagination?.complete === true;
@@ -2176,14 +2134,14 @@
         const show = Boolean(chatOpen && turnCount > 0 &&
             (running || canLoadPrevious || stoppedWithMore || errorWithMore));
 
-        const label = `加载全部历史（${countLabel}）`;
+        const label = '加载全部历史';
         let visibleLabel = label;
         let title = label;
         let disabled = Boolean(adapterConnecting);
 
         if (running) {
             visibleLabel = '停止加载历史';
-            title = `正在加载历史；点击停止（${countLabel}）`;
+            title = '正在加载历史；点击停止';
         } else if (errorWithMore) {
             const error = state.error || adapterError;
             const code = String(error?.code || 'HISTORY_LOAD_FAILED').slice(0, 48);
@@ -2194,7 +2152,7 @@
             title = label;
         } else if (state.status === 'stopped') {
             visibleLabel = '继续加载历史';
-            title = `继续加载历史（${countLabel}）`;
+            title = '继续加载历史';
         }
 
         return {
@@ -2211,18 +2169,13 @@
         const status = document.getElementById(`${RAIL_ID}-status`);
         const state = historyLoader?.getState();
         const chatOpen = Boolean(getNativeConversationId());
-        const indexedCount = currentChatIdentity
-            ? getConversationIndex(currentChatIdentity).getEntries().length
-            : 0;
-        const countLabel = `当前已索引 ${indexedCount} 轮`;
         const view = deriveHistoryControlView({
             chatOpen,
             turnCount: turns.length,
             adapterConnecting,
             adapterError: nativeAdapterError,
             loaderState: state,
-            pagination: latestNativePagination,
-            countLabel
+            pagination: latestNativePagination
         });
 
         historyControl.hidden = view.hidden;
@@ -2277,11 +2230,7 @@
             updateHistoryControl();
             return;
         }
-        const operation = state.status === 'complete'
-            ? historyLoader.refresh()
-            : (state.status === 'error' || nativeAdapterError
-                ? historyLoader.retry()
-                : historyLoader.start());
+        const operation = historyLoader.start();
         updateHistoryControl();
         Promise.resolve(operation).finally(updateHistoryControl);
     }
@@ -2388,8 +2337,6 @@
             }
 
             acceptNativeSnapshot(snapshot, chatIdentity);
-            nativeAdapterRetryPending = false;
-            resetNativeAdapterRetryBackoff();
             historyLoader = createHistoryLoader({
                 readSnapshot: () => adapter.readSnapshot(),
                 loadPreviousPage: () => adapter.loadPreviousPage(),
@@ -2565,11 +2512,9 @@
             insertTurnRecord(targetStore.turns, record);
         }
 
-        if (sourceStore.identityAliases) {
-            for (const [alias, canonical] of sourceStore.identityAliases) {
-                if (!targetStore.identityAliases.has(alias)) {
-                    targetStore.identityAliases.set(alias, canonical);
-                }
+        for (const [alias, canonical] of sourceStore.identityAliases) {
+            if (!targetStore.identityAliases.has(alias)) {
+                targetStore.identityAliases.set(alias, canonical);
             }
         }
 
@@ -2845,12 +2790,14 @@
         return value;
     }
 
-    function getUserIdentityCandidates(bubble, root) {
-        const candidates = [];
-
+    /*
+     * Stable user-turn identity: the native turn key, then the user message
+     * id, then a non-positional content-search key.
+     */
+    function getUserStableIdentity(bubble, root) {
         const turnKey = root.getAttribute('data-turn-key') || '';
         if (turnKey && !isFallbackSearchKey(turnKey)) {
-            candidates.push(`user:${turnKey}`);
+            return `user:${turnKey}`;
         }
 
         const messageId = getFirstMessageId(
@@ -2858,15 +2805,15 @@
             bubble.getAttribute('data-message-id')
         );
         if (messageId && !isFallbackSearchKey(messageId)) {
-            candidates.push(`user:${messageId}`);
+            return `user:${messageId}`;
         }
 
         const searchKey = root.getAttribute('data-content-search-turn-key') || '';
         if (searchKey && !isFallbackSearchKey(searchKey)) {
-            candidates.push(`user:${searchKey}`);
+            return `user:${searchKey}`;
         }
 
-        return candidates;
+        return '';
     }
 
     function collectTurns(scope = document) {
@@ -2885,9 +2832,8 @@
             const root = getLogicalTurnWrapper(bubble);
             if (!root) continue;
 
-            const identityCandidates = getUserIdentityCandidates(bubble, root);
             const fallbackKey = `turn-${userTurns.length}`;
-            const stableIdentity = identityCandidates[0] || '';
+            const stableIdentity = getUserStableIdentity(bubble, root);
             const identity = stableIdentity ||
                 `fallback:${fallbackKey}:${normalizeText(
                     bubble.innerText || bubble.textContent || ''
@@ -3037,7 +2983,9 @@
         }
 
         /* Last resort: positional fallback keys; they may drift. */
-        if (rawUnitIdentity) candidates.push(rawUnitIdentity);
+        if (rawUnitIdentity && isFallbackSearchKey(rawUnitIdentity)) {
+            candidates.push(rawUnitIdentity);
+        }
         return candidates;
     }
 
@@ -4101,8 +4049,6 @@
     function reconcileObservedTurnIdentities(observedTurns) {
         if (!currentChatIdentity || !observedTurns?.length) return;
         const store = getTurnRecordStore(currentChatIdentity);
-        if (!store.identityAliases) store.identityAliases = new Map();
-        if (!store.identitiesByNode) store.identitiesByNode = new WeakMap();
 
         for (const turn of observedTurns) {
             if (!turn?.identity) continue;
@@ -4110,6 +4056,11 @@
             const expectedPrefix = turn.kind === 'user'
                 ? 'user:'
                 : 'assistant:';
+            const turnNodes = [
+                turn.root,
+                turn.userBubble,
+                turn.assistantUnit
+            ];
             let canonical = '';
 
             if (turn.stableIdentity) {
@@ -4120,11 +4071,7 @@
             }
 
             if (!canonical) {
-                for (const node of [
-                    turn.root,
-                    turn.userBubble,
-                    turn.assistantUnit
-                ]) {
+                for (const node of turnNodes) {
                     if (!(node instanceof Element) || !node.isConnected) {
                         continue;
                     }
@@ -4179,11 +4126,7 @@
             }
 
             if (!turn.stableIdentity || !turn.identity) continue;
-            for (const node of [
-                turn.root,
-                turn.userBubble,
-                turn.assistantUnit
-            ]) {
+            for (const node of turnNodes) {
                 if (node instanceof Element && node.isConnected) {
                     store.identitiesByNode.set(node, turn.identity);
                 }
@@ -4287,7 +4230,6 @@
      */
     function collapseDuplicateTurnRecords(store) {
         if (!store?.turns?.length) return 0;
-        if (!store.identityAliases) store.identityAliases = new Map();
 
         const ownerByAlias = new Map();
         const canonicalOf = new Map();
@@ -4349,9 +4291,6 @@
         if (!currentChatIdentity) return;
 
         const store = getTurnRecordStore(currentChatIdentity);
-        if (!store.suppressedRemovedIdentities) {
-            store.suppressedRemovedIdentities = new Map();
-        }
 
         reconcileObservedTurnIdentities(observedTurns);
 
@@ -4926,10 +4865,6 @@
         return null;
     }
 
-    function findCurrentTurn(identity) {
-        return turns.find(turn => turn.identity === identity) || null;
-    }
-
     function findMountedTurn(identity) {
         const direct = mountedTurnsByIdentity.get(identity);
         if (direct?.root?.isConnected) return direct;
@@ -5457,11 +5392,6 @@
         const index = turns.findIndex(turn => turn.identity === identity);
         if (index >= 0) showPreview(index, bar);
     }
-
-    async function jumpToTurn(identity) {
-        return jumpToIdentity(identity);
-    }
-
 
     /******************************************************************
      * 根据消息数量调节 bar 间距
