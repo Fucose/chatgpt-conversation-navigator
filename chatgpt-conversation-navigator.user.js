@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.3
+// @version      0.4.4
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史并回到回复顶部。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -111,11 +111,28 @@
             rebuildAliases();
         }
 
-        function resolveEntry(record) {
+        function resolveEntry(record, options = {}) {
             rebuildAliases();
-            return record?.identity
-                ? findMatch(record)
-                : null;
+            if (!record?.identity) return null;
+            if (options.kind) {
+                for (const alias of getAliases(record)) {
+                    const match = aliases.get(alias);
+                    if (match && match.kind === options.kind) return match;
+                }
+                return null;
+            }
+            return findMatch(record);
+        }
+
+        function retire(identity) {
+            const index = entries.findIndex(entry =>
+                entry.identity === identity
+            );
+            if (index < 0) return false;
+            entries.splice(index, 1);
+            committedUserText.delete(identity);
+            rebuildAliases();
+            return true;
         }
 
         function addSuppression(entry) {
@@ -249,6 +266,7 @@
             applySnapshot,
             getEntries: () => entries,
             pruneFrom,
+            retire,
             resolveEntry,
             hasSnapshot: () => authoritative,
             getBranchKey: () => branchKey,
@@ -457,6 +475,7 @@
         ];
         const MAX_PAGE_ELEMENTS = 200_000;
         const MAX_FIBER_NODES_PER_ROOT = 200_000;
+        const MAX_RUNTIME_CANDIDATES = 32;
         const PAGE_LOAD_WAIT_MS = 60_000;
         const PAGE_LOAD_POLL_MS = 250;
 
@@ -556,14 +575,14 @@
                 fail('DOCUMENT_UNAVAILABLE', 'The current page document is unavailable.');
             }
 
+            const urls = new Set();
             let links;
             try {
                 links = documentObject.querySelectorAll(MODULE_PRELOAD_SELECTOR);
             } catch (_error) {
-                fail('MODULE_PRELOADS_UNAVAILABLE', 'Current ChatGPT module preloads could not be read.');
+                return urls;
             }
 
-            const urls = new Set();
             for (const link of Array.from(links || [])) {
                 const value = link?.href || link?.getAttribute?.('href');
                 const url = asSameOriginAsset(value, windowObject);
@@ -574,43 +593,73 @@
         }
 
         function getRuntimeCandidates(manifest, documentObject, windowObject) {
-            if (!isObject(manifest) || !isObject(manifest.routes)) {
-                fail('ROUTER_MANIFEST_UNAVAILABLE', 'The current ChatGPT route manifest is unavailable.');
-            }
-
             const pathname = windowObject.location?.pathname;
             if (typeof pathname !== 'string' || !pathname) {
                 fail('CURRENT_ROUTE_UNAVAILABLE', 'The active ChatGPT route could not be identified.');
             }
 
+            /*
+             * Module preloads are one evidence source, not a prerequisite.
+             * SPA route transitions may not have added preload links yet, and
+             * current frontend rollouts do not guarantee them for every route.
+             */
             const preloads = getModulePreloadUrls(documentObject, windowObject);
-            if (preloads.size === 0) {
-                fail('MODULE_PRELOADS_UNAVAILABLE', 'No current ChatGPT JavaScript module preloads were found.');
+            const scores = new Map();
+            for (const url of preloads) {
+                scores.set(url, 3);
             }
 
-            const routeAssets = getRouteAssets(manifest.routes, pathname);
-            if (isObject(manifest.entry) && Array.isArray(manifest.entry.imports)) {
-                routeAssets.push(...manifest.entry.imports);
+            if (isObject(manifest) && isObject(manifest.routes)) {
+                const routeAssets = getRouteAssets(manifest.routes, pathname);
+                if (isObject(manifest.entry) && Array.isArray(manifest.entry.imports)) {
+                    routeAssets.push(...manifest.entry.imports);
+                }
+
+                for (const asset of routeAssets) {
+                    const url = asSameOriginAsset(asset, windowObject);
+                    if (!url) continue;
+                    scores.set(url, preloads.has(url) ? 5 : 4);
+                }
             }
 
-            const counts = new Map();
-            for (const asset of routeAssets) {
-                const url = asSameOriginAsset(asset, windowObject);
-                if (!url || !preloads.has(url)) continue;
-                counts.set(url, (counts.get(url) || 0) + 1);
+            try {
+                const resources = windowObject.performance?.getEntriesByType?.('resource');
+                for (const entry of Array.from(resources || [])) {
+                    const url = asSameOriginAsset(entry?.name, windowObject);
+                    if (url && !scores.has(url)) scores.set(url, 1);
+                }
+            } catch (_error) {
+                /* The performance timeline is optional evidence. */
             }
 
-            if (counts.size === 0) {
-                fail('CURRENT_RUNTIME_UNAVAILABLE', 'No current route module was present in ChatGPT module preloads.');
+            if (scores.size === 0) {
+                fail(
+                    isObject(manifest)
+                        ? 'CURRENT_RUNTIME_UNAVAILABLE'
+                        : 'ROUTER_MANIFEST_UNAVAILABLE',
+                    'No ChatGPT JavaScript assets were available to discover the current runtime.'
+                );
             }
 
-            return [...counts.entries()]
+            return [...scores.entries()]
                 .sort((left, right) => right[1] - left[1])
+                .slice(0, MAX_RUNTIME_CANDIDATES)
                 .map(([url]) => url);
         }
 
         function isWebpackRequire(value) {
             return typeof value === 'function' && isObject(value.m);
+        }
+
+        let cachedWebpackRequire = null;
+
+        function getRuntimeValidationError(requireFunction) {
+            try {
+                requireSupportedModules(requireFunction);
+                return null;
+            } catch (error) {
+                return error;
+            }
         }
 
         async function discoverWebpackRequire({
@@ -622,12 +671,26 @@
                 fail('WINDOW_UNAVAILABLE', 'The current ChatGPT window is unavailable.');
             }
 
+            /*
+             * Once a runtime works on this page it stays valid for the whole
+             * SPA session, including later route transitions. Re-validate
+             * against the module contract in case the page reloaded a bundle.
+             */
+            if (
+                cachedWebpackRequire &&
+                !getRuntimeValidationError(cachedWebpackRequire)
+            ) {
+                return cachedWebpackRequire;
+            }
+            cachedWebpackRequire = null;
+
             const manifest = windowObject.__reactRouterManifest;
             const candidates = getRuntimeCandidates(manifest, documentObject, windowObject);
             const importer = typeof importModule === 'function'
                 ? importModule
                 : specifier => import(specifier);
 
+            let lastModuleError = null;
             for (const url of candidates) {
                 let namespace;
                 try {
@@ -637,9 +700,19 @@
                 }
 
                 const requireFunction = namespace?.__webpack_require__;
-                if (isWebpackRequire(requireFunction)) return requireFunction;
+                if (!isWebpackRequire(requireFunction)) continue;
+
+                const moduleError = getRuntimeValidationError(requireFunction);
+                if (moduleError) {
+                    lastModuleError = moduleError;
+                    continue;
+                }
+
+                cachedWebpackRequire = requireFunction;
+                return requireFunction;
             }
 
+            if (lastModuleError) throw lastModuleError;
             fail('SUPPORTED_RUNTIME_NOT_FOUND', 'The current ChatGPT runtime does not expose the supported module loader.');
         }
 
@@ -911,9 +984,12 @@
                 fail('NATIVE_PAGINATION_UNAVAILABLE', 'ChatGPT pagination state could not be read.');
             }
 
-            if (value == null) {
-                fail('NATIVE_PAGINATION_UNINITIALIZED', 'ChatGPT pagination state has not initialized for this conversation.');
-            }
+            /*
+             * A conversation without older pages (for example a short chat)
+             * never initializes pagination state. "Missing" is a valid
+             * capability answer, not a failure.
+             */
+            if (value == null) return null;
             if (!isObject(value)) {
                 fail('UNSUPPORTED_PAGINATION_SHAPE', 'ChatGPT pagination state has an unsupported shape.');
             }
@@ -943,6 +1019,21 @@
         }
 
         function normalizeNativePagination(rawPagination) {
+            if (rawPagination == null) {
+                return {
+                    available: false,
+                    pending: true,
+                    complete: false,
+                    nativeComplete: false,
+                    cursor: null,
+                    hasError: false,
+                    isLoading: false,
+                    hasLoadedOlderPages: undefined,
+                    canLoadPrevious: false,
+                    completionReason: 'pagination-not-initialized',
+                };
+            }
+
             const hasError = rawPagination.hasError === true;
             const isLoading = rawPagination.isLoading === true;
             const cursor = rawPagination.cursor ?? null;
@@ -964,6 +1055,8 @@
                                 : 'cursor-available'))));
 
             return {
+                available: true,
+                pending: false,
                 complete,
                 nativeComplete: rawPagination.complete,
                 cursor,
@@ -1209,6 +1302,11 @@
                     return readSnapshot();
                 }
 
+                /* Nothing proves that older pages exist for this conversation. */
+                if (!pagination.available) {
+                    return readSnapshot();
+                }
+
                 if (conversationStateKey == null) {
                     if (rawPagination.cursor == null && rawPagination.isLoading !== true) {
                         return readSnapshot();
@@ -1297,7 +1395,13 @@
         }
         return { createNativeAdapter, NativeAdapterError };
     })();
-    const core = { createConversationIndex, createHistoryLoader, createNativeAdapter, NativeAdapterError };
+    const core = {
+        createConversationIndex,
+        createHistoryLoader,
+        createNativeAdapter,
+        deriveHistoryControlView,
+        NativeAdapterError
+    };
     if (typeof module === 'object' && module?.exports &&
         typeof document === 'undefined') {
         module.exports = core;
@@ -1309,12 +1413,29 @@
     const PREVIEW_ID = 'yw-chatgpt-turn-preview';
     const STYLE_ID = 'yw-chatgpt-turn-nav-style';
     const RETRYABLE_NATIVE_BINDING_CODES = new Set([
+        'DOCUMENT_UNAVAILABLE',
+        'WINDOW_UNAVAILABLE',
+        'ROUTER_MANIFEST_UNAVAILABLE',
+        'CURRENT_ROUTE_UNAVAILABLE',
+        'MODULE_PRELOADS_UNAVAILABLE',
+        'CURRENT_RUNTIME_UNAVAILABLE',
+        'SUPPORTED_RUNTIME_NOT_FOUND',
+        'SUPPORTED_MODULES_UNAVAILABLE',
+        'SUPPORTED_MODULE_SHAPE_UNKNOWN',
+        'REACT_FIBERS_UNAVAILABLE',
+        'REACT_FIBER_LIMIT_EXCEEDED',
         'ACTIVE_CONVERSATION_NOT_FOUND',
+        'AMBIGUOUS_ACTIVE_CONVERSATION',
         'APP_SCOPE_BINDING_UNAVAILABLE',
+        'AMBIGUOUS_APP_SCOPE_BINDING',
+        'NATIVE_CONVERSATION_STATE_UNAVAILABLE',
+        'NATIVE_PAGINATION_UNAVAILABLE',
         'NATIVE_PAGINATION_UNINITIALIZED'
     ]);
     const isRetryableNativeBindingError = error =>
         RETRYABLE_NATIVE_BINDING_CODES.has(error?.code);
+    const NATIVE_ADAPTER_RETRY_BASE_MS = 800;
+    const NATIVE_ADAPTER_RETRY_MAX_MS = 30_000;
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
@@ -1346,9 +1467,10 @@
     let adapterConnecting = false;
     let nativeAdapterEpoch = 0;
     let nativeSnapshotTimer = null;
-    let latestNativePaginationComplete = null;
+    let latestNativePagination = null;
     let nativeAdapterRetryPending = false;
-    let lastNativeAdapterRetryAt = 0;
+    let nativeAdapterRetryDelayMs = 0;
+    let nextNativeAdapterRetryAt = 0;
     let scrollCoordinatorResizeObserver = null;
     let threadResizeObserver = null;
     let threadResizeObservedNodes = new Set();
@@ -1367,13 +1489,27 @@
     let chatOwnersByTurnIdentity = new Map();
     let userEditCandidates = new Map();
     let fallbackTurnOwnersByNode = new WeakMap();
-    let assistantIdentitiesByNode = new WeakMap();
     let newConversationSubmissionPending = false;
     let newConversationSubmissionTimer = null;
     let assistantLabelRefreshTimer = null;
     let pendingAssistantLabelUnits = new Map();
     let railDensityCacheKey = '';
     let railLayoutSignature = '';
+
+    function bumpNativeAdapterRetryBackoff() {
+        nativeAdapterRetryDelayMs = nativeAdapterRetryDelayMs
+            ? Math.min(
+                nativeAdapterRetryDelayMs * 2,
+                NATIVE_ADAPTER_RETRY_MAX_MS
+            )
+            : NATIVE_ADAPTER_RETRY_BASE_MS;
+        nextNativeAdapterRetryAt = Date.now() + nativeAdapterRetryDelayMs;
+    }
+
+    function resetNativeAdapterRetryBackoff() {
+        nativeAdapterRetryDelayMs = 0;
+        nextNativeAdapterRetryAt = 0;
+    }
 
     /******************************************************************
      * CSS
@@ -1883,6 +2019,8 @@
                 toolbar.className = 'yw-nav-toolbar';
                 rail.appendChild(toolbar);
             }
+            /* Drop controls rendered by an older version of the script. */
+            toolbar.replaceChildren();
             historyControl = document.createElement('button');
             historyControl.type = 'button';
             historyControl.className = 'yw-history-control';
@@ -1904,7 +2042,32 @@
             historyControl.setAttribute('aria-describedby', status.id);
         }
 
-        if (!barList || !rail.contains(barList)) {
+        if (!barList || !rail.contains(barList) || barList.parentElement !== rail) {
+            /*
+             * An updated script can reuse a rail rendered by an older
+             * version on a live page. Adopt its single bar list and drop
+             * legacy bar/list nodes instead of stacking a second list.
+             */
+            barList = null;
+            for (const child of Array.from(rail.children)) {
+                if (!(child instanceof Element)) continue;
+                if (
+                    child.classList.contains('yw-turn-list') &&
+                    !barList
+                ) {
+                    barList = child;
+                    continue;
+                }
+                if (
+                    child.classList.contains('yw-turn-list') ||
+                    child.classList.contains('yw-turn-bar')
+                ) {
+                    child.remove();
+                }
+            }
+        }
+
+        if (!barList) {
             barList = document.createElement('div');
             barList.className = 'yw-turn-list';
             barList.setAttribute('aria-label', 'Conversation turns');
@@ -1914,6 +2077,9 @@
         if (!rail.isConnected) document.body.appendChild(rail);
 
         if (!replyTopButton || !replyTopButton.isConnected) {
+            for (const stale of document.querySelectorAll('.yw-reply-top')) {
+                stale.remove();
+            }
             replyTopButton = document.createElement('button');
             replyTopButton.type = 'button';
             replyTopButton.className = 'yw-reply-top';
@@ -1977,6 +2143,69 @@
             : null;
     }
 
+    /*
+     * The history control is an action button, not a pagination diagnostic.
+     * It only appears when the native state confirms that older pages exist
+     * (a cursor) or when an already-started load can be resumed or retried.
+     * "Unknown" must never look like "needs loading".
+     */
+    function deriveHistoryControlView({
+        chatOpen,
+        turnCount,
+        adapterConnecting,
+        adapterError,
+        loaderState,
+        pagination,
+        countLabel
+    }) {
+        const state = loaderState || {};
+        const complete = pagination?.complete === true;
+        const canLoadPrevious = !complete &&
+            pagination?.canLoadPrevious === true;
+        const cursor = state.cursor ?? pagination?.cursor ?? null;
+        const cursorKnown = typeof cursor === 'string' && cursor.length > 0;
+        const running = Boolean(state.running);
+        const stoppedWithMore = !complete && cursorKnown &&
+            state.status === 'stopped';
+        const errorWithMore = !complete && cursorKnown &&
+            (
+                state.status === 'error' ||
+                pagination?.hasError === true ||
+                Boolean(adapterError)
+            );
+        const show = Boolean(chatOpen && turnCount > 0 &&
+            (running || canLoadPrevious || stoppedWithMore || errorWithMore));
+
+        const label = `加载全部历史（${countLabel}）`;
+        let visibleLabel = label;
+        let title = label;
+        let disabled = Boolean(adapterConnecting);
+
+        if (running) {
+            visibleLabel = '停止加载历史';
+            title = `正在加载历史；点击停止（${countLabel}）`;
+        } else if (errorWithMore) {
+            const error = state.error || adapterError;
+            const code = String(error?.code || 'HISTORY_LOAD_FAILED').slice(0, 48);
+            visibleLabel = '重试加载历史';
+            title = `加载失败（${code}），点击重试。`;
+        } else if (!chatOpen) {
+            disabled = true;
+            title = label;
+        } else if (state.status === 'stopped') {
+            visibleLabel = '继续加载历史';
+            title = `继续加载历史（${countLabel}）`;
+        }
+
+        return {
+            hidden: !show,
+            label: visibleLabel,
+            title,
+            disabled,
+            busy: Boolean(adapterConnecting || state.running)
+        };
+    }
+
     function updateHistoryControl() {
         if (!historyControl) return;
         const status = document.getElementById(`${RAIL_ID}-status`);
@@ -1986,40 +2215,28 @@
             ? getConversationIndex(currentChatIdentity).getEntries().length
             : 0;
         const countLabel = `当前已索引 ${indexedCount} 轮`;
-        const complete = latestNativePaginationComplete === true;
-        let label = `加载全部历史（${countLabel}）`;
-        let title = label;
-        let disabled = Boolean(adapterConnecting);
-        const busy = Boolean(adapterConnecting || state?.running);
+        const view = deriveHistoryControlView({
+            chatOpen,
+            turnCount: turns.length,
+            adapterConnecting,
+            adapterError: nativeAdapterError,
+            loaderState: state,
+            pagination: latestNativePagination,
+            countLabel
+        });
 
-        if (state?.running) {
-            label = '停止加载历史';
-            title = `正在加载历史；点击停止（${countLabel}）`;
-        } else if ((state?.status === 'error' || nativeAdapterError) && chatOpen) {
-            const error = state?.error || nativeAdapterError;
-            const code = String(error?.code || 'HISTORY_LOAD_FAILED').slice(0, 48);
-            label = '重试加载历史';
-            title = `加载失败（${code}），点击重试。`;
-        } else if (!chatOpen) {
-            disabled = true;
-            title = label;
-        } else if (state?.status === 'stopped') {
-            label = '继续加载历史';
-            title = `继续加载历史（${countLabel}）`;
-        }
-
-        historyControl.hidden = !turns.length || !chatOpen || complete;
+        historyControl.hidden = view.hidden;
         const toolbar = rail?.querySelector('.yw-nav-toolbar');
         if (toolbar) toolbar.hidden = historyControl.hidden;
-        historyControl.disabled = disabled;
+        historyControl.disabled = view.disabled;
         historyControl.classList.toggle('yw-history-loading', Boolean(state?.running));
-        historyControl.setAttribute('aria-busy', String(busy));
-        historyControl.setAttribute('aria-label', label);
+        historyControl.setAttribute('aria-busy', String(view.busy));
+        historyControl.setAttribute('aria-label', view.label);
         historyControl.removeAttribute('title');
-        if (status && (!status.firstElementChild || status.textContent !== title)) {
+        if (status && (!status.firstElementChild || status.textContent !== view.title)) {
             const text = document.createElement('span');
             text.className = 'yw-history-tooltip-text';
-            for (const part of title.split(/(（[^（）]*）)/u)) {
+            for (const part of view.title.split(/(（[^（）]*）)/u)) {
                 if (!part) continue;
                 const segment = document.createElement('span');
                 if (part.startsWith('（') && part.endsWith('）')) {
@@ -2075,11 +2292,10 @@
             adapterConnecting ||
             nativeAdapterError ||
             !getNativeConversationId(currentChatIdentity) ||
-            Date.now() - lastNativeAdapterRetryAt < 1000
+            Date.now() < nextNativeAdapterRetryAt
         ) {
             return;
         }
-        lastNativeAdapterRetryAt = Date.now();
         if (nativeAdapter && historyLoader) {
             nativeAdapterRetryPending = false;
             scheduleNativeSnapshotRefresh();
@@ -2105,6 +2321,8 @@
         nativeAdapter = null;
         nativeAdapterError = null;
         adapterConnecting = false;
+        nativeAdapterRetryPending = false;
+        latestNativePagination = null;
         try {
             adapter?.dispose?.();
         } catch (error) {
@@ -2121,7 +2339,10 @@
     async function startNativeAdapter(chatIdentity, options = {}) {
         const manual = Boolean(options.manual);
         disposeRouteAdapter();
-        if (manual) nativeAdapterRetryPending = false;
+        if (manual) {
+            nativeAdapterRetryPending = false;
+            resetNativeAdapterRetryBackoff();
+        }
         const epoch = nativeAdapterEpoch;
         const chatId = getNativeConversationId(chatIdentity);
         if (!chatId) {
@@ -2168,6 +2389,7 @@
 
             acceptNativeSnapshot(snapshot, chatIdentity);
             nativeAdapterRetryPending = false;
+            resetNativeAdapterRetryBackoff();
             historyLoader = createHistoryLoader({
                 readSnapshot: () => adapter.readSnapshot(),
                 loadPreviousPage: () => adapter.loadPreviousPage(),
@@ -2211,14 +2433,16 @@
                 nativeAdapterRetryPending = !manual &&
                     isRetryableNativeBindingError(error);
                 nativeAdapterError = nativeAdapterRetryPending ? null : error;
+                if (nativeAdapterRetryPending) bumpNativeAdapterRetryBackoff();
+                else resetNativeAdapterRetryBackoff();
                 try {
                     nativeAdapter?.dispose?.();
                 } catch (_) {}
                 nativeAdapter = null;
                 historyLoader = null;
-                if (manual) {
+                if (manual || !nativeAdapterRetryPending) {
                     const code = String(error?.code || 'HISTORY_LOAD_FAILED').slice(0, 48);
-                    console.warn(`[Conversation Navigator] History loading failed (${code})`);
+                    console.warn(`[Conversation Navigator] Native history adapter failed (${code})`);
                 }
                 updateHistoryControl();
             }
@@ -2341,6 +2565,14 @@
             insertTurnRecord(targetStore.turns, record);
         }
 
+        if (sourceStore.identityAliases) {
+            for (const [alias, canonical] of sourceStore.identityAliases) {
+                if (!targetStore.identityAliases.has(alias)) {
+                    targetStore.identityAliases.set(alias, canonical);
+                }
+            }
+        }
+
         for (const [assistantIdentity, userIdentity] of
             sourceStore.pairedAssistantToUser
         ) {
@@ -2407,9 +2639,9 @@
 
         cancelJumpSearch();
         userEditCandidates.clear();
-        latestNativePaginationComplete = null;
+        latestNativePagination = null;
         nativeAdapterRetryPending = false;
-        lastNativeAdapterRetryAt = 0;
+        resetNativeAdapterRetryBackoff();
 
         /* 根页刚提交 composer 后生成的 /c/<id> 才保留当前新对话。 */
         if (
@@ -2579,6 +2811,64 @@
         return visibility === 'hidden' || visibility === 'collapse';
     }
 
+    /*
+     * ChatGPT uses two kinds of DOM keys: stable turn/message UUIDs and
+     * positional content-search fallback keys ("fallback-turn-N"). Positional
+     * keys renumber whenever the virtualized window shifts, so they must
+     * never become persistent identities.
+     */
+    function isFallbackSearchKey(value) {
+        return typeof value === 'string' &&
+            (
+                value.startsWith('fallback-') ||
+                value.startsWith('fallback:')
+            );
+    }
+
+    function getFirstMessageId(value) {
+        return String(value || '')
+            .split(/\s+/)
+            .map(id => id.trim())
+            .filter(Boolean)[0] || '';
+    }
+
+    function getIdentityValue(identity) {
+        const value = String(identity || '')
+            .replace(/^(user|assistant):/, '');
+        if (
+            !value ||
+            isFallbackSearchKey(value) ||
+            value.startsWith('round:')
+        ) {
+            return '';
+        }
+        return value;
+    }
+
+    function getUserIdentityCandidates(bubble, root) {
+        const candidates = [];
+
+        const turnKey = root.getAttribute('data-turn-key') || '';
+        if (turnKey && !isFallbackSearchKey(turnKey)) {
+            candidates.push(`user:${turnKey}`);
+        }
+
+        const messageId = getFirstMessageId(
+            bubble.getAttribute('data-chatgpt-search-message-ids') ||
+            bubble.getAttribute('data-message-id')
+        );
+        if (messageId && !isFallbackSearchKey(messageId)) {
+            candidates.push(`user:${messageId}`);
+        }
+
+        const searchKey = root.getAttribute('data-content-search-turn-key') || '';
+        if (searchKey && !isFallbackSearchKey(searchKey)) {
+            candidates.push(`user:${searchKey}`);
+        }
+
+        return candidates;
+    }
+
     function collectTurns(scope = document) {
         const bubbles = queryAllIncludingRoot(
             scope,
@@ -2595,14 +2885,9 @@
             const root = getLogicalTurnWrapper(bubble);
             if (!root) continue;
 
-            const rawStableIdentity =
-                root.getAttribute('data-turn-key') ||
-                root.getAttribute('data-content-search-turn-key') ||
-                bubble.getAttribute('data-chatgpt-search-message-ids');
+            const identityCandidates = getUserIdentityCandidates(bubble, root);
             const fallbackKey = `turn-${userTurns.length}`;
-            const stableIdentity = rawStableIdentity
-                ? `user:${rawStableIdentity}`
-                : '';
+            const stableIdentity = identityCandidates[0] || '';
             const identity = stableIdentity ||
                 `fallback:${fallbackKey}:${normalizeText(
                     bubble.innerText || bubble.textContent || ''
@@ -2711,36 +2996,132 @@
         return result;
     }
 
-    function getAssistantUnitIdentity(assistantUnit) {
+    function getAssistantUnitMessageId(assistantUnit) {
+        const firstId = getFirstMessageId(
+            assistantUnit.getAttribute('data-chatgpt-search-message-ids')
+        );
+        if (firstId && !isFallbackSearchKey(firstId)) return firstId;
+
+        const selected = assistantUnit.querySelector(
+            '[data-chatgpt-selection-message-id]'
+        );
+        const selectedId = selected?.getAttribute(
+            'data-chatgpt-selection-message-id'
+        ) || '';
+        if (selectedId && !isFallbackSearchKey(selectedId)) return selectedId;
+
+        return '';
+    }
+
+    function getAssistantIdentityCandidates(assistantUnit) {
+        const candidates = [];
+
+        const messageId = getAssistantUnitMessageId(assistantUnit);
+        if (messageId) candidates.push(messageId);
+
         const rawUnitIdentity =
             assistantUnit.getAttribute('data-content-search-unit-key') ||
             assistantUnit.getAttribute('data-chatgpt-search-unit-key') ||
             '';
-        if (!rawUnitIdentity) return '';
-
-        const previous = assistantIdentitiesByNode.get(assistantUnit);
-        if (
-            !assistantUnit.isConnected &&
-            previous?.rawUnitIdentity === rawUnitIdentity
-        ) {
-            return previous.identity;
+        if (rawUnitIdentity && !isFallbackSearchKey(rawUnitIdentity)) {
+            candidates.push(rawUnitIdentity);
         }
 
         const logicalWrapper = getLogicalTurnWrapper(assistantUnit);
         const logicalTurnKey = getTurnWrapperKey(logicalWrapper);
-        if (logicalTurnKey) {
-            const identity = `round:${JSON.stringify([
+        if (logicalTurnKey && rawUnitIdentity) {
+            candidates.push(`round:${JSON.stringify([
                 logicalTurnKey,
                 rawUnitIdentity
-            ])}`;
-            assistantIdentitiesByNode.set(assistantUnit, {
-                rawUnitIdentity,
-                identity
-            });
-            return identity;
+            ])}`);
         }
 
-        return rawUnitIdentity;
+        /* Last resort: positional fallback keys; they may drift. */
+        if (rawUnitIdentity) candidates.push(rawUnitIdentity);
+        return candidates;
+    }
+
+    function resolveRememberedIdentity(store, identity) {
+        if (!store || !identity) return '';
+        const aliased = store.identityAliases.get(identity);
+        if (aliased && store.byIdentity.has(aliased)) return aliased;
+        if (store.byIdentity.has(identity)) return identity;
+        return '';
+    }
+
+    function getRecordEvidenceIds(record) {
+        const ids = new Set();
+        for (const value of [
+            record?.userMessageId,
+            record?.messageId,
+            ...(record?.userMessageIds || []),
+            ...(record?.assistantMessageIds || [])
+        ]) {
+            if (value) ids.add(value);
+        }
+        if (record?.turnKey && !isFallbackSearchKey(record.turnKey)) {
+            ids.add(record.turnKey);
+        }
+        const identityValue = getIdentityValue(record?.identity);
+        if (identityValue) ids.add(identityValue);
+        return ids;
+    }
+
+    function evidenceIsCompatible(recordIds, turnIds) {
+        if (!recordIds?.size || !turnIds?.size) return true;
+        for (const id of turnIds) {
+            if (recordIds.has(id)) return true;
+        }
+        return false;
+    }
+
+    function assistantIdentityMatchesUnit(store, fullIdentity, assistantUnit) {
+        const record = store.byIdentity.get(fullIdentity);
+        if (!record || record.kind !== 'assistant') return false;
+
+        const turnIds = new Set();
+        const messageId = getAssistantUnitMessageId(assistantUnit);
+        if (messageId) turnIds.add(messageId);
+        const identityValue = getIdentityValue(fullIdentity);
+        if (identityValue) turnIds.add(identityValue);
+
+        return evidenceIsCompatible(getRecordEvidenceIds(record), turnIds);
+    }
+
+    function getAssistantUnitIdentity(assistantUnit) {
+        const candidates = getAssistantIdentityCandidates(assistantUnit);
+        if (!candidates.length) return '';
+
+        const store = currentChatIdentity
+            ? turnRecordsByChat.get(currentChatIdentity)
+            : null;
+        if (store?.identitiesByNode) {
+            const remembered = resolveRememberedIdentity(
+                store,
+                store.identitiesByNode.get(assistantUnit)
+            );
+            if (
+                remembered.startsWith('assistant:') &&
+                assistantIdentityMatchesUnit(store, remembered, assistantUnit)
+            ) {
+                return remembered.slice('assistant:'.length);
+            }
+
+            for (const candidate of candidates) {
+                const resolved = resolveRememberedIdentity(
+                    store,
+                    `assistant:${candidate}`
+                );
+                if (
+                    resolved &&
+                    assistantIdentityMatchesUnit(store, resolved, assistantUnit)
+                ) {
+                    return resolved.slice('assistant:'.length);
+                }
+            }
+        }
+
+        return candidates[0];
     }
 
     function getPairedAssistantUnits(turn) {
@@ -2938,9 +3319,12 @@
 
     function toIndexRecord(turn) {
         const messageIds = getTurnMessageIds(turn);
+        const wrapperKey = getTurnWrapperKey(turn.root);
+        const turnKey = turn.turnKey ||
+            (wrapperKey && !isFallbackSearchKey(wrapperKey) ? wrapperKey : '');
         return {
             identity: turn.identity,
-            turnKey: turn.turnKey || getTurnWrapperKey(turn.root),
+            turnKey,
             kind: turn.kind,
             userMessageId: turn.userMessageId || messageIds.userMessageId,
             userMessageIds: turn.userMessageIds || messageIds.userMessageIds,
@@ -2960,6 +3344,8 @@
             turnRecordsByChat.set(chatIdentity, {
                 turns: [],
                 byIdentity: new Map(),
+                identityAliases: new Map(),
+                identitiesByNode: new WeakMap(),
                 pairedAssistantToUser: new Map(),
                 suppressedRemovedIdentities: new Map(),
                 index: getConversationIndex(chatIdentity),
@@ -3058,8 +3444,8 @@
         if (!applyNativeSnapshot(snapshot, chatIdentity)) return false;
         if (chatIdentity === currentChatIdentity) {
             nativeAdapterRetryPending = false;
-            latestNativePaginationComplete =
-                snapshot?.pagination?.complete === true;
+            resetNativeAdapterRetryBackoff();
+            latestNativePagination = snapshot?.pagination || null;
             renderTurns();
             updateHistoryControl();
         }
@@ -3089,6 +3475,7 @@
                     if (isRetryableNativeBindingError(error)) {
                         nativeAdapterRetryPending = true;
                         nativeAdapterError = null;
+                        bumpNativeAdapterRetryBackoff();
                     } else {
                         nativeAdapterError = error;
                     }
@@ -3119,6 +3506,7 @@
         store.turns = store.turns.filter(turn =>
             turn.identity !== assistantIdentity
         );
+        store.index.retire(assistantIdentity);
     }
 
     function insertTurnRecord(records, record, observed = []) {
@@ -3225,7 +3613,10 @@
                 getPairedAssistantUnits(observed)[0] || null;
         }
 
-        record.turnKey = getTurnWrapperKey(record.root) || record.turnKey || '';
+        const wrapperKey = getTurnWrapperKey(record.root);
+        if (wrapperKey && !isFallbackSearchKey(wrapperKey)) {
+            record.turnKey = wrapperKey;
+        }
         Object.assign(record, getTurnMessageIds(observed));
     }
 
@@ -3240,11 +3631,35 @@
         const store = turnRecordsByChat.get(currentChatIdentity);
         const wrapper = getLogicalTurnWrapper(element);
         const bubble = element.closest('[data-user-message-bubble="true"]');
-        const rawIdentity = getTurnWrapperKey(wrapper) ||
-            bubble?.getAttribute('data-chatgpt-search-message-ids');
-        const record = rawIdentity
-            ? store?.byIdentity.get(`user:${rawIdentity}`)
-            : null;
+        const rawIdentities = [
+            getTurnWrapperKey(wrapper),
+            getFirstMessageId(
+                bubble?.getAttribute('data-chatgpt-search-message-ids')
+            )
+        ].filter(value => value && !isFallbackSearchKey(value));
+
+        let record = null;
+        if (store?.identitiesByNode) {
+            for (const node of [bubble, wrapper]) {
+                const remembered = resolveRememberedIdentity(
+                    store,
+                    store.identitiesByNode.get(node)
+                );
+                if (remembered?.startsWith('user:')) {
+                    record = store.byIdentity.get(remembered) || null;
+                    if (record) break;
+                }
+            }
+        }
+        if (!record) {
+            for (const rawIdentity of rawIdentities) {
+                const identity = `user:${rawIdentity}`;
+                const resolved = resolveRememberedIdentity(store, identity) ||
+                    identity;
+                record = store?.byIdentity.get(resolved) || null;
+                if (record) break;
+            }
+        }
         if (record?.kind !== 'user') return null;
 
         return {
@@ -3564,6 +3979,367 @@
         return null;
     }
 
+    function getTurnEvidenceIds(turn) {
+        const ids = new Set();
+        const messageIds = getTurnMessageIds(turn);
+        for (const value of [
+            messageIds.userMessageId,
+            messageIds.messageId,
+            ...messageIds.userMessageIds,
+            ...messageIds.assistantMessageIds,
+            turn?.userMessageId,
+            turn?.messageId,
+            ...(turn?.userMessageIds || []),
+            ...(turn?.assistantMessageIds || [])
+        ]) {
+            if (value) ids.add(value);
+        }
+
+        const wrapperKey = getTurnWrapperKey(turn?.root);
+        if (wrapperKey && !isFallbackSearchKey(wrapperKey)) {
+            ids.add(wrapperKey);
+        }
+        const identityValue = getIdentityValue(turn?.identity);
+        if (identityValue) ids.add(identityValue);
+        return ids;
+    }
+
+    function findAdjacentRecordOfKind(records, startIndex, direction, kind) {
+        for (
+            let index = startIndex + direction;
+            index >= 0 && index < records.length;
+            index += direction
+        ) {
+            if (records[index].kind === kind) return records[index];
+        }
+        return null;
+    }
+
+    function findAdjacentObservedTurn(observedTurns, startIndex, direction, kind) {
+        for (
+            let index = startIndex + direction;
+            index >= 0 && index < observedTurns.length;
+            index += direction
+        ) {
+            if (observedTurns[index].kind === kind) return observedTurns[index];
+        }
+        return null;
+    }
+
+    /*
+     * Last-resort migration for a turn whose stable keys are temporarily
+     * missing after a node re-mount: match an unmounted record with the same
+     * user text and identical neighboring user turns. This mirrors the edit
+     * reconciliation boundary test, so repeated identical messages are not
+     * collapsed by accident.
+     */
+    function findUnstableTurnReplacement(store, turn, observedTurns) {
+        if (turn.kind !== 'user') return null;
+        const text = normalizeText(getFullUserText(turn));
+        if (!text) return null;
+
+        const candidates = store.turns.filter(record =>
+            record.kind === 'user' &&
+            !record.root?.isConnected &&
+            normalizeText(record.userTextSnapshot || record.userText || '') === text
+        );
+        if (candidates.length !== 1) return null;
+
+        const candidate = candidates[0];
+        const turnIndex = store.turns.indexOf(candidate);
+        if (turnIndex < 0) return null;
+
+        const observedIndex = observedTurns.indexOf(turn);
+        const previousObserved = findAdjacentObservedTurn(
+            observedTurns,
+            observedIndex,
+            -1,
+            'user'
+        );
+        const nextObserved = findAdjacentObservedTurn(
+            observedTurns,
+            observedIndex,
+            1,
+            'user'
+        );
+        const previousRecord = findAdjacentRecordOfKind(
+            store.turns,
+            turnIndex,
+            -1,
+            'user'
+        );
+        const nextRecord = findAdjacentRecordOfKind(
+            store.turns,
+            turnIndex,
+            1,
+            'user'
+        );
+
+        if (
+            (previousObserved?.identity || null) !==
+            (previousRecord?.identity || null)
+        ) {
+            return null;
+        }
+        if (
+            nextObserved &&
+            (nextObserved.identity || null) !== (nextRecord?.identity || null)
+        ) {
+            return null;
+        }
+        if (!nextObserved && nextRecord?.root?.isConnected) return null;
+
+        return candidate;
+    }
+
+    /*
+     * The DOM presentation identity (data-turn-key / search keys / message
+     * ids) can drift while the logical turn stays the same. Before a turn is
+     * merged into the store, migrate it onto an already known identity when
+     * one is evidenced (node lineage, alias table, or the native index).
+     */
+    function reconcileObservedTurnIdentities(observedTurns) {
+        if (!currentChatIdentity || !observedTurns?.length) return;
+        const store = getTurnRecordStore(currentChatIdentity);
+        if (!store.identityAliases) store.identityAliases = new Map();
+        if (!store.identitiesByNode) store.identitiesByNode = new WeakMap();
+
+        for (const turn of observedTurns) {
+            if (!turn?.identity) continue;
+
+            const expectedPrefix = turn.kind === 'user'
+                ? 'user:'
+                : 'assistant:';
+            let canonical = '';
+
+            if (turn.stableIdentity) {
+                canonical = resolveRememberedIdentity(
+                    store,
+                    store.identityAliases.get(turn.identity)
+                );
+            }
+
+            if (!canonical) {
+                for (const node of [
+                    turn.root,
+                    turn.userBubble,
+                    turn.assistantUnit
+                ]) {
+                    if (!(node instanceof Element) || !node.isConnected) {
+                        continue;
+                    }
+                    const remembered = resolveRememberedIdentity(
+                        store,
+                        store.identitiesByNode.get(node)
+                    );
+                    if (
+                        !remembered ||
+                        !remembered.startsWith(expectedPrefix)
+                    ) {
+                        continue;
+                    }
+                    const record = store.byIdentity.get(remembered);
+                    if (!record || record.kind !== turn.kind) continue;
+                    if (!evidenceIsCompatible(
+                        getRecordEvidenceIds(record),
+                        getTurnEvidenceIds(turn)
+                    )) {
+                        continue;
+                    }
+                    canonical = remembered;
+                    break;
+                }
+            }
+
+            if (!canonical && turn.stableIdentity) {
+                const entry = store.index.resolveEntry(
+                    toIndexRecord(turn),
+                    {kind: turn.kind}
+                );
+                if (entry?.identity && entry.identity !== turn.identity) {
+                    canonical = entry.identity;
+                }
+            }
+
+            if (!canonical && !turn.stableIdentity) {
+                const replacement = findUnstableTurnReplacement(
+                    store,
+                    turn,
+                    observedTurns
+                );
+                if (replacement) canonical = replacement.identity;
+            }
+
+            if (canonical && canonical !== turn.identity) {
+                if (turn.stableIdentity) {
+                    store.identityAliases.set(turn.identity, canonical);
+                }
+                turn.identity = canonical;
+                turn.stableIdentity = true;
+            }
+
+            if (!turn.stableIdentity || !turn.identity) continue;
+            for (const node of [
+                turn.root,
+                turn.userBubble,
+                turn.assistantUnit
+            ]) {
+                if (node instanceof Element && node.isConnected) {
+                    store.identitiesByNode.set(node, turn.identity);
+                }
+            }
+        }
+    }
+
+    function getRecordMatchAliases(record) {
+        const result = new Set();
+        if (record?.turnKey && record?.kind) {
+            result.add(`turn:${record.kind}:${record.turnKey}`);
+        }
+        for (const messageId of [
+            record?.messageId,
+            record?.userMessageId,
+            ...(record?.userMessageIds || []),
+            ...(record?.assistantMessageIds || [])
+        ]) {
+            if (messageId) result.add(`message:${messageId}`);
+        }
+        return result;
+    }
+
+    function mergeTurnRecordFields(target, source) {
+        if (!source) return;
+        if (!target.userText && source.userText) {
+            target.userText = source.userText;
+        }
+        if (!target.userTextSnapshot && source.userTextSnapshot) {
+            target.userTextSnapshot = source.userTextSnapshot;
+        }
+        if (
+            target.domUserTextBaseline == null &&
+            source.domUserTextBaseline != null
+        ) {
+            target.domUserTextBaseline = source.domUserTextBaseline;
+        }
+        if (!target.assistantText && source.assistantText) {
+            target.assistantText = source.assistantText;
+        }
+        target.userMessageId = target.userMessageId || source.userMessageId || '';
+        target.userMessageIds = Array.from(new Set([
+            ...(target.userMessageIds || []),
+            ...(source.userMessageIds || [])
+        ]));
+        target.messageId = target.messageId || source.messageId || '';
+        target.assistantMessageIds = Array.from(new Set([
+            ...(target.assistantMessageIds || []),
+            ...(source.assistantMessageIds || [])
+        ]));
+        if (!target.turnKey && source.turnKey) target.turnKey = source.turnKey;
+        for (const key of ['root', 'userBubble', 'assistantUnit']) {
+            if (
+                !target[key]?.isConnected &&
+                source[key]?.isConnected
+            ) {
+                target[key] = source[key];
+            }
+        }
+        if (source.preserveCommittedUserText) {
+            target.preserveCommittedUserText = true;
+        }
+    }
+
+    function collapseDuplicateTurnRecord(store, canonical, duplicate) {
+        if (canonical.kind !== 'user' && duplicate.kind === 'user') {
+            const swap = canonical;
+            canonical = duplicate;
+            duplicate = swap;
+        }
+
+        if (canonical.kind === 'user' && duplicate.kind === 'assistant') {
+            store.pairedAssistantToUser.set(
+                duplicate.identity,
+                canonical.identity
+            );
+            removePairedAssistantRecord(
+                store,
+                duplicate.identity,
+                canonical.identity,
+                currentChatIdentity
+            );
+        } else if (duplicate.kind === canonical.kind) {
+            mergeTurnRecordFields(canonical, duplicate);
+        } else {
+            return;
+        }
+
+        store.byIdentity.delete(duplicate.identity);
+        store.turns = store.turns.filter(record =>
+            record.identity !== duplicate.identity
+        );
+        store.index.retire(duplicate.identity);
+        store.identityAliases.set(duplicate.identity, canonical.identity);
+    }
+
+    /*
+     * Records are kept across virtualization, so stale identities can pile
+     * up as extra bars. Once two records share a proven message/turn alias
+     * they are the same logical turn and the newer one is folded back.
+     */
+    function collapseDuplicateTurnRecords(store) {
+        if (!store?.turns?.length) return 0;
+        if (!store.identityAliases) store.identityAliases = new Map();
+
+        const ownerByAlias = new Map();
+        const canonicalOf = new Map();
+        const duplicates = [];
+
+        function resolveCanonical(record) {
+            let current = record;
+            const seen = new Set();
+            while (canonicalOf.has(current) && !seen.has(current)) {
+                seen.add(current);
+                current = canonicalOf.get(current);
+            }
+            return current;
+        }
+
+        for (const record of store.turns) {
+            if (!record?.identity) continue;
+            if (
+                store.suppressedRemovedIdentities?.has(record.identity)
+            ) {
+                continue;
+            }
+
+            let canonical = null;
+            for (const alias of getRecordMatchAliases(record)) {
+                const owner = ownerByAlias.get(alias);
+                if (owner && owner !== record) {
+                    const resolved = resolveCanonical(owner);
+                    if (resolved !== record) {
+                        canonical = resolved;
+                        break;
+                    }
+                }
+            }
+
+            if (canonical) {
+                canonicalOf.set(record, canonical);
+                duplicates.push({canonical, duplicate: record});
+                continue;
+            }
+
+            for (const alias of getRecordMatchAliases(record)) {
+                if (!ownerByAlias.has(alias)) ownerByAlias.set(alias, record);
+            }
+        }
+
+        for (const {canonical, duplicate} of duplicates) {
+            collapseDuplicateTurnRecord(store, canonical, duplicate);
+        }
+        return duplicates.length;
+    }
+
     function mergeObservedTurnRecords(
         observedTurns,
         replaceNodeReferences,
@@ -3576,6 +4352,8 @@
         if (!store.suppressedRemovedIdentities) {
             store.suppressedRemovedIdentities = new Map();
         }
+
+        reconcileObservedTurnIdentities(observedTurns);
 
         if (allowBranchReconciliation) {
             const liveIdentities = new Set(observedTurns
@@ -3724,6 +4502,8 @@
                 insertTurnRecord(store.turns, record, observed);
             }
         }
+
+        collapseDuplicateTurnRecords(store);
 
         store.index.upsertObserved(store.turns.map(toIndexRecord));
     }
@@ -4829,14 +5609,20 @@
         mountedTurnsByIdentity = new Map();
         for (const turn of observedTurns) {
             if (!turn.root?.isConnected) continue;
-            const indexedEntry = index.resolveEntry(toIndexRecord(turn));
+            const indexedEntry = index.resolveEntry(
+                toIndexRecord(turn),
+                {kind: turn.kind}
+            );
             mountedTurnsByIdentity.set(indexedEntry?.identity || turn.identity, turn);
         }
         syncThreadResizeTargets(observedTurns);
         const newTurns = buildRenderedTurns(observedTurns);
         const labelSources = new Map();
         for (const turn of observedTurns) {
-            const indexedEntry = index.resolveEntry(toIndexRecord(turn));
+            const indexedEntry = index.resolveEntry(
+                toIndexRecord(turn),
+                {kind: turn.kind}
+            );
             labelSources.set(indexedEntry?.identity || turn.identity, turn);
         }
 
