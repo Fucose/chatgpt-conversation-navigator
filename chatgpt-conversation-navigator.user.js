@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.5
-// @description  ChatGPT 对话导航：悬停预览、加载完整历史并回到回复顶部。
+// @version      0.4.6
+// @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
 // @supportURL   https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7#comments
@@ -1479,6 +1479,260 @@
         }
         return { createNativeAdapter, createNativeLocator, NativeAdapterError };
     })();
+    function chooseCurrentReplyCandidate(candidates) {
+        let best = null;
+        let bestDistance = Infinity;
+
+        for (const candidate of candidates || []) {
+            const rect = candidate?.rect;
+            const top = Number(rect?.top);
+            const bottom = Number(rect?.bottom);
+            const left = Number(rect?.left);
+            const right = Number(rect?.right);
+            const visibleTop = Number(candidate?.visibleTop);
+            const visibleBottom = Number(candidate?.visibleBottom);
+            const visibleLeft = Number(candidate?.visibleLeft ?? -Infinity);
+            const visibleRight = Number(candidate?.visibleRight ?? Infinity);
+            const readingY = Number(candidate?.readingY);
+            if (
+                !Number.isFinite(top) || !Number.isFinite(bottom) ||
+                !Number.isFinite(left) || !Number.isFinite(right) ||
+                !Number.isFinite(visibleTop) ||
+                !Number.isFinite(visibleBottom) ||
+                !Number.isFinite(readingY) ||
+                bottom <= top || right <= left ||
+                bottom <= visibleTop || top >= visibleBottom ||
+                right <= visibleLeft || left >= visibleRight
+            ) {
+                continue;
+            }
+
+            const boundedReadingY = Math.max(
+                visibleTop,
+                Math.min(visibleBottom, readingY)
+            );
+            const distance = boundedReadingY < top
+                ? top - boundedReadingY
+                : boundedReadingY > bottom
+                    ? boundedReadingY - bottom
+                    : 0;
+            if (distance < bestDistance) {
+                best = {
+                    ...candidate,
+                    readingY: boundedReadingY,
+                    pointInside: distance === 0
+                };
+                bestDistance = distance;
+            }
+        }
+
+        return best;
+    }
+
+    function chooseAdjacentReplyHeading(headings, edgeY, direction, tolerance = 1) {
+        const edge = Number(edgeY);
+        if (!Number.isFinite(edge)) return null;
+        const upward = direction === 'up' || direction === -1;
+        const candidates = (headings || []).filter(heading => {
+            const top = Number(heading?.top);
+            return Number.isFinite(top) && (upward
+                ? top < edge - tolerance
+                : top > edge + tolerance);
+        });
+        candidates.sort((left, right) => upward
+            ? Number(right.top) - Number(left.top)
+            : Number(left.top) - Number(right.top));
+        return candidates[0] || null;
+    }
+
+    function computeReplyScrollDelta({
+        targetTop,
+        targetBottom,
+        viewportTop,
+        viewportBottom,
+        topInset = 0,
+        bottomInset = 0,
+        edge = 'top'
+    }) {
+        return edge === 'bottom'
+            ? Number(targetBottom) - (Number(viewportBottom) - Number(bottomInset))
+            : Number(targetTop) - (Number(viewportTop) + Number(topInset));
+    }
+
+    function getRequiredScrollExtension(desiredTop, maxTop) {
+        return Math.max(0, Number(desiredTop) - Number(maxTop));
+    }
+
+    function collectFixedPositionAncestors(
+        elements,
+        boundary,
+        body,
+        getPosition,
+        shouldExclude = null,
+        acceptedPositions = ['fixed', 'sticky']
+    ) {
+        const overlays = new Set();
+        for (const element of elements || []) {
+            for (
+                let ancestor = element;
+                ancestor && ancestor !== body;
+                ancestor = ancestor.parentElement
+            ) {
+                const position = getPosition(ancestor);
+                if (
+                    acceptedPositions.includes(position) &&
+                    !shouldExclude?.(ancestor)
+                ) {
+                    overlays.add(ancestor);
+                }
+                if (ancestor === boundary) break;
+            }
+        }
+        return [...overlays];
+    }
+
+    function computeBottomOverlayInset(
+        overlays,
+        viewport,
+        targetX,
+        targetRect = null
+    ) {
+        let inset = 0;
+        let composerInset = 0;
+        for (const overlay of overlays || []) {
+            const rect = overlay?.rect;
+            if (
+                !(overlay?.position === 'fixed' ||
+                    overlay?.position === 'sticky' ||
+                    (overlay?.kind === 'composer' &&
+                        overlay?.position === 'absolute')) ||
+                !Number.isFinite(Number(rect?.left)) ||
+                !Number.isFinite(Number(rect?.right)) ||
+                !Number.isFinite(Number(rect?.top)) ||
+                !Number.isFinite(Number(rect?.bottom)) ||
+                (targetRect
+                    ? rect.right <= targetRect.left ||
+                        rect.left >= targetRect.right ||
+                        rect.right <= viewport.left ||
+                        rect.left >= viewport.right
+                    : rect.left > targetX || rect.right <= targetX) ||
+                rect.top >= viewport.bottom || rect.bottom <= viewport.top
+            ) {
+                continue;
+            }
+            const visibleTop = Math.max(viewport.top, rect.top);
+            if (overlay.kind === 'composer') {
+                if (!composerInset) {
+                    composerInset = viewport.bottom - visibleTop + 14;
+                }
+                continue;
+            }
+            if (
+                rect.top >= viewport.bottom ||
+                rect.bottom < viewport.bottom - 2 ||
+                rect.bottom <= viewport.top
+            ) {
+                continue;
+            }
+            inset = Math.max(inset, viewport.bottom - visibleTop + 8);
+        }
+        return Math.ceil(Math.max(inset, composerInset));
+    }
+
+    function clipReplyScrollViewportGeometry(rect, viewportWidth, viewportHeight) {
+        const left = Math.min(viewportWidth, Math.max(0, Number(rect.left)));
+        const right = Math.max(
+            left,
+            Math.min(viewportWidth, Number(rect.right))
+        );
+        const top = Math.min(viewportHeight, Math.max(0, Number(rect.top)));
+        const bottom = Math.max(
+            top,
+            Math.min(viewportHeight, Number(rect.bottom))
+        );
+        return {left, right, top, bottom, height: bottom - top};
+    }
+
+    function computeReplyToolbarPosition({
+        viewportLeft,
+        viewportRight,
+        windowWidth = null,
+        contentLeft,
+        sidebarLeft = null,
+        sidebarRight = null,
+        sidebarVisible = false,
+        sidebarGap = 12,
+        viewportTop,
+        viewportBottom,
+        windowHeight = null,
+        headerInset = 0,
+        bottomInset = 0,
+        toolbarWidth = 32,
+        toolbarHeight = 168,
+        minimumGutter = 48,
+        centerRatio = 0.7
+    }) {
+        const leftEdge = Math.max(0, Number(viewportLeft));
+        const rightEdge = Number(viewportRight);
+        const physicalWindowWidth = windowWidth !== null &&
+            Number.isFinite(Number(windowWidth))
+            ? Number(windowWidth)
+            : rightEdge;
+        const contentEdge = Number(contentLeft);
+        const usableTop = Number(viewportTop) + Number(headerInset);
+        const usableBottom = Number(viewportBottom) - Number(bottomInset);
+        const usableHeight = usableBottom - usableTop;
+        const hasWindowHeight = windowHeight !== null &&
+            Number.isFinite(Number(windowHeight));
+        const physicalWindowHeight = hasWindowHeight
+            ? Number(windowHeight)
+            : null;
+        const sidebarWidth = Number(sidebarRight) - Number(sidebarLeft);
+        const useSidebar = Boolean(
+            sidebarVisible && Number.isFinite(sidebarWidth) &&
+            sidebarWidth > 0 && Number(sidebarRight) > 0 &&
+            Number(sidebarLeft) < physicalWindowWidth
+        );
+        const toolbarLeft = useSidebar
+            ? Number(sidebarRight) + Number(sidebarGap)
+            : leftEdge + Number(sidebarGap);
+        const contentGutter = contentEdge - toolbarLeft;
+        if (
+            ![leftEdge, rightEdge, contentEdge, usableTop, usableBottom]
+                .every(Number.isFinite) ||
+            rightEdge <= leftEdge ||
+            !Number.isFinite(toolbarLeft) ||
+            toolbarLeft + Number(toolbarWidth) > rightEdge ||
+            contentGutter < Math.max(Number(minimumGutter), Number(toolbarWidth) + 8) ||
+            (hasWindowHeight
+                ? physicalWindowHeight < Number(toolbarHeight)
+                : usableHeight < Number(toolbarHeight))
+        ) {
+            return null;
+        }
+
+        const top = hasWindowHeight
+            ? Math.max(
+                0,
+                Math.min(
+                    physicalWindowHeight - Number(toolbarHeight),
+                    (physicalWindowHeight - Number(toolbarHeight)) / 2
+                )
+            )
+            : Math.max(
+                usableTop,
+                Math.min(
+                    usableBottom - Number(toolbarHeight),
+                    usableTop + usableHeight * Number(centerRatio) -
+                        Number(toolbarHeight) / 2
+                )
+            );
+        return {
+            left: toolbarLeft,
+            top
+        };
+    }
+
     const core = {
         createConversationIndex,
         createHistoryLoader,
@@ -1486,6 +1740,14 @@
         createNativeAdapter,
         runBoundedScrollSearch,
         deriveHistoryControlView,
+        chooseCurrentReplyCandidate,
+        chooseAdjacentReplyHeading,
+        computeReplyScrollDelta,
+        getRequiredScrollExtension,
+        collectFixedPositionAncestors,
+        computeBottomOverlayInset,
+        clipReplyScrollViewportGeometry,
+        computeReplyToolbarPosition,
         NativeAdapterError
     };
     if (typeof module === 'object' && module?.exports &&
@@ -1498,6 +1760,49 @@
     const RAIL_ID = 'yw-chatgpt-turn-rail';
     const PREVIEW_ID = 'yw-chatgpt-turn-preview';
     const STYLE_ID = 'yw-chatgpt-turn-nav-style';
+    const REPLY_NAV_ID = 'yw-chatgpt-reply-navigation';
+    /*
+     * Reply navigation icon path notices.
+     * Lucide paths (ISC License):
+     * Copyright (c) 2026 Lucide Icons and Contributors
+     * Permission to use, copy, modify, and/or distribute this software for any
+     * purpose with or without fee is hereby granted, provided that the above
+     * copyright notice and this permission notice appear in all copies.
+     * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+     * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+     * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+     * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+     * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+     * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+     * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+     *
+     * Feather chevrons (MIT License):
+     * Copyright (c) 2013-present Cole Bemis
+     * Source: https://github.com/feathericons/feather/blob/master/LICENSE
+     * Permission is hereby granted, free of charge, to any person obtaining a
+     * copy of this software and associated documentation files (the
+     * "Software"), to deal in the Software without restriction, including
+     * without limitation the rights to use, copy, modify, merge, publish,
+     * distribute, sublicense, and/or sell copies of the Software, and to
+     * permit persons to whom the Software is furnished to do so, subject to
+     * the following conditions:
+     * The above copyright notice and this permission notice shall be included
+     * in all copies or substantial portions of the Software.
+     * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+     * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+     * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+     * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+     * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+     * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+     * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+     */
+    const REPLY_NAV_ICONS = {
+        outline: 'M3 5h.01M3 12h.01M3 19h.01M8 5h13M8 12h13M8 19h13',
+        first: 'm17 18-6-6 6-6M7 6v12',
+        up: 'm18 15-6-6-6 6',
+        down: 'm6 9 6 6 6-6',
+        last: 'm7 18 6-6-6-6M17 6v12'
+    };
     const RETRYABLE_NATIVE_BINDING_CODES = new Set([
         'DOCUMENT_UNAVAILABLE',
         'WINDOW_UNAVAILABLE',
@@ -1542,6 +1847,13 @@
     let previewUser = null;
     let previewAssistant = null;
     let replyTopButton = null;
+    let replyNavigationUI = null;
+    let replyNavigationContext = null;
+    let replyOutlineOpen = false;
+    let replyNavigationListenersInstalled = false;
+    let replyLayoutResizeObserver = null;
+    let replyLayoutObservedNodes = new Set();
+    let replyLayoutObservedSidebar = null;
 
     let turns = [];
     let turnSignature = '';
@@ -1580,6 +1892,7 @@
 
     let rebuildTimer = null;
     let activeRAF = null;
+    let replyNavigationRAF = null;
     let hideTimer = null;
 
     let currentChatIdentity = null;
@@ -1856,6 +2169,156 @@
                 display: none !important;
             }
 
+            #${REPLY_NAV_ID} {
+                position: fixed;
+                inset: 0;
+                z-index: 2147483646;
+                pointer-events: none;
+            }
+
+            #${REPLY_NAV_ID}[hidden] {
+                display: none !important;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-toolbar {
+                position: fixed;
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                width: 32px;
+                padding: 0;
+                margin: 0;
+                box-sizing: border-box;
+                pointer-events: auto;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button {
+                appearance: none;
+                -webkit-appearance: none;
+                display: grid;
+                flex: 0 0 32px;
+                place-items: center;
+                width: 32px;
+                height: 32px;
+                padding: 0;
+                box-sizing: border-box;
+                border: 1px solid transparent;
+                border-radius: 7px;
+                background: transparent;
+                color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
+                cursor: pointer;
+                outline: none;
+                transition: background-color 120ms ease, color 120ms ease;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button:hover,
+            #${REPLY_NAV_ID} .yw-reply-nav-button:focus-visible,
+            #${REPLY_NAV_ID} .yw-reply-nav-button[aria-expanded="true"] {
+                border-color: var(--color-border, rgba(127, 127, 127, 0.24));
+                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                color: var(--text-primary, var(--color-text-primary, #555));
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button:disabled {
+                opacity: 0.4;
+                cursor: default;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button:disabled:hover {
+                border-color: transparent;
+                background: transparent;
+                color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button svg {
+                display: block;
+                width: 18px;
+                height: 18px;
+                fill: none;
+                stroke: currentColor;
+                stroke-width: 2;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button[data-action="first"] svg,
+            #${REPLY_NAV_ID} .yw-reply-nav-button[data-action="last"] svg {
+                transform: rotate(90deg);
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline {
+                position: fixed;
+                width: min(320px, calc(100vw - 56px));
+                max-height: min(70vh, 560px);
+                overflow: auto;
+                padding: 12px;
+                box-sizing: border-box;
+                border: 1px solid var(--color-border, rgba(127, 127, 127, 0.28));
+                border-radius: 12px;
+                background: var(--main-surface-primary, var(--color-surface, rgba(255, 255, 255, 0.98)));
+                color: var(--text-primary, var(--color-text-primary, #222));
+                box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+                pointer-events: auto;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline[hidden] {
+                display: none !important;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline h2 {
+                margin: 0 0 8px;
+                color: inherit;
+                font-size: 14px;
+                font-weight: 600;
+                line-height: 1.4;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-list {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                padding: 0;
+                margin: 0;
+                list-style: none;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-item {
+                min-width: 0;
+                padding: 0;
+                margin: 0;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-target {
+                display: block;
+                width: 100%;
+                padding: 6px 8px;
+                box-sizing: border-box;
+                border: 0;
+                border-radius: 6px;
+                background: transparent;
+                color: inherit;
+                font: inherit;
+                font-size: 13px;
+                line-height: 1.4;
+                text-align: left;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                cursor: pointer;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-target:hover,
+            #${REPLY_NAV_ID} .yw-reply-outline-target:focus-visible {
+                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                outline: none;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-empty {
+                padding: 6px 8px;
+                color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
+                font-size: 13px;
+                line-height: 1.4;
+            }
+
             /* 单根短横线 */
             #${RAIL_ID} .yw-turn-bar {
                 appearance: none;
@@ -2127,6 +2590,112 @@
         replyTopButton.dataset.iconSignature = signature;
     }
 
+    function createReplyNavigationIcon(pathData) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('aria-hidden', 'true');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', pathData);
+        svg.appendChild(path);
+        return svg;
+    }
+
+    function ensureReplyNavigationUI() {
+        if (replyNavigationUI?.root?.isConnected) return;
+
+        document.getElementById(REPLY_NAV_ID)?.remove();
+        const root = document.createElement('div');
+        root.id = REPLY_NAV_ID;
+        root.hidden = true;
+
+        const toolbar = document.createElement('div');
+        toolbar.className = 'yw-reply-toolbar';
+        toolbar.setAttribute('role', 'group');
+        toolbar.setAttribute('aria-label', '当前回复导航');
+
+        const buttonSpecs = [
+            ['outline', '当前回复大纲'],
+            ['first', '回到当前回复顶部'],
+            ['up', '上一个标题'],
+            ['down', '下一个标题'],
+            ['last', '跳到当前回复底部']
+        ];
+        const buttons = new Map();
+        for (const [action, label] of buttonSpecs) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'yw-reply-nav-button';
+            button.dataset.action = action;
+            button.setAttribute('aria-label', label);
+            button.appendChild(createReplyNavigationIcon(REPLY_NAV_ICONS[action]));
+            if (action === 'outline') {
+                button.title = '当前回复大纲';
+                button.setAttribute('aria-expanded', 'false');
+                button.setAttribute('aria-controls', `${REPLY_NAV_ID}-outline`);
+                button.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    toggleReplyOutline();
+                });
+            } else {
+                button.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (action === 'first') jumpToCurrentReplyTop();
+                    else if (action === 'up') navigateReplyHeading('up');
+                    else if (action === 'down') navigateReplyHeading('down');
+                    else if (action === 'last') jumpToCurrentReplyBottom();
+                });
+            }
+            buttons.set(action, button);
+            toolbar.appendChild(button);
+        }
+
+        const outline = document.createElement('section');
+        outline.id = `${REPLY_NAV_ID}-outline`;
+        outline.className = 'yw-reply-outline';
+        outline.hidden = true;
+        outline.setAttribute('role', 'region');
+        outline.setAttribute('aria-labelledby', `${REPLY_NAV_ID}-title`);
+
+        const heading = document.createElement('h2');
+        heading.id = `${REPLY_NAV_ID}-title`;
+        heading.textContent = '当前回复大纲';
+        outline.appendChild(heading);
+
+        const list = document.createElement('ol');
+        list.className = 'yw-reply-outline-list';
+        outline.appendChild(list);
+
+        root.append(toolbar, outline);
+        document.body.appendChild(root);
+        replyNavigationUI = {root, toolbar, outline, heading, list, buttons};
+
+        if (!replyNavigationListenersInstalled) {
+            document.addEventListener('click', event => {
+                if (!replyOutlineOpen) return;
+                const target = asElement(event.target);
+                if (target && replyNavigationUI?.root?.contains(target)) return;
+                closeReplyOutline();
+            }, true);
+
+            document.addEventListener('keydown', event => {
+                if (!replyOutlineOpen || event.key !== 'Escape') return;
+                const target = asElement(event.target);
+                const focusInside = Boolean(
+                    target?.closest(`#${REPLY_NAV_ID}`) ||
+                    replyNavigationUI?.root?.contains(document.activeElement)
+                );
+                closeReplyOutline(focusInside);
+                if (focusInside) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            }, true);
+            replyNavigationListenersInstalled = true;
+        }
+    }
+
     function ensureUI() {
         installStyles();
 
@@ -2225,6 +2794,8 @@
         }
         replyTopButton.removeAttribute('title');
         syncReplyTopButtonIcon();
+
+        ensureReplyNavigationUI();
 
         preview = document.getElementById(PREVIEW_ID);
 
@@ -2829,6 +3400,7 @@
 
         if (barList) barList.replaceChildren();
         if (rail) rail.style.display = 'none';
+        clearReplyNavigation();
         railDensityCacheKey = '';
         railLayoutSignature = '';
 
@@ -2866,6 +3438,7 @@
             lastLocatorDiagnostic = '';
             lastHistoryCapabilityDiagnostic = '';
             lastHistoryControlDiagnostic = '';
+            clearReplyNavigation();
             clearNewConversationSubmission();
             startNativeLocator(identity);
             startNativeAdapter(identity);
@@ -4921,14 +5494,18 @@
     function extendScrollRangeTo(scrollContext, desiredTop) {
         const { container } = scrollContext;
         const maxScrollTop = scrollContext.maxTop();
-        if (desiredTop <= maxScrollTop) return maxScrollTop;
+        const requiredExtension = getRequiredScrollExtension(
+            desiredTop,
+            maxScrollTop
+        );
+        if (!requiredExtension) return maxScrollTop;
 
         const originalValue = container.style.getPropertyValue('padding-bottom');
         const originalPriority = container.style.getPropertyPriority('padding-bottom');
         const computedPadding = parseFloat(
             window.getComputedStyle(container).paddingBottom
         ) || 0;
-        const appliedPadding = computedPadding + desiredTop - maxScrollTop + 2;
+        const appliedPadding = computedPadding + requiredExtension + 2;
 
         container.style.setProperty(
             'padding-bottom',
@@ -4967,7 +5544,12 @@
         ]) {
             const target = eventName === 'keydown' ? window : document;
             target.addEventListener(eventName, event => {
-                if (rail?.contains(event.target)) return;
+                const eventElement = asElement(event.target);
+                if (
+                    (eventElement && rail?.contains(eventElement)) ||
+                    (eventElement &&
+                        replyNavigationUI?.root?.contains(eventElement))
+                ) return;
                 if (eventName === 'pointermove' && event.buttons === 0) return;
                 if (eventName === 'keydown') {
                     if (isEditable(event.target)) return;
@@ -5103,7 +5685,10 @@
     }
 
     function getFixedHeaderInset(target, scrollContext) {
-        const viewportTop = scrollContext.viewportTop;
+        const viewportTop = getScrollViewportGeometry(
+            scrollContext,
+            target
+        ).top;
         const targetRect = target.getBoundingClientRect();
         const targetX = targetRect.left + targetRect.width / 2;
         let inset = 0;
@@ -5123,6 +5708,154 @@
             }
         }
         return inset > 0 ? Math.ceil(inset + 8) : 0;
+    }
+
+    function getScrollViewportGeometry(scrollContext, target = null) {
+        if (scrollContext.isDocumentScroll) {
+            let left = 0;
+            let right = window.innerWidth;
+            const main = target?.closest?.('main, [role="main"]');
+            if (main?.isConnected) {
+                const mainRect = main.getBoundingClientRect();
+                if (mainRect.width > 0 && mainRect.right > mainRect.left) {
+                    left = Math.max(0, mainRect.left);
+                    right = Math.min(window.innerWidth, mainRect.right);
+                }
+            }
+            return clipReplyScrollViewportGeometry({
+                left,
+                right,
+                top: scrollContext.viewportTop,
+                bottom: scrollContext.viewportTop + window.innerHeight
+            }, window.innerWidth, window.innerHeight);
+        }
+
+        const container = scrollContext.container;
+        const rect = container.getBoundingClientRect();
+        const left = rect.left + container.clientLeft;
+        return clipReplyScrollViewportGeometry({
+            left,
+            right: left + container.clientWidth,
+            top: scrollContext.viewportTop,
+            bottom: scrollContext.viewportTop + container.clientHeight
+        }, window.innerWidth, window.innerHeight);
+    }
+
+    function getReplySidebarElement() {
+        return document.querySelector('aside.app-shell-left-panel');
+    }
+
+    function getReplySidebarGeometry(element = getReplySidebarElement()) {
+        if (
+            !element?.isConnected || element.hidden ||
+            element.getAttribute('aria-hidden') === 'true'
+        ) {
+            return null;
+        }
+        const style = window.getComputedStyle(element);
+        if (
+            style.display === 'none' || style.visibility === 'hidden' ||
+            Number(style.opacity) === 0
+        ) {
+            return null;
+        }
+        const rect = element.getBoundingClientRect();
+        if (
+            rect.width <= 0 || rect.height <= 0 ||
+            rect.right <= 0 || rect.left >= window.innerWidth
+        ) {
+            return null;
+        }
+        return {left: rect.left, right: rect.right};
+    }
+
+    function isReplyLayoutElementVisible(element) {
+        if (!element?.isConnected || element.closest('[hidden]')) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+    }
+
+    function getPromptComposerRoot() {
+        const selectors = [
+            '#prompt-textarea',
+            '[data-testid="prompt-textarea"]',
+            '[data-testid="composer-text-input"]',
+            'form textarea, form [contenteditable="true"], ' +
+                'form [contenteditable=""]'
+        ];
+        let control = null;
+        for (const selector of selectors) {
+            const candidate = document.querySelector(selector);
+            if (isReplyLayoutElementVisible(candidate)) {
+                control = candidate;
+                break;
+            }
+        }
+        if (!control) {
+            const composer = document.querySelector('[data-testid*="composer"]');
+            if (isReplyLayoutElementVisible(composer)) return composer;
+            return null;
+        }
+        return control.closest('form') ||
+            control.closest('[data-testid*="composer"]') || control;
+    }
+
+    function getFixedBottomInset(target, scrollContext) {
+        const viewport = getScrollViewportGeometry(scrollContext, target);
+        const targetRect = target.getBoundingClientRect();
+        const targetX = targetRect.left + targetRect.width / 2;
+        const excludesReplyOrScroller = element =>
+            element === target || element.contains(target) ||
+            element.contains(scrollContext.container);
+        const positionOf = element =>
+            window.getComputedStyle(element).position;
+        const composerRoot = getPromptComposerRoot();
+        const composerOverlays = composerRoot
+            ? collectFixedPositionAncestors(
+                [composerRoot],
+                scrollContext.container,
+                document.body,
+                positionOf,
+                excludesReplyOrScroller,
+                ['fixed', 'sticky', 'absolute']
+            ).map(element => ({
+                element,
+                kind: 'composer',
+                position: positionOf(element),
+                rect: element.getBoundingClientRect()
+            }))
+            : [];
+        const edgeCandidates = document.querySelectorAll(
+            'footer, [role="contentinfo"], ' +
+            '[data-testid*="footer"], [data-testid*="bottom"]'
+        );
+        const composerElements = new Set(
+            composerOverlays.map(overlay => overlay.element)
+        );
+        const edgeOverlays = collectFixedPositionAncestors(
+            edgeCandidates,
+            scrollContext.container,
+            document.body,
+            positionOf,
+            excludesReplyOrScroller
+        ).filter(element => !composerElements.has(element)).map(element => ({
+            kind: 'edge',
+            position: positionOf(element),
+            rect: element.getBoundingClientRect()
+        }));
+        const overlayGeometry = composerOverlays.map(overlay => ({
+            kind: overlay.kind,
+            position: overlay.position,
+            rect: overlay.rect
+        }));
+        return computeBottomOverlayInset(
+            [...overlayGeometry, ...edgeOverlays],
+            viewport,
+            targetX,
+            targetRect
+        );
     }
 
     function findMessageElement(messageId) {
@@ -5814,6 +6547,92 @@
         requestAnimationFrame(updateReplyTopButton);
     }
 
+    function scheduleReplyNavigationUpdate() {
+        if (replyNavigationRAF !== null) return;
+        replyNavigationRAF = requestAnimationFrame(() => {
+            replyNavigationRAF = null;
+            updateReplyTopButton();
+        });
+    }
+
+    function handleReplySidebarTransitionEnd(event) {
+        const sidebar = replyLayoutObservedSidebar;
+        if (!sidebar) return;
+        if (!replyNavigationUI?.root?.isConnected) {
+            disconnectReplyNavigationLayoutObservers();
+            return;
+        }
+        const target = asElement(event.target);
+        if (!target || (target !== sidebar && !sidebar.contains(target))) return;
+        if (![
+            'width', 'inline-size', 'transform', 'left', 'right',
+            'margin-left', 'margin-right', 'flex-basis',
+            'grid-template-columns'
+        ].includes(event.propertyName)) {
+            return;
+        }
+        scheduleReplyNavigationUpdate();
+    }
+
+    function disconnectReplyNavigationLayoutObservers() {
+        if (replyLayoutResizeObserver) {
+            replyLayoutResizeObserver.disconnect();
+            replyLayoutResizeObserver = null;
+        }
+        replyLayoutObservedNodes.clear();
+        replyLayoutObservedSidebar?.removeEventListener(
+            'transitionend',
+            handleReplySidebarTransitionEnd
+        );
+        replyLayoutObservedSidebar = null;
+    }
+
+    function syncReplyNavigationLayoutObservers(context) {
+        if (!replyNavigationUI?.root?.isConnected) {
+            disconnectReplyNavigationLayoutObservers();
+            return;
+        }
+        const sidebar = getReplySidebarElement();
+        if (sidebar !== replyLayoutObservedSidebar) {
+            replyLayoutObservedSidebar?.removeEventListener(
+                'transitionend',
+                handleReplySidebarTransitionEnd
+            );
+            replyLayoutObservedSidebar = sidebar?.isConnected ? sidebar : null;
+            replyLayoutObservedSidebar?.addEventListener(
+                'transitionend',
+                handleReplySidebarTransitionEnd
+            );
+        }
+        if (typeof ResizeObserver !== 'function') return;
+        if (!replyLayoutResizeObserver) {
+            replyLayoutResizeObserver = new ResizeObserver(() => {
+                if (!replyNavigationUI?.root?.isConnected) {
+                    disconnectReplyNavigationLayoutObservers();
+                    return;
+                }
+                scheduleReplyNavigationUpdate();
+            });
+        }
+
+        const main = context.reply.closest('main, [role="main"]');
+        const nextNodes = new Set(
+            [sidebar, main, context.scrollContext.container].filter(node =>
+                node instanceof Element && node.isConnected
+            )
+        );
+        for (const node of replyLayoutObservedNodes) {
+            if (nextNodes.has(node)) continue;
+            replyLayoutResizeObserver.unobserve(node);
+            replyLayoutObservedNodes.delete(node);
+        }
+        for (const node of nextNodes) {
+            if (replyLayoutObservedNodes.has(node)) continue;
+            replyLayoutResizeObserver.observe(node);
+            replyLayoutObservedNodes.add(node);
+        }
+    }
+
     function showPreviewByIdentity(identity, bar) {
         const index = turns.findIndex(turn => turn.identity === identity);
         if (index >= 0) showPreview(index, bar);
@@ -6126,54 +6945,372 @@
         }
     }
 
-    function updateReplyTopButton() {
-        if (!replyTopButton) return;
-        const readingPointRatio = 0.38;
+    function getCurrentReplyContext() {
+        if (currentChatIdentity === null) return null;
+        if (getChatIdentity() !== currentChatIdentity) {
+            handleRouteChange();
+            return null;
+        }
 
+        const candidates = [];
         for (const turn of turns) {
             const mounted = mountedTurnsByIdentity.get(turn.identity) || turn;
+            if (!mounted.root?.isConnected) continue;
+
             const reply = getAssistantReplyTarget(mounted);
             if (!reply?.isConnected) continue;
-
             const rect = reply.getBoundingClientRect();
             if (!rect.width || !rect.height) continue;
-            const context = createScrollContext(reply);
-            const viewportHeight = context.isDocumentScroll
-                ? window.innerHeight
-                : context.container.clientHeight;
-            const readingY = context.viewportTop +
-                viewportHeight * readingPointRatio;
-            const headerInset = getFixedHeaderInset(reply, context);
-            const readingEdge = context.viewportTop + headerInset;
 
-            if (
-                rect.top >= readingEdge ||
-                rect.top > readingY ||
-                rect.bottom < readingY
-            ) {
-                continue;
-            }
+            const scrollContext = createScrollContext(reply);
+            const viewport = getScrollViewportGeometry(scrollContext, reply);
+            const headerInset = getFixedHeaderInset(reply, scrollContext);
+            const bottomInset = getFixedBottomInset(reply, scrollContext);
+            const visibleTop = viewport.top + headerInset;
+            const visibleBottom = viewport.bottom - bottomInset;
+            if (visibleBottom <= visibleTop) continue;
 
+            const readingY = Math.max(
+                visibleTop,
+                Math.min(
+                    visibleBottom,
+                    viewport.top + viewport.height * 0.38
+                )
+            );
             const messageIds = getTurnMessageIds(mounted);
-            const messageId = turn.kind === 'assistant'
-                ? (turn.messageId || messageIds.messageId)
-                : (turn.assistantMessageIds?.[0] ||
+            const messageId = mounted.kind === 'assistant'
+                ? (mounted.messageId || messageIds.messageId)
+                : (mounted.assistantMessageIds?.[0] ||
                     messageIds.assistantMessageIds[0] || '');
-            replyTopButton.dataset.identity = turn.identity;
-            if (messageId) {
-                replyTopButton.dataset.messageId = messageId;
-            } else {
-                delete replyTopButton.dataset.messageId;
-            }
-            replyTopButton.style.left = `${rect.left + rect.width / 2}px`;
-            replyTopButton.style.top = `${context.viewportTop + 24}px`;
-            replyTopButton.hidden = false;
+
+            candidates.push({
+                turn: mounted,
+                identity: turn.identity,
+                messageId,
+                reply,
+                rect,
+                scrollContext,
+                viewport,
+                headerInset,
+                bottomInset,
+                visibleTop,
+                visibleBottom,
+                visibleLeft: viewport.left,
+                visibleRight: viewport.right,
+                readingY
+            });
+        }
+
+        const selected = chooseCurrentReplyCandidate(candidates);
+        return selected
+            ? {...selected, chatIdentity: currentChatIdentity}
+            : null;
+    }
+
+    function getReplyHeadingEntries(context) {
+        if (!context?.reply?.isConnected) return [];
+        const selector =
+            'h1.Heading-Ro3lZr, h2.Heading-Ro3lZr, ' +
+            'h3.Heading-Ro3lZr, h4.Heading-Ro3lZr, ' +
+            'h5.Heading-Ro3lZr, h6.Heading-Ro3lZr';
+        const matches = Array.from(context.reply.querySelectorAll(selector));
+        if (context.reply.matches?.(selector)) matches.unshift(context.reply);
+
+        return matches
+            .filter(element => element.isConnected && context.reply.contains(element))
+            .map(element => ({
+                element,
+                level: Number(element.tagName.slice(1)),
+                text: element.textContent.trim(),
+                top: element.getBoundingClientRect().top
+            }))
+            .filter(entry => entry.level >= 1 && entry.level <= 6 && entry.text);
+    }
+
+    function renderReplyOutline(context, entries) {
+        const ui = replyNavigationUI;
+        if (!ui) return;
+        const sameOwner =
+            ui.outlineChatIdentity === context.chatIdentity &&
+            ui.outlineIdentity === context.identity &&
+            ui.outlineReply === context.reply;
+        const previous = ui.outlineEntries || [];
+        const sameEntries = sameOwner && previous.length === entries.length &&
+            entries.every((entry, index) =>
+                previous[index]?.element === entry.element &&
+                previous[index]?.level === entry.level &&
+                previous[index]?.text === entry.text
+            );
+        if (sameEntries) return;
+
+        ui.list.replaceChildren();
+        ui.outlineChatIdentity = context.chatIdentity;
+        ui.outlineIdentity = context.identity;
+        ui.outlineReply = context.reply;
+        ui.outlineEntries = entries;
+
+        if (!entries.length) {
+            const empty = document.createElement('li');
+            empty.className = 'yw-reply-outline-empty';
+            empty.textContent = '当前回复没有可跳转的标题';
+            ui.list.appendChild(empty);
             return;
         }
 
-        replyTopButton.hidden = true;
-        delete replyTopButton.dataset.identity;
-        delete replyTopButton.dataset.messageId;
+        for (const entry of entries) {
+            const item = document.createElement('li');
+            item.className = 'yw-reply-outline-item';
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'yw-reply-outline-target';
+            button.style.paddingInlineStart = `${8 + (entry.level - 1) * 12}px`;
+            button.textContent = entry.text;
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                scrollToReplyHeading(context, entry);
+            });
+            item.appendChild(button);
+            ui.list.appendChild(item);
+        }
+    }
+
+    function positionReplyOutline() {
+        const ui = replyNavigationUI;
+        if (!ui || ui.outline.hidden) return;
+        const anchor = ui.buttons.get('outline').getBoundingClientRect();
+        const panel = ui.outline.getBoundingClientRect();
+        const width = panel.width || ui.outline.offsetWidth;
+        const height = panel.height || ui.outline.offsetHeight;
+        const left = Math.max(
+            8,
+            Math.min(anchor.right + 8, window.innerWidth - width - 8)
+        );
+        const top = Math.max(
+            8,
+            Math.min(anchor.top, window.innerHeight - height - 8)
+        );
+        ui.outline.style.left = `${left}px`;
+        ui.outline.style.top = `${top}px`;
+    }
+
+    function setReplyOutlineOpen(open, restoreFocus = false) {
+        const ui = replyNavigationUI;
+        if (!ui) return;
+        replyOutlineOpen = Boolean(open && replyNavigationContext && !ui.root.hidden);
+        ui.outline.hidden = !replyOutlineOpen;
+        ui.buttons.get('outline').setAttribute(
+            'aria-expanded',
+            String(replyOutlineOpen)
+        );
+        if (replyOutlineOpen) positionReplyOutline();
+        else if (restoreFocus) ui.buttons.get('outline').focus();
+    }
+
+    function closeReplyOutline(restoreFocus = false) {
+        setReplyOutlineOpen(false, restoreFocus);
+    }
+
+    function toggleReplyOutline() {
+        updateReplyTopButton();
+        if (!replyNavigationUI || replyNavigationUI.root.hidden) return;
+        setReplyOutlineOpen(!replyOutlineOpen);
+    }
+
+    function clearReplyNavigation() {
+        if (replyNavigationRAF !== null) {
+            cancelAnimationFrame(replyNavigationRAF);
+            replyNavigationRAF = null;
+        }
+        disconnectReplyNavigationLayoutObservers();
+        replyNavigationContext = null;
+        replyOutlineOpen = false;
+        if (replyNavigationUI) {
+            replyNavigationUI.root.hidden = true;
+            replyNavigationUI.outline.hidden = true;
+            replyNavigationUI.buttons.get('outline')?.setAttribute(
+                'aria-expanded',
+                'false'
+            );
+            replyNavigationUI.toolbar.style.removeProperty('left');
+            replyNavigationUI.toolbar.style.removeProperty('top');
+            replyNavigationUI.outline.style.removeProperty('left');
+            replyNavigationUI.outline.style.removeProperty('top');
+            replyNavigationUI.list.replaceChildren();
+            replyNavigationUI.outlineEntries = [];
+            replyNavigationUI.outlineChatIdentity = null;
+            replyNavigationUI.outlineIdentity = null;
+            replyNavigationUI.outlineReply = null;
+        }
+        if (replyTopButton) {
+            replyTopButton.hidden = true;
+            delete replyTopButton.dataset.identity;
+            delete replyTopButton.dataset.messageId;
+        }
+    }
+
+    function updateReplyNavigationControls(context, headings) {
+        const ui = replyNavigationUI;
+        if (!ui) return;
+        renderReplyOutline(context, headings);
+        const up = chooseAdjacentReplyHeading(headings, context.visibleTop, 'up', 2);
+        const down = chooseAdjacentReplyHeading(headings, context.visibleTop, 'down', 2);
+        ui.buttons.get('first').disabled = !context.identity || !context.reply?.isConnected;
+        ui.buttons.get('up').disabled = !up;
+        ui.buttons.get('down').disabled = !down;
+        ui.buttons.get('last').disabled = !context.reply?.isConnected;
+
+        const viewport = context.viewport;
+        const sidebarElement = getReplySidebarElement();
+        const sidebar = getReplySidebarGeometry(sidebarElement);
+        syncReplyNavigationLayoutObservers(context);
+        const position = computeReplyToolbarPosition({
+            viewportLeft: viewport.left,
+            viewportRight: viewport.right,
+            windowWidth: window.innerWidth,
+            contentLeft: context.rect.left,
+            sidebarLeft: sidebar?.left,
+            sidebarRight: sidebar?.right,
+            sidebarVisible: Boolean(sidebar),
+            viewportTop: viewport.top,
+            viewportBottom: viewport.bottom,
+            windowHeight: window.innerHeight,
+            headerInset: context.headerInset,
+            bottomInset: context.bottomInset,
+            toolbarWidth: 32,
+            toolbarHeight: 168,
+            minimumGutter: 48,
+            centerRatio: 0.7
+        });
+
+        if (!position) {
+            closeReplyOutline();
+            ui.root.hidden = true;
+            return;
+        }
+
+        ui.root.hidden = false;
+        ui.toolbar.style.left = `${position.left}px`;
+        ui.toolbar.style.top = `${position.top}px`;
+        if (replyOutlineOpen) positionReplyOutline();
+    }
+
+    function isCurrentReplyNavigationContext(context) {
+        if (
+            !context ||
+            context.chatIdentity !== currentChatIdentity ||
+            context.chatIdentity !== getChatIdentity() ||
+            !context.reply?.isConnected
+        ) {
+            return false;
+        }
+        const mounted = findMountedTurn(context.identity);
+        const selected = getCurrentReplyContext();
+        return Boolean(
+            selected?.identity === context.identity &&
+            selected.reply === context.reply &&
+            mounted?.root?.isConnected &&
+            getAssistantReplyTarget(mounted) === context.reply
+        );
+    }
+
+    function alignReplyElement(target, edge) {
+        if (!target?.isConnected) return;
+        cancelJumpSearch();
+        const scrollContext = createScrollContext(target);
+        const viewport = getScrollViewportGeometry(scrollContext, target);
+        const rect = target.getBoundingClientRect();
+        const topInset = getFixedHeaderInset(target, scrollContext);
+        const bottomInset = getFixedBottomInset(target, scrollContext);
+        const delta = computeReplyScrollDelta({
+            targetTop: rect.top,
+            targetBottom: rect.bottom,
+            viewportTop: viewport.top,
+            viewportBottom: viewport.bottom,
+            topInset,
+            bottomInset,
+            edge
+        });
+        const desiredTop = scrollContext.getTop() + delta;
+        extendScrollRangeTo(scrollContext, desiredTop);
+        scrollContext.setTop(desiredTop);
+    }
+
+    function scrollToReplyHeading(context, entry) {
+        if (
+            !isCurrentReplyNavigationContext(context) ||
+            !entry?.element?.isConnected ||
+            !context.reply.contains(entry.element)
+        ) {
+            return;
+        }
+        alignReplyElement(entry.element, 'top');
+    }
+
+    function jumpToCurrentReplyTop() {
+        const context = getCurrentReplyContext();
+        if (!context?.identity) return;
+        replyNavigationContext = context;
+        jumpToIdentity(
+            context.identity,
+            context.messageId || '',
+            {replyTop: true}
+        );
+    }
+
+    function navigateReplyHeading(direction) {
+        const context = getCurrentReplyContext();
+        if (!context) return;
+        replyNavigationContext = context;
+        const entries = getReplyHeadingEntries(context);
+        const heading = chooseAdjacentReplyHeading(
+            entries,
+            context.visibleTop,
+            direction,
+            2
+        );
+        if (heading) scrollToReplyHeading(context, heading);
+    }
+
+    function jumpToCurrentReplyBottom() {
+        const context = getCurrentReplyContext();
+        if (!isCurrentReplyNavigationContext(context)) return;
+        replyNavigationContext = context;
+        alignReplyElement(context.reply, 'bottom');
+    }
+
+    function updateReplyTopButton() {
+        if (!replyTopButton) return;
+        const context = getCurrentReplyContext();
+        if (!context) {
+            clearReplyNavigation();
+            return;
+        }
+
+        replyNavigationContext = context;
+        const headings = getReplyHeadingEntries(context);
+        updateReplyNavigationControls(context, headings);
+
+        if (
+            context.rect.top >= context.visibleTop ||
+            context.rect.top > context.readingY ||
+            context.rect.bottom < context.readingY
+        ) {
+            replyTopButton.hidden = true;
+            delete replyTopButton.dataset.identity;
+            delete replyTopButton.dataset.messageId;
+            return;
+        }
+
+        replyTopButton.dataset.identity = context.identity;
+        if (context.messageId) {
+            replyTopButton.dataset.messageId = context.messageId;
+        } else {
+            delete replyTopButton.dataset.messageId;
+        }
+        replyTopButton.style.left = `${context.rect.left + context.rect.width / 2}px`;
+        replyTopButton.style.top = `${context.viewport.top + 24}px`;
+        replyTopButton.hidden = false;
     }
 
     function updateActiveTurn() {
@@ -6311,6 +7448,12 @@
         if (node.matches(TURN_NODE_SELECTOR)) return true;
 
         return Boolean(node.querySelector(TURN_NODE_SELECTOR));
+    }
+
+    function nodeContainsReplySidebar(node) {
+        if (!(node instanceof Element)) return false;
+        return node.matches('aside.app-shell-left-panel') ||
+            Boolean(node.querySelector('aside.app-shell-left-panel'));
     }
 
     function isKnownCurrentChatTurn(turn) {
@@ -6475,7 +7618,8 @@
                     rail?.contains(mutation.target) ||
                     preview?.contains(mutation.target) ||
                     replyTopButton === mutation.target ||
-                    replyTopButton?.contains(mutation.target)
+                    replyTopButton?.contains(mutation.target) ||
+                    replyNavigationUI?.root?.contains(mutation.target)
                 ) {
                     continue;
                 }
@@ -6495,12 +7639,19 @@
 
                 if (
                     mutation.type === 'attributes' &&
-                    ['style', 'class', 'hidden'].includes(
+                    [
+                        'style', 'class', 'hidden', 'aria-expanded', 'data-state'
+                    ].includes(
                         mutation.attributeName
                     )
                 ) {
                     if (visibilityMutationAffectsCurrentChat(mutation.target)) {
                         relevant = true;
+                    }
+                    if ([
+                        'class', 'style', 'hidden', 'aria-expanded', 'data-state'
+                    ].includes(mutation.attributeName)) {
+                        scheduleReplyNavigationUpdate();
                     }
                     continue;
                 }
@@ -6534,6 +7685,15 @@
 
                 if (mutation.type === 'childList') {
                     queueAssistantBarRefresh(mutation.target);
+                    if (
+                        asElement(mutation.target)?.closest(
+                            'aside.app-shell-left-panel'
+                        ) ||
+                        [...mutation.addedNodes, ...mutation.removedNodes]
+                            .some(nodeContainsReplySidebar)
+                    ) {
+                        scheduleReplyNavigationUpdate();
+                    }
                 }
             }
 
@@ -6561,6 +7721,8 @@
                 'data-content-search-unit-key',
                 'data-chatgpt-search-unit-key',
                 'data-conversation-role',
+                'aria-expanded',
+                'data-state',
                 'style',
                 'class',
                 'hidden'
@@ -6574,7 +7736,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.5)');
+        console.info('[Conversation Navigator] Started (0.4.6)');
         currentChatIdentity = getChatIdentity();
         ensureUI();
         observeRouteChanges();
