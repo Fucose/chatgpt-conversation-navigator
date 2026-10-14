@@ -4,7 +4,7 @@ const {
     createNativeLocator,
     runBoundedScrollSearch,
     deriveHistoryControlView
-} = require('../chatgpt-conversation-navigator.user.js');
+} = require('./chatgpt-conversation-navigator.user.js');
 
 function makePage({chatId = 'chat-1', components = []} = {}) {
     const root = {return: null, child: null, stateNode: {}};
