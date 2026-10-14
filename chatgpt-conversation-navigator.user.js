@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.4
+// @version      0.4.5
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史并回到回复顶部。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -438,14 +438,83 @@
         };
     }
 
-    const { createNativeAdapter, NativeAdapterError } = (() => {
+    async function runBoundedScrollSearch({
+        estimateTop,
+        stepSize,
+        initialDirection = 1,
+        maxSteps = 24,
+        timeoutMs = 8000,
+        maxNoProgress = 2,
+        getTop,
+        setTop,
+        findTarget,
+        isCurrent = () => true,
+        waitForStep = () => new Promise(resolve => setTimeout(resolve, 120))
+    } = {}) {
+        const startedAt = Date.now();
+        const direction = initialDirection < 0 ? -1 : 1;
+        const originalTop = getTop();
+        const safeStepSize = Math.max(1, Number(stepSize) || 1);
+        const safeMaxSteps = Math.max(0, Math.floor(maxSteps));
+        const stepsPerDirection = Math.ceil(safeMaxSteps / 2);
+        let steps = 0;
+
+        async function inspectAt(top) {
+            if (!isCurrent()) return {cancelled: true};
+            const before = getTop();
+            setTop(top);
+            steps += 1;
+            await waitForStep();
+            if (!isCurrent()) return {cancelled: true};
+            const target = findTarget();
+            return target
+                ? {target}
+                : {noProgress: Math.abs(getTop() - before) < 1};
+        }
+
+        const initial = await inspectAt(estimateTop);
+        if (initial.cancelled) {
+            return {target: null, reason: 'CANCELLED', steps, originalTop};
+        }
+        if (initial.target) {
+            return {target: initial.target, reason: 'FOUND', steps, originalTop};
+        }
+
+        for (const scanDirection of [direction, -direction]) {
+            let noProgress = 0;
+            for (let offset = 1; offset <= stepsPerDirection && steps < safeMaxSteps; offset += 1) {
+                if (Date.now() - startedAt >= timeoutMs) {
+                    return {target: null, reason: 'TIMEOUT', steps, originalTop};
+                }
+                const result = await inspectAt(
+                    estimateTop + scanDirection * safeStepSize * offset
+                );
+                if (result.cancelled) {
+                    return {target: null, reason: 'CANCELLED', steps, originalTop};
+                }
+                if (result.target) {
+                    return {target: result.target, reason: 'FOUND', steps, originalTop};
+                }
+                noProgress = result.noProgress ? noProgress + 1 : 0;
+                if (noProgress >= maxNoProgress) break;
+            }
+        }
+
+        return {
+            target: null,
+            reason: Date.now() - startedAt >= timeoutMs ? 'TIMEOUT' : 'NOT_FOUND',
+            steps,
+            originalTop
+        };
+    }
+
+    const { createNativeAdapter, createNativeLocator, NativeAdapterError } = (() => {
         const NATIVE_MODULE_CONTRACT = Object.freeze({
             scope: Object.freeze({id: 'OW', export: 'a'}),
-            conversationState: Object.freeze({id: 'no', export: 'j'}),
+            conversationState: Object.freeze({id: 'MrG', export: 'j'}),
             pagination: Object.freeze({id: 'FG', export: 'c'}),
             loader: Object.freeze({id: 'jfi', export: 'b'}),
             reactDom: Object.freeze({id: 'v7', export: 'flushSync'}),
-            routeSource: Object.freeze({id: 'Zyh', export: 'ChatGptConversationPage'}),
             historySource: Object.freeze({id: 'M3K', export: 'a'}),
         });
 
@@ -727,9 +796,6 @@
             ];
             const loadPrevious = exportsByName.loader?.[NATIVE_MODULE_CONTRACT.loader.export];
             const flushSync = exportsByName.reactDom?.[NATIVE_MODULE_CONTRACT.reactDom.export];
-            const routeComponent = exportsByName.routeSource?.[
-                NATIVE_MODULE_CONTRACT.routeSource.export
-            ];
             const historyComponent = exportsByName.historySource?.[
                 NATIVE_MODULE_CONTRACT.historySource.export
             ];
@@ -742,7 +808,6 @@
                 paginationSelector == null ||
                 typeof loadPrevious !== 'function' ||
                 typeof flushSync !== 'function' ||
-                typeof routeComponent !== 'function' ||
                 typeof historyComponent !== 'function'
             ) {
                 fail('SUPPORTED_MODULE_SHAPE_UNKNOWN', 'The current ChatGPT navigation module exports have changed.');
@@ -943,7 +1008,7 @@
         function getConversationStateKey({scope, chatId, modules}) {
             let value;
             try {
-                /* Mirrors M3K: DF.x(no.j, conversationId); pagination has a separate fallback. */
+                /* Mirrors M3K: DF.x(MrG.j, conversationId); pagination has a separate fallback. */
                 value = scope.get(modules.conversationStateSelector, chatId);
             } catch (_error) {
                 fail('NATIVE_CONVERSATION_STATE_UNAVAILABLE', 'The active ChatGPT conversation state could not be read.');
@@ -1131,6 +1196,97 @@
             };
         }
 
+        function resolveNativeTarget(documentObject, chatId) {
+            const targets = [];
+            for (const tree of collectFiberTrees(documentObject)) {
+                const target = findTarget({fibers: tree.fibers, chatId});
+                if (target) targets.push({tree, target});
+            }
+            if (targets.length === 0) {
+                fail('ACTIVE_CONVERSATION_NOT_FOUND', 'The native conversation list for this chat is unavailable.');
+            }
+            if (targets.length > 1) {
+                fail('AMBIGUOUS_ACTIVE_CONVERSATION', 'More than one native conversation list matched this chat.');
+            }
+            return targets[0];
+        }
+
+        function getRouteConversationId(windowObject) {
+            const pathname = windowObject?.location?.pathname;
+            return typeof pathname === 'string'
+                ? pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] || null
+                : null;
+        }
+
+        function createNativeLocator({
+            document: documentObject,
+            window: windowObject,
+            chatId: requestedChatId,
+            isCurrent = () => true
+        } = {}) {
+            if (typeof requestedChatId !== 'string' || requestedChatId.length === 0) {
+                fail('INVALID_CHAT_ID', 'A conversation identifier is required.');
+            }
+            let disposed = false;
+
+            function assertActive() {
+                if (disposed) fail('LOCATOR_DISPOSED', 'This native message locator has been disposed.');
+                if (
+                    getRouteConversationId(windowObject) !== requestedChatId ||
+                    !isCurrent()
+                ) {
+                    fail('STALE_NATIVE_LOCATOR', 'The active ChatGPT conversation changed before navigation.');
+                }
+            }
+
+            function resolveCurrentTarget() {
+                assertActive();
+                return resolveNativeTarget(documentObject, requestedChatId).target;
+            }
+
+            async function locateMessage(messageId, isRequestCurrent = () => true) {
+                if (typeof messageId !== 'string' || messageId.length === 0) {
+                    fail('INVALID_MESSAGE_ID', 'A message identifier is required.');
+                }
+                const target = resolveCurrentTarget();
+                const entries = target.props.entries;
+                if (!Array.isArray(entries)) {
+                    fail('UNSUPPORTED_TURN_MODEL', 'The native conversation list has an unsupported shape.');
+                }
+                const hasMessage = entries.some(entry =>
+                    Array.isArray(entry?.turn?.messageIds) &&
+                    entry.turn.messageIds.includes(messageId)
+                );
+                if (!hasMessage) return false;
+
+                assertActive();
+                if (!isRequestCurrent()) return false;
+                try {
+                    await target.ref.scrollToMessage(messageId);
+                } catch (_error) {
+                    fail('NATIVE_SCROLL_FAILED', 'ChatGPT could not scroll to the requested message.');
+                }
+                assertActive();
+                if (!isRequestCurrent()) return false;
+
+                const currentTarget = resolveCurrentTarget();
+                const currentEntries = currentTarget.props.entries;
+                if (!Array.isArray(currentEntries)) return false;
+                return currentEntries.some(entry =>
+                    Array.isArray(entry?.turn?.messageIds) &&
+                    entry.turn.messageIds.includes(messageId)
+                ) && Boolean(isRequestCurrent());
+            }
+
+            resolveCurrentTarget();
+            return {
+                locateMessage,
+                dispose() {
+                    disposed = true;
+                }
+            };
+        }
+
         function createNativeAdapterErrorFrom(error, code, message) {
             if (error instanceof NativeAdapterError) return error;
             return new NativeAdapterError(code, message);
@@ -1162,20 +1318,10 @@
 
             function resolveCurrentState() {
                 assertActive();
-                const trees = collectFiberTrees(documentObject);
-                const targets = [];
-                for (const tree of trees) {
-                    const target = findTarget({fibers: tree.fibers, chatId: requestedChatId});
-                    if (target) targets.push({tree, target});
+                if (getRouteConversationId(windowObject) !== requestedChatId) {
+                    fail('STALE_NATIVE_ADAPTER', 'The active ChatGPT conversation changed during page loading.');
                 }
-                if (targets.length === 0) {
-                    fail('ACTIVE_CONVERSATION_NOT_FOUND', 'The native conversation list for this chat is unavailable.');
-                }
-                if (targets.length > 1) {
-                    fail('AMBIGUOUS_ACTIVE_CONVERSATION', 'More than one native conversation list matched this chat.');
-                }
-
-                const {tree, target} = targets[0];
+                const {tree, target} = resolveNativeTarget(documentObject, requestedChatId);
                 const scope = findAppScopeBinding({
                     fibers: tree.fibers,
                     chatId: requestedChatId,
@@ -1319,32 +1465,9 @@
                 }
             }
 
-            async function locateMessage(messageId) {
-                assertActive();
-                if (typeof messageId !== 'string' || messageId.length === 0) {
-                    fail('INVALID_MESSAGE_ID', 'A message identifier is required.');
-                }
-
-                const {target} = resolveCurrentState();
-                const entries = target.props.entries;
-                const hasMessage = entries.some(entry =>
-                    Array.isArray(entry?.turn?.messageIds) &&
-                    entry.turn.messageIds.includes(messageId)
-                );
-                if (!hasMessage) return false;
-
-                try {
-                    await target.ref.scrollToMessage(messageId);
-                } catch (_error) {
-                    fail('NATIVE_SCROLL_FAILED', 'ChatGPT could not scroll to the requested message.');
-                }
-                return true;
-            }
-
             const adapter = {
                 readSnapshot,
                 loadPreviousPage,
-                locateMessage,
                 dispose() {
                     disposed = true;
                 },
@@ -1354,12 +1477,14 @@
             adapter.readSnapshot();
             return adapter;
         }
-        return { createNativeAdapter, NativeAdapterError };
+        return { createNativeAdapter, createNativeLocator, NativeAdapterError };
     })();
     const core = {
         createConversationIndex,
         createHistoryLoader,
+        createNativeLocator,
         createNativeAdapter,
+        runBoundedScrollSearch,
         deriveHistoryControlView,
         NativeAdapterError
     };
@@ -1391,6 +1516,11 @@
         'NATIVE_CONVERSATION_STATE_UNAVAILABLE',
         'NATIVE_PAGINATION_UNAVAILABLE'
     ]);
+    const RETRYABLE_NATIVE_LOCATOR_CODES = new Set([
+        'REACT_FIBERS_UNAVAILABLE',
+        'REACT_FIBER_LIMIT_EXCEEDED',
+        'ACTIVE_CONVERSATION_NOT_FOUND'
+    ]);
     const isRetryableNativeBindingError = error =>
         RETRYABLE_NATIVE_BINDING_CODES.has(error?.code);
     const NATIVE_ADAPTER_RETRY_BASE_MS = 800;
@@ -1421,15 +1551,24 @@
     let mountedTurnsByIdentity = new Map();
     let activeJumpSearch = null;
     let nativeAdapter = null;
+    let nativeLocator = null;
     let historyLoader = null;
     let nativeAdapterError = null;
+    let nativeLocatorError = null;
     let adapterConnecting = false;
     let nativeAdapterEpoch = 0;
+    let nativeLocatorEpoch = 0;
     let nativeSnapshotTimer = null;
     let latestNativePagination = null;
     let nativeAdapterRetryPending = false;
     let nativeAdapterRetryDelayMs = 0;
     let nextNativeAdapterRetryAt = 0;
+    let nativeLocatorRetryPending = false;
+    let nativeLocatorRetryDelayMs = 0;
+    let nextNativeLocatorRetryAt = 0;
+    let lastLocatorDiagnostic = '';
+    let lastHistoryCapabilityDiagnostic = '';
+    let lastHistoryControlDiagnostic = '';
     let scrollCoordinatorResizeObserver = null;
     let threadResizeObserver = null;
     let threadResizeObservedNodes = new Set();
@@ -1468,6 +1607,35 @@
     function resetNativeAdapterRetryBackoff() {
         nativeAdapterRetryDelayMs = 0;
         nextNativeAdapterRetryAt = 0;
+    }
+
+    function bumpNativeLocatorRetryBackoff() {
+        nativeLocatorRetryDelayMs = nativeLocatorRetryDelayMs
+            ? Math.min(nativeLocatorRetryDelayMs * 2, NATIVE_ADAPTER_RETRY_MAX_MS)
+            : NATIVE_ADAPTER_RETRY_BASE_MS;
+        nextNativeLocatorRetryAt = Date.now() + nativeLocatorRetryDelayMs;
+    }
+
+    function resetNativeLocatorRetryBackoff() {
+        nativeLocatorRetryDelayMs = 0;
+        nextNativeLocatorRetryAt = 0;
+    }
+
+    function getDiagnosticCode(error, fallback = '') {
+        return String(error?.code || fallback).slice(0, 48);
+    }
+
+    function reportRouteCapability(name, status, error = null) {
+        const code = error ? getDiagnosticCode(error, 'UNKNOWN') : '';
+        const key = `${currentChatIdentity}|${name}|${status}|${code}`;
+        const previous = name === 'Native message locator'
+            ? lastLocatorDiagnostic
+            : lastHistoryCapabilityDiagnostic;
+        if (previous === key) return;
+        if (name === 'Native message locator') lastLocatorDiagnostic = key;
+        else lastHistoryCapabilityDiagnostic = key;
+        const suffix = code ? ` (${code})` : '';
+        console.info(`[Conversation Navigator] ${name} ${status}${suffix}`);
     }
 
     /******************************************************************
@@ -2133,6 +2301,14 @@
             );
         const show = Boolean(chatOpen && turnCount > 0 &&
             (running || canLoadPrevious || stoppedWithMore || errorWithMore));
+        let reason = 'unknown';
+        if (!chatOpen) reason = 'no-conversation';
+        else if (running) reason = 'loading';
+        else if (errorWithMore) reason = 'retry-available';
+        else if (canLoadPrevious || stoppedWithMore) reason = 'older-pages-confirmed';
+        else if (pagination?.complete === true || state.status === 'complete') reason = 'complete';
+        else if (adapterError) reason = 'unavailable';
+        else if (turnCount === 0) reason = 'no-turns';
 
         const label = '加载全部历史';
         let visibleLabel = label;
@@ -2160,7 +2336,11 @@
             label: visibleLabel,
             title,
             disabled,
-            busy: Boolean(adapterConnecting || state.running)
+            busy: Boolean(adapterConnecting || state.running),
+            reason,
+            reasonCode: reason === 'unavailable' || reason === 'retry-available'
+                ? String((state.error || adapterError)?.code || 'HISTORY_LOAD_FAILED').slice(0, 48)
+                : ''
         };
     }
 
@@ -2177,6 +2357,14 @@
             loaderState: state,
             pagination: latestNativePagination
         });
+
+        const diagnosticKey = `${currentChatIdentity}|${view.hidden ? 'hidden' : 'visible'}|${view.reason}|${view.reasonCode}`;
+        if (diagnosticKey !== lastHistoryControlDiagnostic) {
+            lastHistoryControlDiagnostic = diagnosticKey;
+            const visibility = view.hidden ? 'hidden' : 'visible';
+            const detail = view.reasonCode ? `: ${view.reasonCode}` : '';
+            console.info(`[Conversation Navigator] History control ${visibility} (${view.reason}${detail})`);
+        }
 
         historyControl.hidden = view.hidden;
         const toolbar = rail?.querySelector('.yw-nav-toolbar');
@@ -2202,6 +2390,21 @@
         }
     }
 
+    function monitorHistoryLoad(operation) {
+        console.info('[Conversation Navigator] History load started');
+        updateHistoryControl();
+        return Promise.resolve(operation).then(state => {
+            if (state?.status === 'complete') {
+                console.info('[Conversation Navigator] History load complete');
+            } else if (state?.status === 'error') {
+                console.warn(`[Conversation Navigator] History load failed (${getDiagnosticCode(state.error, 'HISTORY_LOAD_FAILED')})`);
+            } else if (state?.status === 'stopped') {
+                console.info('[Conversation Navigator] History load stopped');
+            }
+            return state;
+        }).finally(updateHistoryControl);
+    }
+
     function toggleHistoryLoading() {
         if (!historyLoader || nativeAdapterError) {
             const chatIdentity = currentChatIdentity;
@@ -2215,7 +2418,7 @@
                     historyLoader &&
                     !nativeAdapterError
                 ) {
-                    return historyLoader.start();
+                    return monitorHistoryLoad(historyLoader.start());
                 }
                 return null;
             });
@@ -2227,19 +2430,17 @@
         const state = historyLoader.getState();
         if (state.running) {
             historyLoader.stop();
+            console.info('[Conversation Navigator] History load stop requested');
             updateHistoryControl();
             return;
         }
-        const operation = historyLoader.start();
-        updateHistoryControl();
-        Promise.resolve(operation).finally(updateHistoryControl);
+        monitorHistoryLoad(historyLoader.start());
     }
 
     function retryNativeAdapterBinding() {
         if (
             !nativeAdapterRetryPending ||
             adapterConnecting ||
-            nativeAdapterError ||
             !getNativeConversationId(currentChatIdentity) ||
             Date.now() < nextNativeAdapterRetryAt
         ) {
@@ -2252,6 +2453,76 @@
         }
         if (nativeAdapter || historyLoader) return;
         startNativeAdapter(currentChatIdentity, { automaticRetry: true });
+    }
+
+    function disposeRouteNativeLocator(preserveRetryBackoff = false) {
+        nativeLocatorEpoch += 1;
+        const locator = nativeLocator;
+        nativeLocator = null;
+        nativeLocatorError = null;
+        nativeLocatorRetryPending = false;
+        if (!preserveRetryBackoff) resetNativeLocatorRetryBackoff();
+        try {
+            locator?.dispose?.();
+        } catch (_error) {
+            /* A stale locator cannot be used after this route generation. */
+        }
+    }
+
+    function startNativeLocator(chatIdentity, options = {}) {
+        disposeRouteNativeLocator(Boolean(options.automaticRetry));
+        const epoch = nativeLocatorEpoch;
+        const chatId = getNativeConversationId(chatIdentity);
+        if (!chatId) {
+            reportRouteCapability('Native message locator', 'unavailable', {
+                code: 'NO_CONVERSATION'
+            });
+            return;
+        }
+
+        try {
+            const locator = createNativeLocator({
+                window,
+                document,
+                chatId,
+                isCurrent: () =>
+                    epoch === nativeLocatorEpoch &&
+                    chatIdentity === currentChatIdentity &&
+                    getChatIdentity() === chatIdentity
+            });
+            if (
+                epoch !== nativeLocatorEpoch ||
+                chatIdentity !== currentChatIdentity ||
+                getChatIdentity() !== chatIdentity
+            ) {
+                locator.dispose?.();
+                return;
+            }
+            nativeLocator = locator;
+            nativeLocatorError = null;
+            nativeLocatorRetryPending = false;
+            resetNativeLocatorRetryBackoff();
+            reportRouteCapability('Native message locator', 'ready');
+        } catch (error) {
+            if (epoch !== nativeLocatorEpoch || chatIdentity !== currentChatIdentity) return;
+            nativeLocatorError = error;
+            nativeLocatorRetryPending = !options.manual &&
+                RETRYABLE_NATIVE_LOCATOR_CODES.has(error?.code);
+            if (nativeLocatorRetryPending) bumpNativeLocatorRetryBackoff();
+            reportRouteCapability('Native message locator', 'unavailable', error);
+        }
+    }
+
+    function retryNativeLocatorBinding() {
+        if (
+            !nativeLocatorRetryPending ||
+            nativeLocator ||
+            !getNativeConversationId(currentChatIdentity) ||
+            Date.now() < nextNativeLocatorRetryAt
+        ) {
+            return;
+        }
+        startNativeLocator(currentChatIdentity, {automaticRetry: true});
     }
 
     function disposeRouteAdapter() {
@@ -2275,7 +2546,7 @@
         try {
             adapter?.dispose?.();
         } catch (error) {
-            console.warn('[Conversation Navigator] Adapter cleanup failed', error);
+            console.warn(`[Conversation Navigator] Adapter cleanup failed (${getDiagnosticCode(error, 'ADAPTER_CLEANUP_FAILED')})`);
         }
         if (threadResizeObserver) {
             threadResizeObserver.disconnect();
@@ -2318,8 +2589,7 @@
             if (
                 !adapter ||
                 typeof adapter.readSnapshot !== 'function' ||
-                typeof adapter.loadPreviousPage !== 'function' ||
-                typeof adapter.locateMessage !== 'function'
+                typeof adapter.loadPreviousPage !== 'function'
             ) {
                 throw new Error('The native history adapter is unsupported.');
             }
@@ -2370,6 +2640,7 @@
             });
             nativeAdapterError = null;
             adapterConnecting = false;
+            reportRouteCapability('Native history', 'ready');
             updateHistoryControl();
         } catch (error) {
             if (
@@ -2379,7 +2650,7 @@
                 adapterConnecting = false;
                 nativeAdapterRetryPending = !manual &&
                     isRetryableNativeBindingError(error);
-                nativeAdapterError = nativeAdapterRetryPending ? null : error;
+                nativeAdapterError = error;
                 if (nativeAdapterRetryPending) bumpNativeAdapterRetryBackoff();
                 else resetNativeAdapterRetryBackoff();
                 try {
@@ -2387,10 +2658,7 @@
                 } catch (_) {}
                 nativeAdapter = null;
                 historyLoader = null;
-                if (manual || !nativeAdapterRetryPending) {
-                    const code = String(error?.code || 'HISTORY_LOAD_FAILED').slice(0, 48);
-                    console.warn(`[Conversation Navigator] Native history adapter failed (${code})`);
-                }
+                reportRouteCapability('Native history', 'unavailable', error);
                 updateHistoryControl();
             }
         }
@@ -2595,13 +2863,20 @@
         ) {
             transferChatTurnIdentities(currentChatIdentity, identity);
             currentChatIdentity = identity;
+            lastLocatorDiagnostic = '';
+            lastHistoryCapabilityDiagnostic = '';
+            lastHistoryControlDiagnostic = '';
             clearNewConversationSubmission();
+            startNativeLocator(identity);
             startNativeAdapter(identity);
             return;
         }
 
         clearNewConversationSubmission();
         currentChatIdentity = identity;
+        lastLocatorDiagnostic = '';
+        lastHistoryCapabilityDiagnostic = '';
+        lastHistoryControlDiagnostic = '';
 
         if (rebuildTimer !== null) {
             clearTimeout(rebuildTimer);
@@ -2609,6 +2884,7 @@
         }
 
         clearNavigation();
+        startNativeLocator(identity);
         startNativeAdapter(identity);
     }
 
@@ -3393,6 +3669,10 @@
         if (chatIdentity === currentChatIdentity) {
             nativeAdapterRetryPending = false;
             resetNativeAdapterRetryBackoff();
+            if (nativeAdapterError) {
+                nativeAdapterError = null;
+                reportRouteCapability('Native history', 'ready');
+            }
             latestNativePagination = snapshot?.pagination || null;
             renderTurns();
             updateHistoryControl();
@@ -3420,13 +3700,14 @@
                 acceptNativeSnapshot(snapshot, chatIdentity);
             } catch (error) {
                 if (epoch === nativeAdapterEpoch) {
-                    if (isRetryableNativeBindingError(error)) {
-                        nativeAdapterRetryPending = true;
-                        nativeAdapterError = null;
+                    nativeAdapterError = error;
+                    nativeAdapterRetryPending = isRetryableNativeBindingError(error);
+                    if (nativeAdapterRetryPending) {
                         bumpNativeAdapterRetryBackoff();
                     } else {
-                        nativeAdapterError = error;
+                        resetNativeAdapterRetryBackoff();
                     }
+                    reportRouteCapability('Native history', 'unavailable', error);
                     updateHistoryControl();
                 }
             }
@@ -4739,10 +5020,14 @@
     }
 
     function isCurrentJumpSearch(search) {
+        const currentEntry = search?.messageId
+            ? getCurrentEntry(search.identity)
+            : null;
         return Boolean(
             search &&
             activeJumpSearch === search &&
             !search.cancelled &&
+            search.userScrollGeneration === userScrollGeneration &&
             currentChatIdentity === search.chatIdentity &&
             getChatIdentity() === search.chatIdentity &&
             (
@@ -4750,7 +5035,8 @@
                 getConversationIndex(search.chatIdentity)
                     .getEntries()
                     .some(entry => entry.identity === search.identity)
-            )
+            ) &&
+            (!search.messageId || entryContainsMessage(currentEntry, search.messageId))
         );
     }
 
@@ -5098,7 +5384,7 @@
         clearExtendedScrollRange();
     }
 
-    async function waitForMountedMessage(search, messageId, timeoutMs = 12000) {
+    async function waitForMountedMessage(search, messageId, timeoutMs = 1200) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
             if (!isCurrentJumpSearch(search)) return null;
@@ -5110,6 +5396,85 @@
             await new Promise(resolve => setTimeout(resolve, 40));
         }
         return null;
+    }
+
+    function getDOMSearchEstimate(search) {
+        const targetIndex = turns.findIndex(turn => turn.identity === search.identity);
+        if (targetIndex < 0) return null;
+
+        const mounted = [];
+        for (let index = 0; index < turns.length; index += 1) {
+            const turn = turns[index];
+            const element = getMountedTarget(turn);
+            if (!element?.isConnected) continue;
+            const context = createScrollContext(element);
+            const top = context.getTop() +
+                element.getBoundingClientRect().top - context.viewportTop;
+            mounted.push({index, element, context, top});
+        }
+        if (!mounted.length) return null;
+
+        mounted.sort((left, right) => left.index - right.index);
+        const anchor = mounted.reduce((best, candidate) =>
+            Math.abs(candidate.index - targetIndex) < Math.abs(best.index - targetIndex)
+                ? candidate
+                : best
+        );
+        const neighbors = mounted.filter(candidate =>
+            candidate.context.container === anchor.context.container &&
+            Math.abs(candidate.index - anchor.index) <= 40
+        );
+        const spacings = [];
+        for (let index = 1; index < neighbors.length; index += 1) {
+            const previous = neighbors[index - 1];
+            const next = neighbors[index];
+            const turnDistance = next.index - previous.index;
+            if (turnDistance <= 0) continue;
+            const spacing = Math.abs(next.top - previous.top) / turnDistance;
+            if (Number.isFinite(spacing) && spacing > 0) spacings.push(spacing);
+        }
+        spacings.sort((left, right) => left - right);
+        const viewportHeight = anchor.context.isDocumentScroll
+            ? window.innerHeight
+            : anchor.context.container.clientHeight;
+        const typicalTurnHeight = spacings.length
+            ? spacings[Math.floor(spacings.length / 2)]
+            : Math.max(160, viewportHeight * 0.75);
+        const stepSize = Math.max(120, Math.min(viewportHeight * 1.5, typicalTurnHeight));
+        const estimateTop = Math.max(0, Math.min(
+            anchor.context.maxTop(),
+            anchor.top + (targetIndex - anchor.index) * typicalTurnHeight
+        ));
+
+        return {
+            context: anchor.context,
+            estimateTop,
+            stepSize,
+            initialDirection: targetIndex >= anchor.index ? 1 : -1
+        };
+    }
+
+    async function runDOMSearchFallback(search) {
+        const estimate = getDOMSearchEstimate(search);
+        if (!estimate) {
+            return {target: null, reason: 'NO_MOUNTED_SCROLL_ANCHOR', steps: 0};
+        }
+
+        const result = await runBoundedScrollSearch({
+            ...estimate,
+            maxSteps: 24,
+            timeoutMs: 8000,
+            maxNoProgress: 2,
+            getTop: () => estimate.context.getTop(),
+            setTop: value => estimate.context.setTop(value),
+            findTarget: () => resolveSearchTarget(search),
+            isCurrent: () => isCurrentJumpSearch(search),
+            waitForStep: () => new Promise(resolve => setTimeout(resolve, 140))
+        });
+        if (!result.target && isCurrentJumpSearch(search)) {
+            estimate.context.setTop(result.originalTop);
+        }
+        return result;
     }
 
     async function waitForForegroundSettle(search) {
@@ -5161,6 +5526,7 @@
                 getEntryTargetMessageId(entry, options),
             options,
             cancelled: false,
+            userScrollGeneration,
             correctionFrame: null,
             settled: false
         };
@@ -5171,15 +5537,62 @@
                 ? findMountedMessageForEntry(entry, search.messageId)
                 : getMountedTarget(entry, options);
 
-            if (!target && search.messageId && nativeAdapter) {
-                const located = await nativeAdapter.locateMessage(search.messageId);
-                if (!located || !isCurrentJumpSearch(search)) {
-                    clearForegroundSearch(search);
-                    return;
+            if (search.messageId && !entryContainsMessage(entry, search.messageId)) {
+                console.warn('[Conversation Navigator] Jump failed (TARGET_MESSAGE_NOT_IN_ENTRY)');
+                clearForegroundSearch(search);
+                return;
+            }
+
+            if (!target && search.messageId) {
+                let fallbackReason = 'locator-unavailable';
+                const locator = nativeLocator;
+                const locatorEpoch = nativeLocatorEpoch;
+                if (locator) {
+                    try {
+                        const located = await locator.locateMessage(
+                            search.messageId,
+                            () => isCurrentJumpSearch(search)
+                        );
+                        if (!isCurrentJumpSearch(search)) {
+                            clearForegroundSearch(search);
+                            return;
+                        }
+                        fallbackReason = located
+                            ? 'native-target-not-mounted'
+                            : 'message-not-in-native-entries';
+                        if (located) {
+                            target = await waitForMountedMessage(search, search.messageId);
+                        }
+                    } catch (error) {
+                        fallbackReason = getDiagnosticCode(error, 'NATIVE_LOCATOR_FAILED');
+                    }
+                    if (locator !== nativeLocator || locatorEpoch !== nativeLocatorEpoch) {
+                        target = null;
+                    }
+                } else if (nativeLocatorError) {
+                    fallbackReason = getDiagnosticCode(nativeLocatorError, 'NATIVE_LOCATOR_UNAVAILABLE');
                 }
-                target = await waitForMountedMessage(search, search.messageId);
+
+                if (!target && isCurrentJumpSearch(search)) {
+                    console.info(`[Conversation Navigator] Jump using bounded DOM search (${fallbackReason})`);
+                    const fallback = await runDOMSearchFallback(search);
+                    if (!isCurrentJumpSearch(search)) {
+                        clearForegroundSearch(search);
+                        return;
+                    }
+                    target = fallback.target;
+                    if (!target) {
+                        console.warn(`[Conversation Navigator] Jump failed (${fallback.reason})`);
+                        clearForegroundSearch(search);
+                        return;
+                    }
+                    console.info(`[Conversation Navigator] Jump fallback completed (${fallback.steps} steps)`);
+                }
             }
             if (!target?.isConnected || !isCurrentJumpSearch(search)) {
+                if (isCurrentJumpSearch(search)) {
+                    console.warn('[Conversation Navigator] Jump failed (TARGET_NOT_MOUNTED)');
+                }
                 clearForegroundSearch(search);
                 return;
             }
@@ -5192,7 +5605,7 @@
             updateReplyTopButton();
         } catch (error) {
             if (isCurrentJumpSearch(search)) {
-                console.warn('[Conversation Navigator] Navigation failed', error);
+                console.warn(`[Conversation Navigator] Jump failed (${getDiagnosticCode(error, 'NAVIGATION_FAILED')})`);
                 clearForegroundSearch(search);
             }
         }
@@ -5326,13 +5739,13 @@
         if (latest) Object.assign(activeHistoryAnchor, latest);
     }
 
-    async function waitForReadingAnchorTarget(anchor, adapterEpoch, timeoutMs = 1200) {
+    async function waitForReadingAnchorTarget(anchor, locatorEpoch, timeoutMs = 1200) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
             if (
                 anchor.chatIdentity !== currentChatIdentity ||
                 anchor.userScrollGeneration !== userScrollGeneration ||
-                adapterEpoch !== nativeAdapterEpoch
+                locatorEpoch !== nativeLocatorEpoch
             ) {
                 return null;
             }
@@ -5361,14 +5774,27 @@
         }
 
         let target = findReadingAnchorTarget(anchor);
-        if (!target && nativeAdapter && anchor.messageId) {
-            const adapter = nativeAdapter;
-            const adapterEpoch = nativeAdapterEpoch;
-            await adapter.locateMessage(anchor.messageId);
-            if (adapter !== nativeAdapter || adapterEpoch !== nativeAdapterEpoch) {
+        if (!target && nativeLocator && anchor.messageId) {
+            const locator = nativeLocator;
+            const locatorEpoch = nativeLocatorEpoch;
+            try {
+                const located = await locator.locateMessage(anchor.messageId, () =>
+                    anchor.chatIdentity === currentChatIdentity &&
+                    anchor.userScrollGeneration === userScrollGeneration &&
+                    locator === nativeLocator &&
+                    locatorEpoch === nativeLocatorEpoch
+                );
+                if (
+                    !located ||
+                    locator !== nativeLocator ||
+                    locatorEpoch !== nativeLocatorEpoch
+                ) {
+                    return false;
+                }
+                target = await waitForReadingAnchorTarget(anchor, locatorEpoch);
+            } catch (_error) {
                 return false;
             }
-            target = await waitForReadingAnchorTarget(anchor, adapterEpoch);
         }
         if (!target?.isConnected) return false;
 
@@ -6148,11 +6574,13 @@
      ******************************************************************/
 
     function init() {
-        ensureUI();
+        console.info('[Conversation Navigator] Started (0.4.5)');
         currentChatIdentity = getChatIdentity();
+        ensureUI();
         observeRouteChanges();
         observeNewConversationSubmissions();
         observeUserScrollIntent();
+        startNativeLocator(currentChatIdentity);
         startNativeAdapter(currentChatIdentity);
         renderTurns();
         observeChatChanges();
@@ -6184,6 +6612,7 @@
          */
         setInterval(() => {
             renderTurns();
+            retryNativeLocatorBinding();
             retryNativeAdapterBinding();
         }, 2500);
     }
