@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.6
+// @version      0.4.7
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -511,7 +511,7 @@
     const { createNativeAdapter, createNativeLocator, NativeAdapterError } = (() => {
         const NATIVE_MODULE_CONTRACT = Object.freeze({
             scope: Object.freeze({id: 'OW', export: 'a'}),
-            conversationState: Object.freeze({id: 'MrG', export: 'j'}),
+            conversationState: Object.freeze({id: 'Mr', export: 'j'}),
             pagination: Object.freeze({id: 'FG', export: 'c'}),
             loader: Object.freeze({id: 'jfi', export: 'b'}),
             reactDom: Object.freeze({id: 'v7', export: 'flushSync'}),
@@ -1008,7 +1008,7 @@
         function getConversationStateKey({scope, chatId, modules}) {
             let value;
             try {
-                /* Mirrors M3K: DF.x(MrG.j, conversationId); pagination has a separate fallback. */
+                /* Mirrors M3K: DF.x(Mr.j, conversationId); pagination has a separate fallback. */
                 value = scope.get(modules.conversationStateSelector, chatId);
             } catch (_error) {
                 fail('NATIVE_CONVERSATION_STATE_UNAVAILABLE', 'The active ChatGPT conversation state could not be read.');
@@ -7736,7 +7736,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.6)');
+        console.info('[Conversation Navigator] Started (0.4.7)');
         currentChatIdentity = getChatIdentity();
         ensureUI();
         observeRouteChanges();
