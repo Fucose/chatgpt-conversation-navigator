@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.7
+// @version      0.4.8
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -1654,83 +1654,173 @@
     }
 
     function computeReplyToolbarPosition({
-        viewportLeft,
-        viewportRight,
-        windowWidth = null,
+        windowWidth,
+        windowHeight,
+        viewportLeft = 0,
+        viewportRight = null,
         contentLeft,
         sidebarLeft = null,
         sidebarRight = null,
         sidebarVisible = false,
-        sidebarGap = 12,
-        viewportTop,
-        viewportBottom,
-        windowHeight = null,
-        headerInset = 0,
-        bottomInset = 0,
         toolbarWidth = 32,
-        toolbarHeight = 168,
+        toolbarHeight = 202,
+        sidebarGap = 12,
         minimumGutter = 48,
-        centerRatio = 0.7
+        viewportInset = 8
     }) {
+        const width = Number(windowWidth);
+        const height = Number(windowHeight);
         const leftEdge = Math.max(0, Number(viewportLeft));
-        const rightEdge = Number(viewportRight);
-        const physicalWindowWidth = windowWidth !== null &&
-            Number.isFinite(Number(windowWidth))
-            ? Number(windowWidth)
-            : rightEdge;
+        const rightEdge = viewportRight === null
+            ? width
+            : Number(viewportRight);
         const contentEdge = Number(contentLeft);
-        const usableTop = Number(viewportTop) + Number(headerInset);
-        const usableBottom = Number(viewportBottom) - Number(bottomInset);
-        const usableHeight = usableBottom - usableTop;
-        const hasWindowHeight = windowHeight !== null &&
-            Number.isFinite(Number(windowHeight));
-        const physicalWindowHeight = hasWindowHeight
-            ? Number(windowHeight)
-            : null;
-        const sidebarWidth = Number(sidebarRight) - Number(sidebarLeft);
-        const useSidebar = Boolean(
-            sidebarVisible && Number.isFinite(sidebarWidth) &&
-            sidebarWidth > 0 && Number(sidebarRight) > 0 &&
-            Number(sidebarLeft) < physicalWindowWidth
+        const sideLeft = Number(sidebarLeft);
+        const sideRight = Number(sidebarRight);
+        const controlWidth = Number(toolbarWidth);
+        const controlHeight = Number(toolbarHeight);
+        const gap = Number(sidebarGap);
+        const gutter = Number(minimumGutter);
+        const inset = Number(viewportInset);
+        const hasSidebar = Boolean(
+            sidebarVisible && Number.isFinite(sideLeft) &&
+            Number.isFinite(sideRight) && sideRight > sideLeft &&
+            sideRight > 0 && sideLeft < width
         );
-        const toolbarLeft = useSidebar
-            ? Number(sidebarRight) + Number(sidebarGap)
-            : leftEdge + Number(sidebarGap);
-        const contentGutter = contentEdge - toolbarLeft;
+        const left = hasSidebar ? sideRight + gap : leftEdge + gap;
         if (
-            ![leftEdge, rightEdge, contentEdge, usableTop, usableBottom]
+            ![width, height, leftEdge, rightEdge, contentEdge, left,
+                controlWidth, controlHeight, gap, gutter, inset]
                 .every(Number.isFinite) ||
-            rightEdge <= leftEdge ||
-            !Number.isFinite(toolbarLeft) ||
-            toolbarLeft + Number(toolbarWidth) > rightEdge ||
-            contentGutter < Math.max(Number(minimumGutter), Number(toolbarWidth) + 8) ||
-            (hasWindowHeight
-                ? physicalWindowHeight < Number(toolbarHeight)
-                : usableHeight < Number(toolbarHeight))
+            width <= 0 || height <= 0 || controlWidth <= 0 ||
+            controlHeight <= 0 || rightEdge <= leftEdge ||
+            gap < 0 || gutter < controlWidth + 8 || inset < 0 ||
+            left < inset || left + controlWidth > rightEdge - inset ||
+            contentEdge - left < gutter || height < controlHeight + inset * 2
         ) {
             return null;
         }
 
-        const top = hasWindowHeight
-            ? Math.max(
-                0,
-                Math.min(
-                    physicalWindowHeight - Number(toolbarHeight),
-                    (physicalWindowHeight - Number(toolbarHeight)) / 2
-                )
-            )
-            : Math.max(
-                usableTop,
-                Math.min(
-                    usableBottom - Number(toolbarHeight),
-                    usableTop + usableHeight * Number(centerRatio) -
-                        Number(toolbarHeight) / 2
-                )
-            );
+        const top = (height - controlHeight) / 2;
+        return {left, top};
+    }
+
+    function computeReplyOutlinePosition({
+        windowWidth,
+        windowHeight,
+        sidebarRight = null,
+        sidebarVisible = false,
+        toolbarLeft = null,
+        headerBottom,
+        preferredWidth = 300,
+        preferredHeight = 560,
+        viewportInset = 8,
+        sidebarGap = 8,
+        headerGap = 8
+    }) {
+        const width = Number(windowWidth);
+        const height = Number(windowHeight);
+        const sideRight = sidebarRight === null ? NaN : Number(sidebarRight);
+        const triggerLeft = toolbarLeft === null ? NaN : Number(toolbarLeft);
+        const bottom = Number(headerBottom);
+        const inset = Number(viewportInset);
+        const sideGap = Number(sidebarGap);
+        const topGap = Number(headerGap);
+        if (
+            ![width, height, bottom, inset, sideGap, topGap]
+                .every(Number.isFinite) ||
+            width <= 0 || height <= 0 || bottom < 0 || inset < 0 ||
+            sideGap < 0 || topGap < 0
+        ) {
+            return null;
+        }
+        const requestedLeft = sidebarVisible && Number.isFinite(sideRight)
+            ? sideRight + sideGap
+            : Number.isFinite(triggerLeft) ? triggerLeft : inset;
+        const left = Math.max(inset, Math.min(width - inset, requestedLeft));
+        const availableWidth = Math.max(0, width - inset - left);
+        const panelWidth = Math.max(0, Math.min(
+            Number(preferredWidth),
+            width - inset * 2,
+            availableWidth
+        ));
+        const requestedTop = bottom + topGap;
+        const top = Math.max(
+            inset,
+            Math.min(height - inset, requestedTop)
+        );
+        const availableHeight = height - requestedTop - inset;
+        const maxHeight = Math.max(
+            0,
+            Math.min(Number(preferredHeight), availableHeight)
+        );
         return {
-            left: toolbarLeft,
-            top
+            left,
+            top,
+            width: panelWidth,
+            maxHeight,
+            visible: panelWidth > 0 && maxHeight > 0 &&
+                requestedTop <= height - inset
         };
+    }
+
+    function computeReplyOutlineTooltipPosition({
+        windowWidth,
+        windowHeight,
+        anchorLeft,
+        anchorRight,
+        anchorBottom,
+        tooltipWidth,
+        tooltipHeight,
+        viewportInset = 8,
+        anchorGap = 8
+    }) {
+        const width = Number(windowWidth);
+        const height = Number(windowHeight);
+        const leftEdge = Number(anchorLeft);
+        const rightEdge = Number(anchorRight);
+        const bottom = Number(anchorBottom);
+        const pillWidth = Number(tooltipWidth);
+        const pillHeight = Number(tooltipHeight);
+        const inset = Number(viewportInset);
+        const gap = Number(anchorGap);
+        if (
+            ![width, height, leftEdge, rightEdge, bottom, pillWidth,
+                pillHeight, inset, gap].every(Number.isFinite) ||
+            width <= 0 || height <= 0 || rightEdge < leftEdge ||
+            pillWidth <= 0 || pillHeight <= 0 || inset < 0 || gap < 0
+        ) {
+            return null;
+        }
+        const clampedWidth = Math.min(pillWidth, width - inset * 2);
+        const clampedHeight = Math.min(pillHeight, height - inset * 2);
+        const centeredLeft = (leftEdge + rightEdge - clampedWidth) / 2;
+        const left = Math.max(
+            inset,
+            Math.min(width - clampedWidth - inset, centeredLeft)
+        );
+        const top = Math.max(
+            inset,
+            Math.min(height - clampedHeight - inset, bottom + gap)
+        );
+        return {left, top, width: clampedWidth, height: clampedHeight};
+    }
+
+    function bindReplyOutlineToggle(toggle, toolbar, visible = true) {
+        if (!toggle) return false;
+        if (!toolbar?.isConnected || typeof toolbar.insertBefore !== 'function') {
+            toggle.remove();
+            toggle.hidden = true;
+            return false;
+        }
+        if (
+            toggle.parentElement !== toolbar ||
+            toolbar.firstElementChild !== toggle
+        ) {
+            toolbar.insertBefore(toggle, toolbar.firstElementChild);
+        }
+        toggle.hidden = !visible;
+        return true;
     }
 
     const core = {
@@ -1748,6 +1838,9 @@
         computeBottomOverlayInset,
         clipReplyScrollViewportGeometry,
         computeReplyToolbarPosition,
+        computeReplyOutlinePosition,
+        computeReplyOutlineTooltipPosition,
+        bindReplyOutlineToggle,
         NativeAdapterError
     };
     if (typeof module === 'object' && module?.exports &&
@@ -1761,6 +1854,9 @@
     const PREVIEW_ID = 'yw-chatgpt-turn-preview';
     const STYLE_ID = 'yw-chatgpt-turn-nav-style';
     const REPLY_NAV_ID = 'yw-chatgpt-reply-navigation';
+    const REPLY_NAV_TOOLBAR_HEIGHT = 202;
+    const REPLY_NAV_TOOLBAR_GAP = 12;
+    const REPLY_NAV_VIEWPORT_INSET = 8;
     /*
      * Reply navigation icon path notices.
      * Lucide paths (ISC License):
@@ -1798,6 +1894,8 @@
      */
     const REPLY_NAV_ICONS = {
         outline: 'M3 5h.01M3 12h.01M3 19h.01M8 5h13M8 12h13M8 19h13',
+        'previous-reply': 'M12 19V5M5 12l7-7 7 7',
+        'next-reply': 'M12 5v14m7-7-7 7-7-7',
         first: 'm17 18-6-6 6-6M7 6v12',
         up: 'm18 15-6-6-6 6',
         down: 'm6 9 6 6 6-6',
@@ -1850,10 +1948,12 @@
     let replyNavigationUI = null;
     let replyNavigationContext = null;
     let replyOutlineOpen = false;
-    let replyNavigationListenersInstalled = false;
     let replyLayoutResizeObserver = null;
     let replyLayoutObservedNodes = new Set();
     let replyLayoutObservedSidebar = null;
+    let replyOutlineHeaderToolbar = null;
+    let replyOutlineHeaderLookupAttempted = false;
+    let assistantReplyNavigationCursor = null;
 
     let turns = [];
     let turnSignature = '';
@@ -2192,6 +2292,10 @@
                 pointer-events: auto;
             }
 
+            #${REPLY_NAV_ID} .yw-reply-toolbar[hidden] {
+                display: none !important;
+            }
+
             #${REPLY_NAV_ID} .yw-reply-nav-button {
                 appearance: none;
                 -webkit-appearance: none;
@@ -2212,11 +2316,18 @@
             }
 
             #${REPLY_NAV_ID} .yw-reply-nav-button:hover,
-            #${REPLY_NAV_ID} .yw-reply-nav-button:focus-visible,
             #${REPLY_NAV_ID} .yw-reply-nav-button[aria-expanded="true"] {
-                border-color: var(--color-border, rgba(127, 127, 127, 0.24));
+                border-color: transparent;
                 background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
                 color: var(--text-primary, var(--color-text-primary, #555));
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button:focus-visible {
+                border-color: transparent;
+                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                color: var(--text-primary, var(--color-text-primary, #555));
+                outline: 2px solid currentColor;
+                outline-offset: 2px;
             }
 
             #${REPLY_NAV_ID} .yw-reply-nav-button:disabled {
@@ -2246,12 +2357,101 @@
                 transform: rotate(90deg);
             }
 
+            #${REPLY_NAV_ID}-outline-toggle {
+                appearance: none;
+                -webkit-appearance: none;
+                pointer-events: auto;
+                display: grid !important;
+                flex: 0 0 36px;
+                place-items: center;
+                width: 36px;
+                min-width: 36px;
+                height: 36px;
+                min-height: 36px;
+                padding: 0;
+                box-sizing: border-box;
+                border: 0;
+                border-radius: 8px;
+                background: transparent;
+                color: var(--color-text-primary, #0D0D0D);
+                font: inherit;
+                cursor: pointer;
+            }
+
+            #${REPLY_NAV_ID}-outline-toggle[aria-expanded="true"] {
+                background: color-mix(in oklab, var(--color-text-primary, #0D0D0D) 3%, transparent);
+            }
+
+            #${REPLY_NAV_ID}-outline-toggle:hover {
+                background: var(--color-background-primary-ghost-hover, color-mix(in oklab, var(--color-text-primary, #0D0D0D) 5%, transparent));
+            }
+
+            #${REPLY_NAV_ID}-outline-toggle:active {
+                background: var(--color-background-primary-ghost-active, color-mix(in oklab, var(--color-text-primary, #0D0D0D) 12%, transparent));
+            }
+
+            #${REPLY_NAV_ID}-outline-toggle:focus-visible {
+                outline: 2px solid var(--color-ring-primary-ghost, #3B82F6);
+                outline-offset: -1px;
+            }
+
+            #${REPLY_NAV_ID}-outline-toggle[hidden] {
+                display: none !important;
+            }
+
+            .yw-reply-outline-icon {
+                display: block;
+                flex: 0 0 auto;
+                width: 20px;
+                height: 20px;
+                fill: none;
+                stroke: currentColor;
+                stroke-width: 1.8;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-tooltip {
+                position: fixed;
+                z-index: 2147483647;
+                width: max-content;
+                max-width: calc(100vw - 16px);
+                padding-block: var(--tooltip-padding-block, 5px);
+                padding-inline: var(--tooltip-padding-inline, 12px);
+                box-sizing: border-box;
+                border: 1px solid var(--tooltip-border-color, color-mix(in oklab, #FFFFFF 5%, transparent));
+                border-radius: var(--tooltip-border-radius, 16px);
+                background: var(--tooltip-background-color, #0D0D0D);
+                color: var(--tooltip-text-color, #FFFFFF);
+                font-size: var(--tooltip-font-size, 14px);
+                font-weight: var(--tooltip-font-weight, 600);
+                letter-spacing: var(--tooltip-letter-spacing, -0.15px);
+                line-height: var(--tooltip-line-height, 18px);
+                white-space: nowrap;
+                box-shadow: var(--tooltip-box-shadow, 0 8px 18px #0F172A33);
+                opacity: 0;
+                visibility: hidden;
+                transform: translateY(-2px);
+                transition: opacity 100ms ease, transform 100ms ease,
+                    visibility 100ms ease;
+                pointer-events: none;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-tooltip[data-visible="true"] {
+                opacity: 1;
+                visibility: visible;
+                transform: translateY(0);
+            }
+
             #${REPLY_NAV_ID} .yw-reply-outline {
                 position: fixed;
-                width: min(320px, calc(100vw - 56px));
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                width: min(300px, calc(100vw - 16px));
                 max-height: min(70vh, 560px);
-                overflow: auto;
-                padding: 12px;
+                min-height: 0;
+                padding: 0;
                 box-sizing: border-box;
                 border: 1px solid var(--color-border, rgba(127, 127, 127, 0.28));
                 border-radius: 12px;
@@ -2265,21 +2465,84 @@
                 display: none !important;
             }
 
-            #${REPLY_NAV_ID} .yw-reply-outline h2 {
-                margin: 0 0 8px;
-                color: inherit;
+            #${REPLY_NAV_ID} .yw-reply-outline-heading-row {
+                display: flex;
+                flex: 0 0 auto;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                min-width: 0;
+                padding: 10px 12px 8px;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-heading-row h2 {
+                min-width: 0;
+                margin: 0;
+                color: var(--color-text-secondary, #5D5D5D);
                 font-size: 14px;
-                font-weight: 600;
-                line-height: 1.4;
+                font-weight: 400;
+                line-height: 20px;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-nav {
+                display: flex;
+                flex: 0 0 auto;
+                align-items: center;
+                gap: 2px;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-button {
+                appearance: none;
+                -webkit-appearance: none;
+                display: grid;
+                flex: 0 0 28px;
+                place-items: center;
+                width: 28px;
+                height: 28px;
+                padding: 0;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                background: transparent;
+                color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
+                cursor: pointer;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-button:hover,
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-button:focus-visible {
+                border-color: transparent;
+                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                color: var(--text-primary, var(--color-text-primary, #555));
+                outline: none;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-button:disabled {
+                opacity: 0.4;
+                cursor: default;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-reply-button svg {
+                display: block;
+                width: 16px;
+                height: 16px;
+                fill: none;
+                stroke: currentColor;
+                stroke-width: 2;
+                stroke-linecap: round;
+                stroke-linejoin: round;
             }
 
             #${REPLY_NAV_ID} .yw-reply-outline-list {
                 display: flex;
+                flex: 1 1 auto;
                 flex-direction: column;
-                gap: 2px;
-                padding: 0;
+                gap: 1px;
+                min-height: 0;
+                overflow-y: auto;
+                overflow-x: hidden;
+                padding: 0 12px 12px;
                 margin: 0;
                 list-style: none;
+                scrollbar-width: thin;
             }
 
             #${REPLY_NAV_ID} .yw-reply-outline-item {
@@ -2291,15 +2554,16 @@
             #${REPLY_NAV_ID} .yw-reply-outline-target {
                 display: block;
                 width: 100%;
-                padding: 6px 8px;
+                padding: 4px 6px;
                 box-sizing: border-box;
                 border: 0;
                 border-radius: 6px;
                 background: transparent;
-                color: inherit;
+                color: var(--color-text-primary, #0D0D0D);
                 font: inherit;
-                font-size: 13px;
-                line-height: 1.4;
+                font-size: 14px;
+                font-weight: 400;
+                line-height: 20px;
                 text-align: left;
                 white-space: normal;
                 overflow-wrap: anywhere;
@@ -2313,7 +2577,7 @@
             }
 
             #${REPLY_NAV_ID} .yw-reply-outline-empty {
-                padding: 6px 8px;
+                padding: 3px 6px;
                 color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
                 font-size: 13px;
                 line-height: 1.4;
@@ -2601,7 +2865,10 @@
     }
 
     function ensureReplyNavigationUI() {
-        if (replyNavigationUI?.root?.isConnected) return;
+        if (replyNavigationUI?.root?.isConnected) {
+            updateReplyOutlineToggleLabel();
+            return;
+        }
 
         document.getElementById(REPLY_NAV_ID)?.remove();
         const root = document.createElement('div');
@@ -2614,11 +2881,12 @@
         toolbar.setAttribute('aria-label', '当前回复导航');
 
         const buttonSpecs = [
-            ['outline', '当前回复大纲'],
+            ['previous-reply', '上一个助手回复'],
             ['first', '回到当前回复顶部'],
             ['up', '上一个标题'],
             ['down', '下一个标题'],
-            ['last', '跳到当前回复底部']
+            ['last', '跳到当前回复底部'],
+            ['next-reply', '下一个助手回复']
         ];
         const buttons = new Map();
         for (const [action, label] of buttonSpecs) {
@@ -2628,28 +2896,55 @@
             button.dataset.action = action;
             button.setAttribute('aria-label', label);
             button.appendChild(createReplyNavigationIcon(REPLY_NAV_ICONS[action]));
-            if (action === 'outline') {
-                button.title = '当前回复大纲';
-                button.setAttribute('aria-expanded', 'false');
-                button.setAttribute('aria-controls', `${REPLY_NAV_ID}-outline`);
-                button.addEventListener('click', event => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    toggleReplyOutline();
-                });
-            } else {
-                button.addEventListener('click', event => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    if (action === 'first') jumpToCurrentReplyTop();
-                    else if (action === 'up') navigateReplyHeading('up');
-                    else if (action === 'down') navigateReplyHeading('down');
-                    else if (action === 'last') jumpToCurrentReplyBottom();
-                });
-            }
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (action === 'previous-reply') navigateAssistantReply('previous');
+                else if (action === 'first') jumpToCurrentReplyTop();
+                else if (action === 'up') navigateReplyHeading('up');
+                else if (action === 'down') navigateReplyHeading('down');
+                else if (action === 'last') jumpToCurrentReplyBottom();
+                else if (action === 'next-reply') navigateAssistantReply('next');
+            });
             buttons.set(action, button);
             toolbar.appendChild(button);
         }
+
+        const outlineToggle = document.createElement('button');
+        outlineToggle.type = 'button';
+        outlineToggle.id = `${REPLY_NAV_ID}-outline-toggle`;
+        outlineToggle.className = 'yw-reply-outline-toggle';
+        outlineToggle.hidden = true;
+        outlineToggle.setAttribute('aria-label', '当前回复大纲');
+        outlineToggle.setAttribute('aria-expanded', 'false');
+        outlineToggle.setAttribute('aria-controls', `${REPLY_NAV_ID}-outline`);
+        outlineToggle.setAttribute(
+            'aria-describedby',
+            `${REPLY_NAV_ID}-outline-tooltip`
+        );
+        const outlineIcon = createReplyNavigationIcon(REPLY_NAV_ICONS.outline);
+        outlineIcon.classList.add('yw-reply-outline-icon');
+        const outlineTooltip = document.createElement('span');
+        outlineTooltip.id = `${REPLY_NAV_ID}-outline-tooltip`;
+        outlineTooltip.className = 'yw-reply-outline-tooltip';
+        outlineTooltip.setAttribute('aria-hidden', 'true');
+        outlineTooltip.textContent = '当前回复大纲';
+        outlineTooltip.dataset.visible = 'false';
+        outlineTooltip.hidden = true;
+        outlineToggle.appendChild(outlineIcon);
+        outlineToggle.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleReplyOutline();
+        });
+        outlineToggle.addEventListener('pointerenter', () =>
+            showReplyOutlineTooltip()
+        );
+        outlineToggle.addEventListener('pointerleave', hideReplyOutlineTooltip);
+        outlineToggle.addEventListener('focus', () =>
+            showReplyOutlineTooltip()
+        );
+        outlineToggle.addEventListener('blur', hideReplyOutlineTooltip);
 
         const outline = document.createElement('section');
         outline.id = `${REPLY_NAV_ID}-outline`;
@@ -2658,42 +2953,330 @@
         outline.setAttribute('role', 'region');
         outline.setAttribute('aria-labelledby', `${REPLY_NAV_ID}-title`);
 
+        const headingRow = document.createElement('div');
+        headingRow.className = 'yw-reply-outline-heading-row';
         const heading = document.createElement('h2');
         heading.id = `${REPLY_NAV_ID}-title`;
         heading.textContent = '当前回复大纲';
-        outline.appendChild(heading);
+        const replyNavigation = document.createElement('div');
+        replyNavigation.className = 'yw-reply-outline-reply-nav';
+        replyNavigation.setAttribute('role', 'group');
+        replyNavigation.setAttribute('aria-label', '助手回复导航');
+        const replyButtons = new Map();
+        for (const [direction, action, label] of [
+            ['previous', 'previous-reply', '上一个助手回复'],
+            ['next', 'next-reply', '下一个助手回复']
+        ]) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'yw-reply-outline-reply-button';
+            button.dataset.direction = direction;
+            button.setAttribute('aria-label', label);
+            button.appendChild(createReplyNavigationIcon(REPLY_NAV_ICONS[action]));
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                navigateAssistantReply(direction);
+            });
+            replyButtons.set(direction, button);
+            replyNavigation.appendChild(button);
+        }
+        headingRow.append(heading, replyNavigation);
+        outline.appendChild(headingRow);
 
         const list = document.createElement('ol');
         list.className = 'yw-reply-outline-list';
         outline.appendChild(list);
 
-        root.append(toolbar, outline);
+        root.append(toolbar, outline, outlineTooltip);
         document.body.appendChild(root);
-        replyNavigationUI = {root, toolbar, outline, heading, list, buttons};
+        replyNavigationUI = {
+            root,
+            toolbar,
+            outline,
+            outlineToggle,
+            outlineTooltip,
+            heading,
+            replyButtons,
+            list,
+            buttons
+        };
+        updateReplyOutlineToggleLabel();
+        syncReplyOutlineToggleBinding(true);
+    }
 
-        if (!replyNavigationListenersInstalled) {
-            document.addEventListener('click', event => {
-                if (!replyOutlineOpen) return;
-                const target = asElement(event.target);
-                if (target && replyNavigationUI?.root?.contains(target)) return;
-                closeReplyOutline();
-            }, true);
+    function getReplySidebarElement() {
+        return document.querySelector('aside.app-shell-left-panel');
+    }
 
-            document.addEventListener('keydown', event => {
-                if (!replyOutlineOpen || event.key !== 'Escape') return;
-                const target = asElement(event.target);
-                const focusInside = Boolean(
-                    target?.closest(`#${REPLY_NAV_ID}`) ||
-                    replyNavigationUI?.root?.contains(document.activeElement)
-                );
-                closeReplyOutline(focusInside);
-                if (focusInside) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                }
-            }, true);
-            replyNavigationListenersInstalled = true;
+    function getReplySidebarGeometry(element = getReplySidebarElement()) {
+        if (
+            !element?.isConnected || element.hidden ||
+            element.getAttribute('aria-hidden') === 'true'
+        ) {
+            return null;
         }
+        const style = window.getComputedStyle(element);
+        if (
+            style.display === 'none' || style.visibility === 'hidden' ||
+            Number(style.opacity) === 0
+        ) {
+            return null;
+        }
+        const rect = element.getBoundingClientRect();
+        if (
+            rect.width <= 0 || rect.height <= 0 ||
+            rect.right <= 0 || rect.left >= window.innerWidth
+        ) {
+            return null;
+        }
+        return {left: rect.left, right: rect.right};
+    }
+
+    function findReplyOutlineHeaderToolbar() {
+        const headers = Array.from(
+            document.querySelectorAll('header, [role="banner"]')
+        );
+        const isInteractive = element =>
+            /^(BUTTON|A|INPUT|SELECT|TEXTAREA|SUMMARY)$/i.test(element.tagName || '') ||
+            /^(button|link|menuitem|menuitemcheckbox|menuitemradio|checkbox|radio|switch|tab|option|combobox|textbox|slider|spinbutton)$/i
+                .test(element.getAttribute?.('role') || '');
+        const isVisible = (element, boundary = null, rejectInteractive = false) => {
+            if (!element?.isConnected) return false;
+            let reachedBoundary = false;
+            for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+                if (
+                    ancestor.hidden || ancestor.inert ||
+                    ancestor.hasAttribute?.('inert') ||
+                    ancestor.getAttribute?.('aria-hidden') === 'true' ||
+                    (rejectInteractive && isInteractive(ancestor))
+                ) {
+                    return false;
+                }
+                const style = window.getComputedStyle(ancestor);
+                if (
+                    style.display === 'none' || style.visibility === 'hidden' ||
+                    Number(style.opacity) === 0
+                ) {
+                    return false;
+                }
+                if (ancestor === boundary) {
+                    reachedBoundary = true;
+                    break;
+                }
+            }
+            return boundary ? reachedBoundary : true;
+        };
+        const visibleHeaders = headers.filter(header => {
+            if (!isVisible(header)) return false;
+            for (let ancestor = header; ancestor; ancestor = ancestor.parentElement) {
+                const tagName = String(ancestor.tagName || '').toUpperCase();
+                const role = ancestor.getAttribute?.('role');
+                const marker = [
+                    ancestor.id,
+                    typeof ancestor.className === 'string'
+                        ? ancestor.className
+                        : ancestor.className?.baseVal,
+                    ancestor.getAttribute?.('data-testid'),
+                    ancestor.getAttribute?.('aria-label')
+                ].filter(Boolean).join(' ');
+                if (
+                    tagName === 'ASIDE' || tagName === 'DIALOG' ||
+                    role === 'complementary' || role === 'dialog' ||
+                    ancestor.getAttribute?.('aria-modal') === 'true' ||
+                    /sidebar|quick[-_ ]?chat/i.test(marker)
+                ) {
+                    return false;
+                }
+            }
+            const rect = header.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.top <= 160 &&
+                rect.bottom >= 0 && rect.height <= 240;
+        });
+        const isToolbarContainer = (element, header, headerRect) => {
+            if (!element || element === header) return false;
+            const role = element.getAttribute?.('role');
+            if (
+                (element.tagName !== 'DIV' && role !== 'toolbar') ||
+                isInteractive(element) || !isVisible(element, header, true)
+            ) {
+                return false;
+            }
+            const style = window.getComputedStyle(element);
+            if (!['flex', 'inline-flex'].includes(style.display) && role !== 'toolbar') {
+                return false;
+            }
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.height <= 140 &&
+                rect.right > 0 && rect.left < window.innerWidth &&
+                rect.top >= headerRect.top - 12 &&
+                rect.top <= headerRect.bottom + 12 &&
+                rect.bottom <= headerRect.bottom + 36;
+        };
+        const classNameOf = element => typeof element?.className === 'string'
+            ? element.className
+            : element?.className?.baseVal || '';
+        const isNamedToolbar = element =>
+            /(?:^|\s)Toolbar-[^\s]+/.test(classNameOf(element)) ||
+            element?.getAttribute?.('role') === 'toolbar';
+        const namedToolbarCandidates = root => [
+            ...Array.from(root.querySelectorAll('[class*="Toolbar-"]')),
+            ...Array.from(root.querySelectorAll('[role="toolbar"]'))
+        ];
+        const rankCandidates = (candidates, header, headerRect) => {
+            const valid = [...new Set(candidates)].filter(element =>
+                isToolbarContainer(element, header, headerRect)
+            );
+            valid.sort((left, right) => {
+                const leftRect = left.getBoundingClientRect();
+                const rightRect = right.getBoundingClientRect();
+                const score = (element, rect) =>
+                    (isNamedToolbar(element) ? 1000 : 0) +
+                    (element.querySelector?.('button, [role="button"]') ? 100 : 0) -
+                    Math.abs(rect.top - headerRect.top) - rect.height;
+                return score(right, rightRect) - score(left, leftRect);
+            });
+            return valid;
+        };
+
+        let fallbackMainTitlebar = null;
+        for (const header of visibleHeaders) {
+            const rect = header.getBoundingClientRect();
+            const titlebar = header.querySelector(
+                '[data-app-shell-main-titlebar="true"]'
+            );
+            if (!isToolbarContainer(titlebar, header, rect)) continue;
+            const projectRows = rankCandidates(
+                namedToolbarCandidates(titlebar), header, rect
+            );
+            if (projectRows.length) return projectRows[0];
+            fallbackMainTitlebar ||= titlebar;
+        }
+        if (fallbackMainTitlebar) return fallbackMainTitlebar;
+
+        for (const header of visibleHeaders) {
+            const rect = header.getBoundingClientRect();
+            const named = rankCandidates(
+                namedToolbarCandidates(header), header, rect
+            );
+            if (named.length) return named[0];
+            const flex = rankCandidates(
+                Array.from(header.querySelectorAll('div.flex, div[class*="flex"]')),
+                header,
+                rect
+            );
+            if (flex.length) return flex[0];
+        }
+        return null;
+    }
+
+    function syncReplyOutlineToggleBinding(rescan = false) {
+        const ui = replyNavigationUI;
+        if (!ui?.outlineToggle) return;
+        const toggle = ui.outlineToggle;
+        const shouldScan = rescan ||
+            (!replyOutlineHeaderLookupAttempted && !replyOutlineHeaderToolbar);
+        const previousToolbar = replyOutlineHeaderToolbar;
+        const toolbar = shouldScan
+            ? findReplyOutlineHeaderToolbar()
+            : previousToolbar?.isConnected ? previousToolbar : null;
+        if (shouldScan) replyOutlineHeaderLookupAttempted = true;
+        replyOutlineHeaderToolbar = toolbar;
+        if (!toolbar) {
+            hideReplyOutlineTooltip();
+            bindReplyOutlineToggle(toggle, null, false);
+            return;
+        }
+
+        if (toolbar !== previousToolbar) hideReplyOutlineTooltip();
+        const hasReply = Boolean(
+            replyNavigationContext?.reply?.isConnected && !ui.root.hidden
+        );
+        const keepOpenWithoutReply = Boolean(
+            replyOutlineOpen && !ui.root.hidden
+        );
+        bindReplyOutlineToggle(
+            toggle,
+            toolbar,
+            hasReply || keepOpenWithoutReply
+        );
+        if (toggle.hidden || !toggle.isConnected) hideReplyOutlineTooltip();
+        const expanded = String(Boolean(
+            replyOutlineOpen && !ui.root.hidden && !ui.outline.hidden
+        ));
+        if (toggle.getAttribute('aria-expanded') !== expanded) {
+            toggle.setAttribute('aria-expanded', expanded);
+        }
+    }
+
+    function isReplyOutlineToggleMutation(mutation) {
+        const toggle = replyNavigationUI?.outlineToggle;
+        if (!toggle) return false;
+        if (toggle === mutation.target || toggle.contains(mutation.target)) {
+            return true;
+        }
+        if (mutation.type !== 'childList') return false;
+        const changedNodes = [
+            ...Array.from(mutation.addedNodes),
+            ...Array.from(mutation.removedNodes)
+        ];
+        return changedNodes.length > 0 && changedNodes.every(node =>
+            node === toggle || toggle.contains(node)
+        );
+    }
+
+    function isReplyOutlineHeaderMutation(mutation) {
+        const target = asElement(mutation.target);
+        if (target?.closest('header, [role="banner"]')) return true;
+        const toolbar = replyOutlineHeaderToolbar;
+        if (target && toolbar &&
+            (target === toolbar || target.contains?.(toolbar) ||
+                toolbar.contains?.(target))) {
+            return true;
+        }
+        if (mutation.type !== 'childList') return false;
+        const changedNodes = [
+            ...Array.from(mutation.addedNodes),
+            ...Array.from(mutation.removedNodes)
+        ];
+        return changedNodes.some(node => {
+            if (!(node instanceof Element)) return false;
+            return node.matches('header, [role="banner"]') ||
+                Boolean(node.querySelector('header, [role="banner"]')) ||
+                (toolbar && (node === toolbar || node.contains(toolbar)));
+        });
+    }
+
+    function replyOutlineHeaderMayHaveChanged(mutations) {
+        if (replyOutlineHeaderToolbar && !replyOutlineHeaderToolbar.isConnected) {
+            return true;
+        }
+        return mutations.some(isReplyOutlineHeaderMutation);
+    }
+
+    function isReplySidebarMutation(mutation) {
+        const target = asElement(mutation.target);
+        if (target?.closest('aside.app-shell-left-panel')) return true;
+        if (mutation.type !== 'childList') return false;
+        return [
+            ...Array.from(mutation.addedNodes),
+            ...Array.from(mutation.removedNodes)
+        ].some(node => node instanceof Element && (
+            node.matches('aside.app-shell-left-panel') ||
+            Boolean(node.querySelector('aside.app-shell-left-panel'))
+        ));
+    }
+
+    function isOwnNavigationMutation(mutation) {
+        const target = mutation.target;
+        return Boolean(
+            rail?.contains(target) ||
+            preview?.contains(target) ||
+            replyTopButton === target ||
+            replyTopButton?.contains(target) ||
+            isReplyOutlineToggleMutation(mutation) ||
+            replyNavigationUI?.root?.contains(target)
+        );
     }
 
     function ensureUI() {
@@ -5561,6 +6144,7 @@
                     }
                 }
                 userScrollGeneration += 1;
+                assistantReplyNavigationCursor = null;
                 renewAnchorCapture();
                 cancelJumpSearch();
                 clearExtendedScrollRange();
@@ -5739,34 +6323,6 @@
             top: scrollContext.viewportTop,
             bottom: scrollContext.viewportTop + container.clientHeight
         }, window.innerWidth, window.innerHeight);
-    }
-
-    function getReplySidebarElement() {
-        return document.querySelector('aside.app-shell-left-panel');
-    }
-
-    function getReplySidebarGeometry(element = getReplySidebarElement()) {
-        if (
-            !element?.isConnected || element.hidden ||
-            element.getAttribute('aria-hidden') === 'true'
-        ) {
-            return null;
-        }
-        const style = window.getComputedStyle(element);
-        if (
-            style.display === 'none' || style.visibility === 'hidden' ||
-            Number(style.opacity) === 0
-        ) {
-            return null;
-        }
-        const rect = element.getBoundingClientRect();
-        if (
-            rect.width <= 0 || rect.height <= 0 ||
-            rect.right <= 0 || rect.left >= window.innerWidth
-        ) {
-            return null;
-        }
-        return {left: rect.left, right: rect.right};
     }
 
     function isReplyLayoutElementVisible(element) {
@@ -6555,25 +7111,6 @@
         });
     }
 
-    function handleReplySidebarTransitionEnd(event) {
-        const sidebar = replyLayoutObservedSidebar;
-        if (!sidebar) return;
-        if (!replyNavigationUI?.root?.isConnected) {
-            disconnectReplyNavigationLayoutObservers();
-            return;
-        }
-        const target = asElement(event.target);
-        if (!target || (target !== sidebar && !sidebar.contains(target))) return;
-        if (![
-            'width', 'inline-size', 'transform', 'left', 'right',
-            'margin-left', 'margin-right', 'flex-basis',
-            'grid-template-columns'
-        ].includes(event.propertyName)) {
-            return;
-        }
-        scheduleReplyNavigationUpdate();
-    }
-
     function disconnectReplyNavigationLayoutObservers() {
         if (replyLayoutResizeObserver) {
             replyLayoutResizeObserver.disconnect();
@@ -6585,6 +7122,16 @@
             handleReplySidebarTransitionEnd
         );
         replyLayoutObservedSidebar = null;
+    }
+
+    function handleReplySidebarTransitionEnd(event) {
+        if (
+            event.target === replyLayoutObservedSidebar &&
+            (!event.propertyName ||
+                /width|transform|margin|flex-basis/.test(event.propertyName))
+        ) {
+            scheduleReplyNavigationUpdate();
+        }
     }
 
     function syncReplyNavigationLayoutObservers(context) {
@@ -6615,9 +7162,18 @@
             });
         }
 
-        const main = context.reply.closest('main, [role="main"]');
+        const header = replyOutlineHeaderToolbar?.closest(
+            'header, [role="banner"]'
+        );
+        const main = context?.reply?.closest('main, [role="main"]');
         const nextNodes = new Set(
-            [sidebar, main, context.scrollContext.container].filter(node =>
+            [
+                sidebar,
+                replyOutlineHeaderToolbar,
+                header,
+                main,
+                context?.scrollContext?.container
+            ].filter(node =>
                 node instanceof Element && node.isConnected
             )
         );
@@ -6655,11 +7211,9 @@
 
         if (!count) return;
 
-        const listMaxHeight = Math.max(
-            180,
-            Math.floor(window.innerHeight * 0.72)
-        );
-        const available = Math.max(164, listMaxHeight - 16);
+        const height = Math.max(0, window.innerHeight);
+        const listMaxHeight = Math.max(0, Math.floor(height * 0.72));
+        const available = Math.max(0, listMaxHeight - 16);
 
         let barHeight = 4;
         let gap = 8;
@@ -7030,6 +7584,7 @@
     function renderReplyOutline(context, entries) {
         const ui = replyNavigationUI;
         if (!ui) return;
+        updateReplyOutlineToggleLabel();
         const sameOwner =
             ui.outlineChatIdentity === context.chatIdentity &&
             ui.outlineIdentity === context.identity &&
@@ -7057,13 +7612,14 @@
             return;
         }
 
-        for (const entry of entries) {
+        for (const [index, entry] of entries.entries()) {
             const item = document.createElement('li');
             item.className = 'yw-reply-outline-item';
             const button = document.createElement('button');
             button.type = 'button';
             button.className = 'yw-reply-outline-target';
-            button.style.paddingInlineStart = `${8 + (entry.level - 1) * 12}px`;
+            const displayLevel = index === 0 ? 1 : entry.level;
+            button.style.paddingInlineStart = `${6 + (displayLevel - 1) * 8}px`;
             button.textContent = entry.text;
             button.addEventListener('click', event => {
                 event.preventDefault();
@@ -7077,38 +7633,105 @@
 
     function positionReplyOutline() {
         const ui = replyNavigationUI;
-        if (!ui || ui.outline.hidden) return;
-        const anchor = ui.buttons.get('outline').getBoundingClientRect();
-        const panel = ui.outline.getBoundingClientRect();
-        const width = panel.width || ui.outline.offsetWidth;
-        const height = panel.height || ui.outline.offsetHeight;
-        const left = Math.max(
-            8,
-            Math.min(anchor.right + 8, window.innerWidth - width - 8)
+        if (!ui || !replyOutlineOpen || ui.root.hidden) return;
+        const sidebar = getReplySidebarGeometry();
+        const header = replyOutlineHeaderToolbar?.closest(
+            'header, [role="banner"]'
         );
-        const top = Math.max(
-            8,
-            Math.min(anchor.top, window.innerHeight - height - 8)
-        );
-        ui.outline.style.left = `${left}px`;
-        ui.outline.style.top = `${top}px`;
+        const headerRect = header?.getBoundingClientRect();
+        const toolbarRect = replyOutlineHeaderToolbar?.getBoundingClientRect();
+        const toggleRect = ui.outlineToggle.getBoundingClientRect();
+        const headerBottom = headerRect?.height > 0
+            ? headerRect.bottom
+            : toolbarRect?.bottom;
+        if (!Number.isFinite(Number(headerBottom))) return;
+        const position = computeReplyOutlinePosition({
+            windowWidth: window.innerWidth,
+            windowHeight: window.innerHeight,
+            sidebarRight: sidebar?.right,
+            sidebarVisible: Boolean(sidebar),
+            toolbarLeft: Number.isFinite(toggleRect?.left)
+                ? toggleRect.left
+                : REPLY_NAV_VIEWPORT_INSET,
+            headerBottom
+        });
+        if (!position) return;
+        ui.outline.style.left = `${position.left}px`;
+        ui.outline.style.top = `${position.top}px`;
+        ui.outline.style.width = `${position.width}px`;
+        ui.outline.style.maxHeight = `${position.maxHeight}px`;
+        ui.outline.hidden = !position.visible;
+        const expanded = String(Boolean(
+            position.visible && replyOutlineOpen && !ui.outline.hidden
+        ));
+        if (ui.outlineToggle.getAttribute('aria-expanded') !== expanded) {
+            ui.outlineToggle.setAttribute('aria-expanded', expanded);
+        }
     }
 
-    function setReplyOutlineOpen(open, restoreFocus = false) {
+    function showReplyOutlineTooltip() {
+        const ui = replyNavigationUI;
+        if (ui) updateReplyOutlineToggleLabel();
+        const toggle = ui?.outlineToggle;
+        const tooltip = ui?.outlineTooltip;
+        if (!toggle?.isConnected || toggle.hidden || !tooltip || ui.root.hidden) {
+            hideReplyOutlineTooltip();
+            return;
+        }
+        const anchor = toggle.getBoundingClientRect();
+        if (!anchor.width || !anchor.height) {
+            hideReplyOutlineTooltip();
+            return;
+        }
+        tooltip.hidden = false;
+        tooltip.dataset.visible = 'false';
+        const rect = tooltip.getBoundingClientRect();
+        const position = computeReplyOutlineTooltipPosition({
+            windowWidth: window.innerWidth,
+            windowHeight: window.innerHeight,
+            anchorLeft: anchor.left,
+            anchorRight: anchor.right,
+            anchorBottom: anchor.bottom,
+            tooltipWidth: rect.width,
+            tooltipHeight: rect.height
+        });
+        if (!position) {
+            hideReplyOutlineTooltip();
+            return;
+        }
+        tooltip.style.left = `${position.left}px`;
+        tooltip.style.top = `${position.top}px`;
+        tooltip.dataset.visible = 'true';
+    }
+
+    function hideReplyOutlineTooltip() {
+        const tooltip = replyNavigationUI?.outlineTooltip;
+        if (!tooltip) return;
+        tooltip.dataset.visible = 'false';
+        tooltip.hidden = true;
+        tooltip.style.removeProperty('left');
+        tooltip.style.removeProperty('top');
+    }
+
+    function setReplyOutlineOpen(open) {
         const ui = replyNavigationUI;
         if (!ui) return;
-        replyOutlineOpen = Boolean(open && replyNavigationContext && !ui.root.hidden);
-        ui.outline.hidden = !replyOutlineOpen;
-        ui.buttons.get('outline').setAttribute(
-            'aria-expanded',
-            String(replyOutlineOpen)
+        const canOpen = Boolean(
+            open && replyNavigationContext?.reply?.isConnected &&
+            !ui.root.hidden
         );
+        replyOutlineOpen = canOpen;
+        updateReplyOutlineToggleLabel();
+        ui.outline.hidden = !replyOutlineOpen;
+        if (!replyNavigationContext && !replyOutlineOpen) {
+            ui.root.hidden = true;
+        }
         if (replyOutlineOpen) positionReplyOutline();
-        else if (restoreFocus) ui.buttons.get('outline').focus();
-    }
-
-    function closeReplyOutline(restoreFocus = false) {
-        setReplyOutlineOpen(false, restoreFocus);
+        ui.outlineToggle.setAttribute(
+            'aria-expanded',
+            String(Boolean(replyOutlineOpen && !ui.root.hidden && !ui.outline.hidden))
+        );
+        syncReplyOutlineToggleBinding();
     }
 
     function toggleReplyOutline() {
@@ -7117,26 +7740,57 @@
         setReplyOutlineOpen(!replyOutlineOpen);
     }
 
-    function clearReplyNavigation() {
+    function updateReplyOutlineToggleLabel() {
+        const ui = replyNavigationUI;
+        if (!ui?.outlineToggle || !ui.outlineTooltip) return;
+        const label = replyOutlineOpen ? '收起大纲' : '展开大纲';
+        if (ui.outlineToggle.getAttribute('aria-label') !== label) {
+            ui.outlineToggle.setAttribute('aria-label', label);
+        }
+        if (ui.outlineTooltip.textContent !== label) {
+            ui.outlineTooltip.textContent = label;
+        }
+    }
+
+    function clearReplyNavigation({preserveOutlineOpen = false} = {}) {
         if (replyNavigationRAF !== null) {
             cancelAnimationFrame(replyNavigationRAF);
             replyNavigationRAF = null;
         }
-        disconnectReplyNavigationLayoutObservers();
+        if (!preserveOutlineOpen) assistantReplyNavigationCursor = null;
+        hideReplyOutlineTooltip();
         replyNavigationContext = null;
-        replyOutlineOpen = false;
+        if (!preserveOutlineOpen) replyOutlineOpen = false;
+        updateReplyOutlineToggleLabel();
+        const keepOutlineVisible = Boolean(
+            preserveOutlineOpen && replyOutlineOpen
+        );
+        if (keepOutlineVisible) syncReplyNavigationLayoutObservers(null);
+        else disconnectReplyNavigationLayoutObservers();
         if (replyNavigationUI) {
-            replyNavigationUI.root.hidden = true;
-            replyNavigationUI.outline.hidden = true;
-            replyNavigationUI.buttons.get('outline')?.setAttribute(
+            replyNavigationUI.root.hidden = !keepOutlineVisible;
+            replyNavigationUI.outline.hidden = !keepOutlineVisible;
+            replyNavigationUI.toolbar.hidden = true;
+            replyNavigationUI.outlineToggle.setAttribute(
                 'aria-expanded',
-                'false'
+                String(keepOutlineVisible)
             );
             replyNavigationUI.toolbar.style.removeProperty('left');
             replyNavigationUI.toolbar.style.removeProperty('top');
-            replyNavigationUI.outline.style.removeProperty('left');
-            replyNavigationUI.outline.style.removeProperty('top');
+            if (!keepOutlineVisible) {
+                replyNavigationUI.outline.style.removeProperty('left');
+                replyNavigationUI.outline.style.removeProperty('top');
+                replyNavigationUI.outline.style.removeProperty('width');
+                replyNavigationUI.outline.style.removeProperty('max-height');
+            }
             replyNavigationUI.list.replaceChildren();
+            if (keepOutlineVisible) {
+                const status = document.createElement('li');
+                status.className = 'yw-reply-outline-empty';
+                status.setAttribute('role', 'status');
+                status.textContent = '正在定位当前回复…';
+                replyNavigationUI.list.appendChild(status);
+            }
             replyNavigationUI.outlineEntries = [];
             replyNavigationUI.outlineChatIdentity = null;
             replyNavigationUI.outlineIdentity = null;
@@ -7147,6 +7801,52 @@
             delete replyTopButton.dataset.identity;
             delete replyTopButton.dataset.messageId;
         }
+        syncReplyOutlineToggleBinding();
+        if (replyOutlineOpen && replyNavigationUI) positionReplyOutline();
+    }
+
+    function getAssistantReplyNavigationEntries() {
+        return turns.filter(entry => {
+            if (entry.kind === 'assistant') return true;
+            if (entry.kind !== 'user') return false;
+            if (String(entry.assistantText || '').trim()) return true;
+            if (entry.assistantMessageIds?.length) return true;
+            return Boolean(getAssistantReplyTarget(findMountedTurn(entry.identity)));
+        });
+    }
+
+    function getAssistantReplyNavigationBoundary(context) {
+        const entries = getAssistantReplyNavigationEntries();
+        const pending = assistantReplyNavigationCursor;
+        const pendingIsCurrent = Boolean(
+            pending?.chatIdentity === currentChatIdentity &&
+            pending.userScrollGeneration === userScrollGeneration &&
+            pending.search === activeJumpSearch &&
+            pending.search?.assistantReplyNavigation === true &&
+            pending.search.settled !== true &&
+            pending.search.cancelled !== true &&
+            entries.some(entry => entry.identity === pending.identity)
+        );
+        const identity = pendingIsCurrent
+            ? pending.identity
+            : context?.identity || '';
+        const index = entries.findIndex(entry => entry.identity === identity);
+        return {
+            entries,
+            index,
+            previous: index > 0,
+            next: index >= 0 && index < entries.length - 1
+        };
+    }
+
+    function updateAssistantReplyNavigationButtons(context) {
+        const ui = replyNavigationUI;
+        if (!ui) return;
+        const boundary = getAssistantReplyNavigationBoundary(context);
+        ui.buttons.get('previous-reply').disabled = !boundary.previous;
+        ui.buttons.get('next-reply').disabled = !boundary.next;
+        ui.replyButtons.get('previous').disabled = !boundary.previous;
+        ui.replyButtons.get('next').disabled = !boundary.next;
     }
 
     function updateReplyNavigationControls(context, headings) {
@@ -7160,38 +7860,32 @@
         ui.buttons.get('down').disabled = !down;
         ui.buttons.get('last').disabled = !context.reply?.isConnected;
 
-        const viewport = context.viewport;
-        const sidebarElement = getReplySidebarElement();
-        const sidebar = getReplySidebarGeometry(sidebarElement);
         syncReplyNavigationLayoutObservers(context);
+        ui.root.hidden = false;
+        syncReplyOutlineToggleBinding();
+        updateAssistantReplyNavigationButtons(context);
+
+        const sidebar = getReplySidebarGeometry();
         const position = computeReplyToolbarPosition({
-            viewportLeft: viewport.left,
-            viewportRight: viewport.right,
             windowWidth: window.innerWidth,
+            windowHeight: window.innerHeight,
+            viewportLeft: 0,
+            viewportRight: window.innerWidth,
             contentLeft: context.rect.left,
             sidebarLeft: sidebar?.left,
             sidebarRight: sidebar?.right,
             sidebarVisible: Boolean(sidebar),
-            viewportTop: viewport.top,
-            viewportBottom: viewport.bottom,
-            windowHeight: window.innerHeight,
-            headerInset: context.headerInset,
-            bottomInset: context.bottomInset,
-            toolbarWidth: 32,
-            toolbarHeight: 168,
-            minimumGutter: 48,
-            centerRatio: 0.7
+            toolbarHeight: REPLY_NAV_TOOLBAR_HEIGHT,
+            sidebarGap: REPLY_NAV_TOOLBAR_GAP,
+            viewportInset: REPLY_NAV_VIEWPORT_INSET
         });
-
-        if (!position) {
-            closeReplyOutline();
-            ui.root.hidden = true;
-            return;
+        ui.toolbar.hidden = !position;
+        if (position) {
+            ui.toolbar.style.left = `${position.left}px`;
+            ui.toolbar.style.top = `${position.top}px`;
         }
 
-        ui.root.hidden = false;
-        ui.toolbar.style.left = `${position.left}px`;
-        ui.toolbar.style.top = `${position.top}px`;
+        ui.outline.hidden = !replyOutlineOpen;
         if (replyOutlineOpen) positionReplyOutline();
     }
 
@@ -7272,6 +7966,35 @@
         if (heading) scrollToReplyHeading(context, heading);
     }
 
+    function navigateAssistantReply(direction) {
+        const context = getCurrentReplyContext();
+        const boundary = getAssistantReplyNavigationBoundary(context);
+        const index = boundary.index;
+        if (index < 0) return;
+        const nextIndex = index + (direction === 'previous' ? -1 : 1);
+        const target = boundary.entries[nextIndex];
+        if (!target) return;
+
+        jumpToIdentity(target.identity, '', {replyTop: true});
+        const search = activeJumpSearch;
+        if (
+            !search || search.identity !== target.identity ||
+            search.userScrollGeneration !== userScrollGeneration ||
+            search.options?.replyTop !== true
+        ) {
+            assistantReplyNavigationCursor = null;
+            return;
+        }
+        search.assistantReplyNavigation = true;
+        assistantReplyNavigationCursor = {
+            chatIdentity: currentChatIdentity,
+            userScrollGeneration,
+            identity: target.identity,
+            search
+        };
+        if (context) replyNavigationContext = context;
+    }
+
     function jumpToCurrentReplyBottom() {
         const context = getCurrentReplyContext();
         if (!isCurrentReplyNavigationContext(context)) return;
@@ -7283,13 +8006,16 @@
         if (!replyTopButton) return;
         const context = getCurrentReplyContext();
         if (!context) {
-            clearReplyNavigation();
+            clearReplyNavigation({preserveOutlineOpen: true});
             return;
         }
 
         replyNavigationContext = context;
         const headings = getReplyHeadingEntries(context);
         updateReplyNavigationControls(context, headings);
+        if (replyNavigationUI?.outlineTooltip?.dataset.visible === 'true') {
+            showReplyOutlineTooltip();
+        }
 
         if (
             context.rect.top >= context.visibleTop ||
@@ -7450,12 +8176,6 @@
         return Boolean(node.querySelector(TURN_NODE_SELECTOR));
     }
 
-    function nodeContainsReplySidebar(node) {
-        if (!(node instanceof Element)) return false;
-        return node.matches('aside.app-shell-left-panel') ||
-            Boolean(node.querySelector('aside.app-shell-left-panel'));
-    }
-
     function isKnownCurrentChatTurn(turn) {
         if (!turn) return false;
 
@@ -7606,6 +8326,22 @@
             const previousChatIdentity = currentChatIdentity;
             handleRouteChange();
             const routeChanged = previousChatIdentity !== currentChatIdentity;
+            const hasExternalMutation = mutations.some(mutation =>
+                !isOwnNavigationMutation(mutation)
+            );
+            if (
+                hasExternalMutation &&
+                replyOutlineHeaderMayHaveChanged(mutations)
+            ) {
+                const previousToolbar = replyOutlineHeaderToolbar;
+                syncReplyOutlineToggleBinding(true);
+                if (replyOutlineHeaderToolbar !== previousToolbar) {
+                    scheduleReplyNavigationUpdate();
+                }
+            }
+            if (mutations.some(isReplySidebarMutation)) {
+                scheduleReplyNavigationUpdate();
+            }
 
             let relevant = false;
             const removedTurnSnapshots = [];
@@ -7614,15 +8350,7 @@
                 /*
                  * 忽略我们自己的导航 UI 修改。
                  */
-                if (
-                    rail?.contains(mutation.target) ||
-                    preview?.contains(mutation.target) ||
-                    replyTopButton === mutation.target ||
-                    replyTopButton?.contains(mutation.target) ||
-                    replyNavigationUI?.root?.contains(mutation.target)
-                ) {
-                    continue;
-                }
+                if (isOwnNavigationMutation(mutation)) continue;
 
                 captureUserEditCandidatesFromMutation(mutation);
 
@@ -7685,15 +8413,6 @@
 
                 if (mutation.type === 'childList') {
                     queueAssistantBarRefresh(mutation.target);
-                    if (
-                        asElement(mutation.target)?.closest(
-                            'aside.app-shell-left-panel'
-                        ) ||
-                        [...mutation.addedNodes, ...mutation.removedNodes]
-                            .some(nodeContainsReplySidebar)
-                    ) {
-                        scheduleReplyNavigationUpdate();
-                    }
                 }
             }
 
@@ -7736,7 +8455,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.7)');
+        console.info('[Conversation Navigator] Started (0.4.8)');
         currentChatIdentity = getChatIdentity();
         ensureUI();
         observeRouteChanges();
@@ -7763,6 +8482,7 @@
 
         window.addEventListener('resize', () => {
             updateRailDensity();
+            syncReplyOutlineToggleBinding(true);
             scheduleActiveUpdate();
             invalidateThreadLayout();
         });
