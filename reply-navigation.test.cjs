@@ -14,6 +14,9 @@ const {
     bindReplyOutlineToggle
 } = require('./chatgpt-conversation-navigator.user.js');
 
+const REPLY_OUTLINE_PINNED_STORAGE_KEY =
+    'yw-chatgpt-conversation-navigator:reply-outline-pinned';
+
 function makeReply(id, top, bottom, readingY, visibleTop = 0, visibleBottom = 800) {
     return {
         id,
@@ -23,6 +26,16 @@ function makeReply(id, top, bottom, readingY, visibleTop = 0, visibleBottom = 80
         visibleBottom,
         visibleLeft: 250,
         visibleRight: 1200
+    };
+}
+
+function makeTestStorage(initialEntries = []) {
+    const entries = new Map(initialEntries);
+    return {
+        getItem(key) { return entries.get(key) ?? null; },
+        setItem(key, value) { entries.set(String(key), String(value)); },
+        removeItem(key) { entries.delete(key); },
+        clear() { entries.clear(); }
     };
 }
 
@@ -360,7 +373,7 @@ test('outline display normalizes only the first entry and preserves native level
     assert.deepEqual(entries.map(entry => entry.level), [4, 2, 6]);
 });
 
-test('outline toggle tooltip and accessible label follow open state', () => {
+test('outline tooltip stays static while the accessible toggle label follows open state', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
     const headerToolbar = makeTestParent();
@@ -372,12 +385,14 @@ test('outline toggle tooltip and accessible label follow open state', () => {
     assert.equal(ui.outlineToggle.getAttribute('aria-label'), '展开大纲');
     runtime.showTooltip();
     assert.equal(ui.outlineTooltip.textContent, '展开大纲');
+    assert.equal(ui.outlineTooltip.hidden, false);
 
     runtime.setReplyOutlineOpen(true);
     assert.equal(ui.outlineToggle.getAttribute('aria-label'), '收起大纲');
-    assert.equal(ui.outlineTooltip.textContent, '收起大纲');
+    assert.equal(ui.outlineTooltip.hidden, true);
+    assert.equal(ui.outlineTooltip.textContent, '展开大纲');
     runtime.showTooltip();
-    assert.equal(ui.outlineTooltip.textContent, '收起大纲');
+    assert.equal(ui.outlineTooltip.hidden, true);
     runtime.renderOutline(context, []);
     assert.equal(ui.outlineToggle.getAttribute('aria-label'), '收起大纲');
 
@@ -386,7 +401,203 @@ test('outline toggle tooltip and accessible label follow open state', () => {
     assert.equal(ui.outlineTooltip.textContent, '展开大纲');
 });
 
-test('body-level outline tooltip stays anchored and clamps at viewport edges', () => {
+test('outline pin preference restores only the exact saved true value for new runtimes', () => {
+    const storage = makeTestStorage([
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+    ]);
+    const restoredRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const restoredUI = makeNavigationTestUI();
+    restoredRuntime.install({ui: restoredUI});
+
+    assert.equal(restoredRuntime.state().pinned, true);
+    assert.equal(restoredUI.outlinePinButton.getAttribute('aria-pressed'), 'true');
+    assert.equal(restoredRuntime.storageListenerCount(), 0);
+
+    storage.setItem(REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false');
+    const restoredOffRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const restoredOffUI = makeNavigationTestUI();
+    restoredOffRuntime.install({ui: restoredOffUI});
+    assert.equal(restoredOffRuntime.state().pinned, false);
+    assert.equal(restoredOffUI.outlinePinButton.getAttribute('aria-pressed'), 'false');
+
+    storage.setItem(REPLY_OUTLINE_PINNED_STORAGE_KEY, 'True');
+    const invalidValueRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const invalidValueUI = makeNavigationTestUI();
+    invalidValueRuntime.install({ui: invalidValueUI});
+    assert.equal(invalidValueRuntime.state().pinned, false);
+});
+
+test('pin preference persists for new runtimes while open tabs ignore storage events', () => {
+    const storage = makeTestStorage();
+    const firstRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const secondRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const firstUI = makeNavigationTestUI();
+    const secondUI = makeNavigationTestUI();
+    const context = {reply: {isConnected: true}};
+    firstRuntime.install({ui: firstUI, outlineOpen: true, currentReplyContext: context});
+    secondRuntime.install({ui: secondUI, outlineOpen: true, currentReplyContext: context});
+
+    firstRuntime.click(firstUI.outlinePinButton);
+    assert.equal(storage.getItem(REPLY_OUTLINE_PINNED_STORAGE_KEY), 'true');
+    secondRuntime.dispatchStorage({
+        key: REPLY_OUTLINE_PINNED_STORAGE_KEY,
+        oldValue: null,
+        newValue: 'true',
+        storageArea: storage
+    });
+    assert.equal(firstRuntime.storageListenerCount(), 0);
+    assert.equal(secondRuntime.state().pinned, false);
+    assert.equal(secondUI.outlinePinButton.getAttribute('aria-pressed'), 'false');
+    assert.equal(secondRuntime.state().open, true);
+
+    secondRuntime.click(makeTestElement());
+    assert.equal(secondRuntime.state().open, false);
+    firstRuntime.dispatchStorage({
+        key: REPLY_OUTLINE_PINNED_STORAGE_KEY,
+        oldValue: null,
+        newValue: 'true',
+        storageArea: storage
+    });
+    assert.equal(firstRuntime.state().pinned, true);
+    assert.equal(firstRuntime.state().open, true);
+
+    const restoredPinnedRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const restoredPinnedUI = makeNavigationTestUI();
+    restoredPinnedRuntime.install({ui: restoredPinnedUI});
+    assert.equal(restoredPinnedRuntime.state().pinned, true);
+
+    restoredPinnedRuntime.click(restoredPinnedUI.outlinePinButton);
+    assert.equal(storage.getItem(REPLY_OUTLINE_PINNED_STORAGE_KEY), 'false');
+    firstRuntime.dispatchStorage({
+        key: REPLY_OUTLINE_PINNED_STORAGE_KEY,
+        oldValue: 'true',
+        newValue: 'false',
+        storageArea: storage
+    });
+    assert.equal(firstRuntime.state().pinned, true);
+    assert.equal(firstRuntime.state().open, true);
+
+    const restoredUnpinnedRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    const restoredUnpinnedUI = makeNavigationTestUI();
+    restoredUnpinnedRuntime.install({ui: restoredUnpinnedUI});
+    assert.equal(restoredUnpinnedRuntime.state().pinned, false);
+});
+
+test('pin remains usable when localStorage is unavailable or throws', () => {
+    for (const localStorage of [
+        undefined,
+        () => { throw new Error('blocked localStorage'); }
+    ]) {
+        const runtime = loadReplyNavigationRuntime({localStorage});
+        const ui = makeNavigationTestUI();
+        runtime.install({ui, outlineOpen: true});
+
+        assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'false');
+        runtime.click(ui.outlinePinButton);
+        assert.equal(runtime.state().pinned, true);
+        assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'true');
+        assert.equal(runtime.state().open, true);
+    }
+});
+
+test('outline pin starts off and toggles its icon and accessibility state without closing', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    const context = {reply: {isConnected: true}};
+    runtime.install({ui, outlineOpen: true, currentReplyContext: context});
+
+    assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'false');
+    assert.equal(ui.outlinePinButton.getAttribute('aria-label'), '固定大纲');
+    assert.equal(ui.outlinePinButton.getAttribute('title'), '固定大纲');
+    assert.deepEqual(ui.outlinePinButton.children[0].children.map(path =>
+        path.getAttribute('d')
+    ), [
+        'M12 17v5',
+        'M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89',
+        'm2 2 20 20',
+        'M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11'
+    ]);
+
+    const pinEvent = runtime.click(ui.outlinePinButton);
+    assert.equal(pinEvent.defaultPrevented, true);
+    assert.equal(pinEvent.propagationStopped, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'true');
+    assert.equal(ui.outlinePinButton.getAttribute('aria-label'), '取消固定大纲');
+    assert.equal(ui.outlinePinButton.getAttribute('title'), '取消固定大纲');
+    assert.deepEqual(ui.outlinePinButton.children[0].children.map(path =>
+        path.getAttribute('d')
+    ), [
+        'M12 17v5',
+        'M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z'
+    ]);
+
+    runtime.click(ui.outlinePinButton);
+    assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'false');
+    assert.equal(ui.outlinePinButton.getAttribute('aria-label'), '固定大纲');
+    assert.equal(runtime.state().open, true);
+});
+
+test('outside clicks collapse an unpinned outline and preserve a pinned one', () => {
+    const unpinnedRuntime = loadReplyNavigationRuntime();
+    const unpinnedUI = makeNavigationTestUI();
+    unpinnedRuntime.install({
+        ui: unpinnedUI,
+        outlineOpen: true,
+        currentReplyContext: {reply: {isConnected: true}}
+    });
+
+    unpinnedRuntime.click(makeTestElement());
+    assert.equal(unpinnedRuntime.state().open, false);
+    assert.equal(unpinnedUI.outline.hidden, true);
+
+    const pinnedRuntime = loadReplyNavigationRuntime();
+    const pinnedUI = makeNavigationTestUI();
+    pinnedRuntime.install({
+        ui: pinnedUI,
+        outlineOpen: true,
+        currentReplyContext: {reply: {isConnected: true}}
+    });
+    pinnedRuntime.click(pinnedUI.outlinePinButton);
+    pinnedRuntime.click(makeTestElement());
+    assert.equal(pinnedRuntime.state().open, true);
+    assert.equal(pinnedUI.outline.hidden, false);
+});
+
+test('inside clicks keep the outline open and the toggle still opens and closes it', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    const headerToolbar = makeTestParent();
+    headerToolbar.insertBefore(makeTestElement(), null);
+    const reply = makeTestElement();
+    reply.querySelectorAll = () => [];
+    reply.matches = () => false;
+    const context = {
+        identity: 'reply-1',
+        chatIdentity: 'chat-1',
+        reply,
+        visibleTop: 200,
+        readingY: 300,
+        rect: {top: 300, bottom: 700, left: 300, width: 500},
+        viewport: {top: 0}
+    };
+    runtime.install({ui, headerToolbar, currentReplyContext: context});
+
+    runtime.click(ui.outlineToggle);
+    assert.equal(runtime.state().open, true);
+    assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'true');
+
+    const inside = makeTestElement();
+    ui.outlineHeadingRow.appendChild(inside);
+    runtime.click(inside);
+    assert.equal(runtime.state().open, true);
+
+    runtime.click(ui.outlineToggle);
+    assert.equal(runtime.state().open, false);
+    assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'false');
+});
+
+test('body-level outline tooltip aligns left and clamps at viewport edges', () => {
     assert.deepEqual(computeReplyOutlineTooltipPosition({
         windowWidth: 1000,
         windowHeight: 600,
@@ -431,6 +642,121 @@ test('outline tooltip is anchored to its toggle and hides when focus leaves', ()
     assert.equal(ui.outlineTooltip.style.top, undefined);
 });
 
+test('outline tooltip follows hover and keyboard focus without latching mouse focus', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    ui.outlineToggle.rect = {
+        left: 1100, right: 1190, top: 12, bottom: 50, width: 90, height: 38
+    };
+    ui.outlineTooltip.rect = {
+        left: 0, right: 130, top: 0, bottom: 28, width: 130, height: 28
+    };
+    let hovered = false;
+    let keyboardFocused = false;
+    ui.outlineToggle.matches = selector =>
+        selector === ':hover' ? hovered :
+            selector === ':focus-visible' && keyboardFocused;
+    runtime.install({ui, currentReplyContext: {reply: {isConnected: true}}});
+
+    const dispatch = type => ui.outlineToggle.dispatchEvent({
+        type,
+        target: ui.outlineToggle
+    });
+
+    dispatch('focus');
+    assert.equal(ui.outlineTooltip.hidden, true);
+
+    hovered = true;
+    dispatch('pointerenter');
+    assert.equal(ui.outlineTooltip.hidden, false);
+    dispatch('focus');
+    hovered = false;
+    dispatch('pointerleave');
+    assert.equal(ui.outlineTooltip.hidden, true);
+
+    keyboardFocused = true;
+    dispatch('focus');
+    assert.equal(ui.outlineTooltip.hidden, false);
+    dispatch('pointerleave');
+    assert.equal(ui.outlineTooltip.hidden, false);
+
+    keyboardFocused = false;
+    dispatch('blur');
+    assert.equal(ui.outlineTooltip.hidden, true);
+});
+
+test('outline tooltip is limited to the collapsed state for hover, focus and direct updates', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    const headerToolbar = makeTestParent();
+    headerToolbar.insertBefore(makeTestElement(), null);
+    const reply = makeTestElement();
+    reply.querySelectorAll = () => [];
+    reply.matches = () => false;
+    const context = {
+        identity: 'reply-1',
+        chatIdentity: 'chat-1',
+        reply,
+        rect: {left: 300, right: 800, top: 300, bottom: 700, width: 500, height: 400},
+        visibleTop: 200,
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    let hovered = false;
+    let keyboardFocused = false;
+    ui.outlineToggle.matches = selector =>
+        selector === ':hover' ? hovered :
+            selector === ':focus-visible' && keyboardFocused;
+    runtime.install({ui, headerToolbar, currentReplyContext: context});
+
+    const dispatch = type => ui.outlineToggle.dispatchEvent({
+        type,
+        target: ui.outlineToggle
+    });
+
+    hovered = true;
+    dispatch('pointerenter');
+    assert.equal(ui.outlineTooltip.hidden, false);
+    assert.equal(ui.outlineTooltip.textContent, '展开大纲');
+
+    runtime.click(ui.outlineToggle);
+    assert.equal(runtime.state().open, true);
+    assert.equal(ui.outlineToggle.getAttribute('aria-label'), '收起大纲');
+    assert.equal(ui.outlineTooltip.hidden, true);
+
+    hovered = false;
+    dispatch('pointerleave');
+    hovered = true;
+    dispatch('pointerenter');
+    assert.equal(ui.outlineTooltip.hidden, true);
+
+    keyboardFocused = true;
+    dispatch('focus');
+    assert.equal(ui.outlineTooltip.hidden, true);
+    runtime.showTooltip();
+    runtime.updateReplyTopButton();
+    assert.equal(ui.outlineTooltip.hidden, true);
+
+    keyboardFocused = false;
+    dispatch('blur');
+    assert.equal(ui.outlineTooltip.hidden, true);
+    runtime.click(ui.outlineToggle);
+    assert.equal(runtime.state().open, false);
+    assert.equal(ui.outlineToggle.getAttribute('aria-label'), '展开大纲');
+    assert.equal(ui.outlineTooltip.hidden, false);
+    assert.equal(ui.outlineTooltip.textContent, '展开大纲');
+
+    hovered = true;
+    dispatch('pointerenter');
+    assert.equal(ui.outlineTooltip.hidden, false);
+    assert.equal(ui.outlineTooltip.textContent, '展开大纲');
+
+    runtime.updateReplyTopButton();
+    assert.equal(ui.outlineTooltip.hidden, false);
+    assert.equal(ui.outlineTooltip.textContent, '展开大纲');
+});
+
 test('visible outline tooltip reanchors on the normal reply-layout update', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
@@ -465,7 +791,7 @@ test('visible outline tooltip reanchors on the normal reply-layout update', () =
     };
     runtime.updateReplyTopButton();
     assert.equal(ui.outlineTooltip.hidden, false);
-    assert.equal(ui.outlineTooltip.style.left, '775px');
+    assert.equal(ui.outlineTooltip.style.left, '800px');
     assert.equal(ui.outlineTooltip.style.top, '146px');
 });
 
@@ -780,7 +1106,7 @@ test('assistant reply navigation skips unanswered entries and advances pending v
     assert.equal(calls.length, callCountAtBoundary);
 });
 
-function loadReplyNavigationRuntime() {
+function loadReplyNavigationRuntime({localStorage} = {}) {
     const fs = require('node:fs');
     const vm = require('node:vm');
     const filename = require.resolve('./chatgpt-conversation-navigator.user.js');
@@ -795,6 +1121,76 @@ function loadReplyNavigationRuntime() {
         jumpCalls: [],
         activeSearch: null
     };
+    const documentListeners = new Map();
+    const windowListeners = new Map();
+    const document = {
+        readyState: 'loading',
+        body: {},
+        addEventListener(type, listener, options) {
+            const listeners = documentListeners.get(type) || [];
+            listeners.push({
+                listener,
+                capture: options === true || Boolean(options?.capture)
+            });
+            documentListeners.set(type, listeners);
+        },
+        dispatchClick(target) {
+            const event = {
+                type: 'click',
+                target,
+                defaultPrevented: false,
+                propagationStopped: false,
+                preventDefault() { this.defaultPrevented = true; },
+                stopPropagation() { this.propagationStopped = true; }
+            };
+            for (const {listener, capture} of documentListeners.get('click') || []) {
+                if (capture) listener(event);
+            }
+            for (let current = target; current && !event.propagationStopped;
+                current = current.parentElement) {
+                current.dispatchEvent?.(event);
+            }
+            return event;
+        },
+        querySelector() { return testState.header; },
+        querySelectorAll(selector) {
+            return selector === 'header, [role="banner"]'
+                ? testState.headers
+                : [];
+        },
+        createElement() { return makeTestElement(); },
+        createElementNS() { return makeTestElement(); }
+    };
+    const window = {
+        innerWidth: 1200,
+        innerHeight: 800,
+        addEventListener(type, listener) {
+            const listeners = windowListeners.get(type) || [];
+            listeners.push(listener);
+            windowListeners.set(type, listeners);
+        },
+        dispatchStorage(event) {
+            for (const listener of windowListeners.get('storage') || []) {
+                listener(event);
+            }
+        },
+        storageListenerCount() {
+            return (windowListeners.get('storage') || []).length;
+        },
+        get localStorage() {
+            return typeof localStorage === 'function'
+                ? localStorage()
+                : localStorage;
+        },
+        getComputedStyle(element) {
+            return element.style || {
+                display: 'block',
+                visibility: 'visible',
+                opacity: '1',
+                getPropertyValue() { return ''; }
+            };
+        }
+    };
     const instrumentation = `
         const testState = globalThis.__replyTestState;
         const renderReplyOutlineForTest = renderReplyOutline;
@@ -802,6 +1198,7 @@ function loadReplyNavigationRuntime() {
             install({ui, headerToolbar = null, outlineOpen = false,
                 currentReplyContext = null, turns: testTurns = [],
                 sidebarGeometry = null}) {
+                initializeReplyOutlinePinnedPreference();
                 replyNavigationUI = ui;
                 replyTopButton = {hidden: false, dataset: {}};
                 replyOutlineHeaderToolbar = headerToolbar;
@@ -834,6 +1231,11 @@ function loadReplyNavigationRuntime() {
                 testState.activeSearch = null;
                 renderReplyOutline = () => {};
                 syncReplyNavigationLayoutObservers = () => {};
+                registerReplyOutlineOutsideClickHandling();
+                bindReplyOutlinePinButton(ui.outlinePinButton);
+                bindReplyOutlineToggleClickHandler(ui.outlineToggle);
+                bindReplyOutlineToggleTooltipEvents(ui.outlineToggle);
+                updateReplyOutlinePinButton();
             },
             setHeader(header) {
                 testState.header = header;
@@ -864,6 +1266,10 @@ function loadReplyNavigationRuntime() {
                 renderReplyOutlineForTest(context, entries);
             },
             setReplyOutlineOpen,
+            click(target) { return document.dispatchClick(target); },
+            initializeSettings: initializeReplyOutlinePinnedPreference,
+            dispatchStorage(event) { return window.dispatchStorage(event); },
+            storageListenerCount() { return window.storageListenerCount(); },
             directJump(identity, options = {replyTop: false}) {
                 activeJumpSearch = {
                     identity,
@@ -900,37 +1306,16 @@ function loadReplyNavigationRuntime() {
                     toolbarHidden: replyNavigationUI.toolbar.hidden,
                     outlineHidden: replyNavigationUI.outline.hidden,
                     toggleHidden: replyNavigationUI.outlineToggle.hidden,
-                    expanded: replyNavigationUI.outlineToggle.getAttribute('aria-expanded')
+                    expanded: replyNavigationUI.outlineToggle.getAttribute('aria-expanded'),
+                    pinned: replyOutlinePinned
                 };
             }
         };
     `;
     const context = {
         __replyTestState: testState,
-        document: {
-            readyState: 'loading',
-            body: {},
-            addEventListener() {},
-            querySelector() { return testState.header; },
-            querySelectorAll(selector) {
-                return selector === 'header, [role="banner"]'
-                    ? testState.headers
-                    : [];
-            },
-            createElement() { return makeTestElement(); }
-        },
-        window: {
-            innerWidth: 1200,
-            innerHeight: 800,
-            getComputedStyle(element) {
-                return element.style || {
-                    display: 'block',
-                    visibility: 'visible',
-                    opacity: '1',
-                    getPropertyValue() { return ''; }
-                };
-            }
-        },
+        document,
+        window,
         console
     };
     vm.runInNewContext(
@@ -947,6 +1332,9 @@ function makeNavigationTestUI() {
     const outline = makeTestElement({hidden: false});
     const outlineToggle = makeTestElement({hidden: false});
     const outlineTooltip = makeTestElement({hidden: true});
+    outlineTooltip.textContent = '展开大纲';
+    const outlineHeadingRow = makeTestElement();
+    const outlinePinButton = makeTestElement();
     const list = makeTestElement();
     list.replaceChildren = (...children) => {
         list.children = [];
@@ -962,11 +1350,16 @@ function makeNavigationTestUI() {
         direction,
         {disabled: false}
     ]));
+    outline.appendChild(outlineHeadingRow);
+    outlineHeadingRow.appendChild(outlinePinButton);
+    toolbar.appendChild(outlineToggle);
     return {
         root,
         toolbar,
         outline,
         outlineToggle,
+        outlineHeadingRow,
+        outlinePinButton,
         outlineTooltip,
         list,
         buttons,
@@ -1007,9 +1400,11 @@ function makeTestElement({
     hidden = false,
     rect = {left: 872, right: 952, top: 8, bottom: 48, width: 80, height: 40},
     closest = () => null,
-    querySelector = () => null
+    querySelector = () => null,
+    matches = () => false
 } = {}) {
     const attributes = new Map();
+    const eventListeners = new Map();
     const element = {
         hidden,
         rect,
@@ -1024,6 +1419,13 @@ function makeTestElement({
         dataset: {},
         closest,
         querySelector,
+        matches,
+        contains(target) {
+            for (let current = target; current; current = current.parentElement) {
+                if (current === this) return true;
+            }
+            return false;
+        },
         get nextElementSibling() {
             if (!this.parentElement) return null;
             const siblings = this.parentElement.children;
@@ -1032,12 +1434,30 @@ function makeTestElement({
         getBoundingClientRect() { return this.rect; },
         setAttribute(name, value) { attributes.set(name, String(value)); },
         getAttribute(name) { return attributes.get(name) ?? null; },
-        addEventListener() {},
+        addEventListener(type, listener) {
+            const listeners = eventListeners.get(type) || [];
+            listeners.push(listener);
+            eventListeners.set(type, listeners);
+        },
+        dispatchEvent(event) {
+            for (const listener of eventListeners.get(event.type) || []) {
+                listener.call(this, event);
+            }
+            return !event.defaultPrevented;
+        },
         appendChild(child) {
             child.parentElement = this;
             child.isConnected = true;
             this.children.push(child);
             return child;
+        },
+        replaceChildren(...children) {
+            for (const child of this.children) {
+                child.parentElement = null;
+                child.isConnected = false;
+            }
+            this.children = [];
+            for (const child of children) this.appendChild(child);
         },
         remove() {
             if (this.parentElement) {

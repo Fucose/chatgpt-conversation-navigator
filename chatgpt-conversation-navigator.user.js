@@ -1794,10 +1794,9 @@
         }
         const clampedWidth = Math.min(pillWidth, width - inset * 2);
         const clampedHeight = Math.min(pillHeight, height - inset * 2);
-        const centeredLeft = (leftEdge + rightEdge - clampedWidth) / 2;
         const left = Math.max(
             inset,
-            Math.min(width - clampedWidth - inset, centeredLeft)
+            Math.min(width - clampedWidth - inset, leftEdge)
         );
         const top = Math.max(
             inset,
@@ -1854,6 +1853,8 @@
     const PREVIEW_ID = 'yw-chatgpt-turn-preview';
     const STYLE_ID = 'yw-chatgpt-turn-nav-style';
     const REPLY_NAV_ID = 'yw-chatgpt-reply-navigation';
+    const REPLY_OUTLINE_PINNED_STORAGE_KEY =
+        'yw-chatgpt-conversation-navigator:reply-outline-pinned';
     const REPLY_NAV_TOOLBAR_HEIGHT = 202;
     const REPLY_NAV_TOOLBAR_GAP = 12;
     const REPLY_NAV_VIEWPORT_INSET = 8;
@@ -1894,6 +1895,16 @@
      */
     const REPLY_NAV_ICONS = {
         outline: 'M3 5h.01M3 12h.01M3 19h.01M8 5h13M8 12h13M8 19h13',
+        pin: [
+            'M12 17v5',
+            'M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z'
+        ],
+        'pin-off': [
+            'M12 17v5',
+            'M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89',
+            'm2 2 20 20',
+            'M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11'
+        ],
         'previous-reply': 'M12 19V5M5 12l7-7 7 7',
         'next-reply': 'M12 5v14m7-7-7 7-7-7',
         first: 'm17 18-6-6 6-6M7 6v12',
@@ -1948,6 +1959,11 @@
     let replyNavigationUI = null;
     let replyNavigationContext = null;
     let replyOutlineOpen = false;
+    let replyOutlinePinned = false;
+    let replyOutlineOutsideClickListenerInstalled = false;
+    const replyOutlinePinButtonBindings = new WeakSet();
+    const replyOutlineToggleClickBindings = new WeakSet();
+    const replyOutlineToggleTooltipBindings = new WeakSet();
     let replyLayoutResizeObserver = null;
     let replyLayoutObservedNodes = new Set();
     let replyLayoutObservedSidebar = null;
@@ -2484,6 +2500,46 @@
                 line-height: 20px;
             }
 
+            #${REPLY_NAV_ID} .yw-reply-outline-pin-button {
+                appearance: none;
+                -webkit-appearance: none;
+                display: grid;
+                flex: 0 0 28px;
+                place-items: center;
+                width: 28px;
+                height: 28px;
+                padding: 0;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                background: transparent;
+                color: #9CA3AF;
+                cursor: pointer;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-pin-button[aria-pressed="true"] {
+                color: #5D83EF;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-pin-button:hover {
+                background: color-mix(in oklab, var(--color-text-primary, #0D0D0D) 5%, transparent);
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-pin-button:focus-visible {
+                outline: 2px solid var(--color-ring-primary-ghost, #3B82F6);
+                outline-offset: -1px;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-outline-pin-button svg {
+                display: block;
+                width: 16px;
+                height: 16px;
+                fill: none;
+                stroke: currentColor;
+                stroke-width: 2;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+            }
+
             #${REPLY_NAV_ID} .yw-reply-outline-reply-nav {
                 display: flex;
                 flex: 0 0 auto;
@@ -2858,15 +2914,125 @@
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         svg.setAttribute('viewBox', '0 0 24 24');
         svg.setAttribute('aria-hidden', 'true');
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        path.setAttribute('d', pathData);
-        svg.appendChild(path);
+        for (const pathValue of Array.isArray(pathData) ? pathData : [pathData]) {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', pathValue);
+            svg.appendChild(path);
+        }
         return svg;
     }
 
+    function updateReplyOutlinePinButton() {
+        const button = replyNavigationUI?.outlinePinButton;
+        if (!button) return;
+        const pinned = Boolean(replyOutlinePinned);
+        const icon = pinned ? 'pin' : 'pin-off';
+        const label = pinned ? '取消固定大纲' : '固定大纲';
+        button.setAttribute('aria-label', label);
+        button.setAttribute('aria-pressed', String(pinned));
+        button.setAttribute('title', label);
+        if (button.dataset.icon !== icon) {
+            const svg = createReplyNavigationIcon(REPLY_NAV_ICONS[icon]);
+            svg.setAttribute('class', 'yw-reply-outline-icon');
+            button.replaceChildren(svg);
+            button.dataset.icon = icon;
+        }
+    }
+
+    function readReplyOutlinePinnedPreference() {
+        try {
+            return window.localStorage.getItem(
+                REPLY_OUTLINE_PINNED_STORAGE_KEY
+            ) === 'true';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function persistReplyOutlinePinnedPreference() {
+        try {
+            window.localStorage.setItem(
+                REPLY_OUTLINE_PINNED_STORAGE_KEY,
+                replyOutlinePinned ? 'true' : 'false'
+            );
+        } catch (_) {
+            // The in-memory preference remains usable when storage is blocked.
+        }
+    }
+
+    function initializeReplyOutlinePinnedPreference() {
+        replyOutlinePinned = readReplyOutlinePinnedPreference();
+        updateReplyOutlinePinButton();
+    }
+
+    function bindReplyOutlinePinButton(button) {
+        if (!button || replyOutlinePinButtonBindings.has(button)) return;
+        replyOutlinePinButtonBindings.add(button);
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            replyOutlinePinned = !replyOutlinePinned;
+            persistReplyOutlinePinnedPreference();
+            updateReplyOutlinePinButton();
+        });
+    }
+
+    function bindReplyOutlineToggleClickHandler(button) {
+        if (!button || replyOutlineToggleClickBindings.has(button)) return;
+        replyOutlineToggleClickBindings.add(button);
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleReplyOutline();
+        });
+    }
+
+    function syncReplyOutlineToggleTooltip() {
+        const toggle = replyNavigationUI?.outlineToggle;
+        if (
+            !replyOutlineOpen &&
+            (
+                toggle?.matches?.(':hover') ||
+                toggle?.matches?.(':focus-visible')
+            )
+        ) {
+            showReplyOutlineTooltip();
+        } else {
+            hideReplyOutlineTooltip();
+        }
+    }
+
+    function bindReplyOutlineToggleTooltipEvents(button) {
+        if (!button || replyOutlineToggleTooltipBindings.has(button)) return;
+        replyOutlineToggleTooltipBindings.add(button);
+        for (const type of ['pointerenter', 'pointerleave', 'focus', 'blur']) {
+            button.addEventListener(type, syncReplyOutlineToggleTooltip);
+        }
+    }
+
+    function handleReplyOutlineOutsideClick(event) {
+        const ui = replyNavigationUI;
+        const target = event?.target;
+        if (
+            !ui || !replyOutlineOpen || replyOutlinePinned || !target ||
+            ui.outline.contains(target) || ui.outlineToggle.contains(target)
+        ) {
+            return;
+        }
+        setReplyOutlineOpen(false);
+    }
+
+    function registerReplyOutlineOutsideClickHandling() {
+        if (replyOutlineOutsideClickListenerInstalled) return;
+        document.addEventListener('click', handleReplyOutlineOutsideClick, true);
+        replyOutlineOutsideClickListenerInstalled = true;
+    }
+
     function ensureReplyNavigationUI() {
+        registerReplyOutlineOutsideClickHandling();
         if (replyNavigationUI?.root?.isConnected) {
             updateReplyOutlineToggleLabel();
+            updateReplyOutlinePinButton();
             return;
         }
 
@@ -2918,33 +3084,18 @@
         outlineToggle.setAttribute('aria-label', '当前回复大纲');
         outlineToggle.setAttribute('aria-expanded', 'false');
         outlineToggle.setAttribute('aria-controls', `${REPLY_NAV_ID}-outline`);
-        outlineToggle.setAttribute(
-            'aria-describedby',
-            `${REPLY_NAV_ID}-outline-tooltip`
-        );
         const outlineIcon = createReplyNavigationIcon(REPLY_NAV_ICONS.outline);
         outlineIcon.classList.add('yw-reply-outline-icon');
         const outlineTooltip = document.createElement('span');
         outlineTooltip.id = `${REPLY_NAV_ID}-outline-tooltip`;
         outlineTooltip.className = 'yw-reply-outline-tooltip';
         outlineTooltip.setAttribute('aria-hidden', 'true');
-        outlineTooltip.textContent = '当前回复大纲';
+        outlineTooltip.textContent = '展开大纲';
         outlineTooltip.dataset.visible = 'false';
         outlineTooltip.hidden = true;
         outlineToggle.appendChild(outlineIcon);
-        outlineToggle.addEventListener('click', event => {
-            event.preventDefault();
-            event.stopPropagation();
-            toggleReplyOutline();
-        });
-        outlineToggle.addEventListener('pointerenter', () =>
-            showReplyOutlineTooltip()
-        );
-        outlineToggle.addEventListener('pointerleave', hideReplyOutlineTooltip);
-        outlineToggle.addEventListener('focus', () =>
-            showReplyOutlineTooltip()
-        );
-        outlineToggle.addEventListener('blur', hideReplyOutlineTooltip);
+        bindReplyOutlineToggleClickHandler(outlineToggle);
+        bindReplyOutlineToggleTooltipEvents(outlineToggle);
 
         const outline = document.createElement('section');
         outline.id = `${REPLY_NAV_ID}-outline`;
@@ -2981,7 +3132,12 @@
             replyButtons.set(direction, button);
             replyNavigation.appendChild(button);
         }
-        headingRow.append(heading, replyNavigation);
+
+        const outlinePinButton = document.createElement('button');
+        outlinePinButton.type = 'button';
+        outlinePinButton.className = 'yw-reply-outline-pin-button';
+        bindReplyOutlinePinButton(outlinePinButton);
+        headingRow.append(outlinePinButton, heading, replyNavigation);
         outline.appendChild(headingRow);
 
         const list = document.createElement('ol');
@@ -2995,6 +3151,7 @@
             toolbar,
             outline,
             outlineToggle,
+            outlinePinButton,
             outlineTooltip,
             heading,
             replyButtons,
@@ -3002,6 +3159,7 @@
             buttons
         };
         updateReplyOutlineToggleLabel();
+        updateReplyOutlinePinButton();
         syncReplyOutlineToggleBinding(true);
     }
 
@@ -7671,10 +7829,12 @@
 
     function showReplyOutlineTooltip() {
         const ui = replyNavigationUI;
-        if (ui) updateReplyOutlineToggleLabel();
         const toggle = ui?.outlineToggle;
         const tooltip = ui?.outlineTooltip;
-        if (!toggle?.isConnected || toggle.hidden || !tooltip || ui.root.hidden) {
+        if (
+            replyOutlineOpen || !toggle?.isConnected || toggle.hidden ||
+            !tooltip || ui.root.hidden
+        ) {
             hideReplyOutlineTooltip();
             return;
         }
@@ -7732,6 +7892,7 @@
             String(Boolean(replyOutlineOpen && !ui.root.hidden && !ui.outline.hidden))
         );
         syncReplyOutlineToggleBinding();
+        syncReplyOutlineToggleTooltip();
     }
 
     function toggleReplyOutline() {
@@ -7742,13 +7903,10 @@
 
     function updateReplyOutlineToggleLabel() {
         const ui = replyNavigationUI;
-        if (!ui?.outlineToggle || !ui.outlineTooltip) return;
+        if (!ui?.outlineToggle) return;
         const label = replyOutlineOpen ? '收起大纲' : '展开大纲';
         if (ui.outlineToggle.getAttribute('aria-label') !== label) {
             ui.outlineToggle.setAttribute('aria-label', label);
-        }
-        if (ui.outlineTooltip.textContent !== label) {
-            ui.outlineTooltip.textContent = label;
         }
     }
 
@@ -8456,6 +8614,7 @@
 
     function init() {
         console.info('[Conversation Navigator] Started (0.4.8)');
+        initializeReplyOutlinePinnedPreference();
         currentChatIdentity = getChatIdentity();
         ensureUI();
         observeRouteChanges();
