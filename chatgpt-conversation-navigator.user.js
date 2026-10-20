@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.8
+// @version      0.4.9
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -7724,7 +7724,10 @@
         const selector =
             'h1.Heading-Ro3lZr, h2.Heading-Ro3lZr, ' +
             'h3.Heading-Ro3lZr, h4.Heading-Ro3lZr, ' +
-            'h5.Heading-Ro3lZr, h6.Heading-Ro3lZr';
+            'h5.Heading-Ro3lZr, h6.Heading-Ro3lZr, ' +
+            'h1.Title-HRvkwB, h2.Title-HRvkwB, ' +
+            'h3.Title-HRvkwB, h4.Title-HRvkwB, ' +
+            'h5.Title-HRvkwB, h6.Title-HRvkwB';
         const matches = Array.from(context.reply.querySelectorAll(selector));
         if (context.reply.matches?.(selector)) matches.unshift(context.reply);
 
@@ -8613,7 +8616,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.8)');
+        console.info('[Conversation Navigator] Started (0.4.9)');
         initializeReplyOutlinePinnedPreference();
         currentChatIdentity = getChatIdentity();
         ensureUI();

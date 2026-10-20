@@ -51,6 +51,66 @@ test('current reply selection chooses the nearest visible assistant at a reading
     assert.equal(selected.pointInside, false);
 });
 
+test('reply heading discovery supports legacy Heading-Ro3lZr headings', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const reply = makeReplyHeadingRoot([
+        {tagName: 'H1', className: 'Heading-Ro3lZr', text: 'Overview'},
+        {tagName: 'H3', className: 'Heading-Ro3lZr', text: 'Details'}
+    ]);
+
+    assert.deepEqual(
+        summarizeReplyHeadingEntries(runtime, reply),
+        [
+            {text: 'Overview', level: 1},
+            {text: 'Details', level: 3}
+        ]
+    );
+});
+
+test('reply heading discovery supports current Title-HRvkwB headings', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const reply = makeReplyHeadingRoot([
+        {tagName: 'H2', className: 'TextBase-hXhSqg Title-HRvkwB', text: 'Current title'},
+        {tagName: 'H6', className: 'Title-HRvkwB', text: 'Deep section'}
+    ]);
+
+    assert.deepEqual(
+        summarizeReplyHeadingEntries(runtime, reply),
+        [
+            {text: 'Current title', level: 2},
+            {text: 'Deep section', level: 6}
+        ]
+    );
+});
+
+test('mixed reply heading variants keep DOM order and levels within the current reply', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const reply = makeReplyHeadingRoot([
+        {tagName: 'H3', className: 'Title-HRvkwB', text: 'New first'},
+        {tagName: 'H1', className: 'Heading-Ro3lZr', text: 'Old second'},
+        {tagName: 'H5', className: 'Heading-Ro3lZr', text: 'Old third'},
+        {tagName: 'H2', className: 'TextBase-hXhSqg Title-HRvkwB', text: 'New fourth'},
+        {tagName: 'H4', className: 'OtherHeadingClass', text: 'Unrelated class'},
+        {tagName: 'DIV', className: 'Title-HRvkwB', text: 'Not a heading'}
+    ]);
+    const conversation = makeTestElement();
+    const otherReply = makeReplyHeadingRoot([
+        {tagName: 'H2', className: 'Heading-Ro3lZr', text: 'Other reply'}
+    ]);
+    conversation.appendChild(reply);
+    conversation.appendChild(otherReply);
+
+    assert.deepEqual(
+        summarizeReplyHeadingEntries(runtime, reply),
+        [
+            {text: 'New first', level: 3},
+            {text: 'Old second', level: 1},
+            {text: 'Old third', level: 5},
+            {text: 'New fourth', level: 2}
+        ]
+    );
+});
+
 test('heading navigation advances from the visible top edge and reverses to the prior heading', () => {
     const headings = [100, 300, 500].map(top => ({top}));
 
@@ -1265,6 +1325,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             renderOutline(context, entries) {
                 renderReplyOutlineForTest(context, entries);
             },
+            getReplyHeadingEntries,
             setReplyOutlineOpen,
             click(target) { return document.dispatchClick(target); },
             initializeSettings: initializeReplyOutlinePinnedPreference,
@@ -1365,6 +1426,49 @@ function makeNavigationTestUI() {
         buttons,
         replyButtons
     };
+}
+
+function makeReplyHeadingRoot(specs) {
+    const reply = makeTestElement();
+    reply.tagName = 'DIV';
+    reply.matches = selector => matchesTestHeadingSelector(reply, selector);
+    reply.querySelectorAll = selector => {
+        const matches = [];
+        const visit = parent => {
+            for (const child of parent.children) {
+                if (matchesTestHeadingSelector(child, selector)) matches.push(child);
+                visit(child);
+            }
+        };
+        visit(reply);
+        return matches;
+    };
+
+    for (const spec of specs) {
+        const heading = makeTestElement({
+            rect: {left: 300, right: 700, top: 100, bottom: 124, width: 400, height: 24}
+        });
+        heading.tagName = spec.tagName;
+        heading.className = spec.className;
+        heading.textContent = spec.text;
+        reply.appendChild(heading);
+    }
+    return reply;
+}
+
+function summarizeReplyHeadingEntries(runtime, reply) {
+    return JSON.parse(JSON.stringify(
+        runtime.getReplyHeadingEntries({reply}).map(({text, level}) => ({text, level}))
+    ));
+}
+
+function matchesTestHeadingSelector(element, selector) {
+    const className = String(element.className || '');
+    return selector.split(',').some(part => {
+        const match = part.trim().match(/^(h[1-6])\.([\w-]+)$/i);
+        return match && element.tagName?.toLowerCase() === match[1].toLowerCase() &&
+            className.split(/\s+/).includes(match[2]);
+    });
 }
 
 function configureOutlineSearch(root, {named = [], flex = [], buttons = []} = {}) {
