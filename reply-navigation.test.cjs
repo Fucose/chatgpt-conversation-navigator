@@ -16,6 +16,8 @@ const {
 
 const REPLY_OUTLINE_PINNED_STORAGE_KEY =
     'yw-chatgpt-conversation-navigator:reply-outline-pinned';
+const REPLY_OUTLINE_OPEN_STORAGE_KEY =
+    'yw-chatgpt-conversation-navigator:reply-outline-open';
 
 function makeReply(id, top, bottom, readingY, visibleTop = 0, visibleBottom = 800) {
     return {
@@ -67,18 +69,46 @@ test('reply heading discovery supports legacy Heading-Ro3lZr headings', () => {
     );
 });
 
-test('reply heading discovery supports current Title-HRvkwB headings', () => {
+test('reply heading discovery supports semantic title attributes across h1-h6', () => {
     const runtime = loadReplyNavigationRuntime();
     const reply = makeReplyHeadingRoot([
-        {tagName: 'H2', className: 'TextBase-hXhSqg Title-HRvkwB', text: 'Current title'},
-        {tagName: 'H6', className: 'Title-HRvkwB', text: 'Deep section'}
+        {
+            tagName: 'H1',
+            className: 'TextBase-qM5iDq Title-mwq_Iy',
+            dataComponent: 'title',
+            text: 'New title class'
+        },
+        {
+            tagName: 'H2',
+            className: 'RenamedHeading-a1b2c3',
+            dataComponent: 'title',
+            text: 'Renamed heading class'
+        },
+        {tagName: 'H3', dataComponent: 'title', text: 'Classless heading'},
+        {
+            tagName: 'H4',
+            className: 'AnotherRenamedHeading-xYz',
+            dataComponent: 'title',
+            text: 'Another renamed heading class'
+        },
+        {tagName: 'H5', dataComponent: 'title', text: 'Classless deep heading'},
+        {
+            tagName: 'H6',
+            className: 'TextBase-new Title-newHash',
+            dataComponent: 'title',
+            text: 'Deep semantic title'
+        }
     ]);
 
     assert.deepEqual(
         summarizeReplyHeadingEntries(runtime, reply),
         [
-            {text: 'Current title', level: 2},
-            {text: 'Deep section', level: 6}
+            {text: 'New title class', level: 1},
+            {text: 'Renamed heading class', level: 2},
+            {text: 'Classless heading', level: 3},
+            {text: 'Another renamed heading class', level: 4},
+            {text: 'Classless deep heading', level: 5},
+            {text: 'Deep semantic title', level: 6}
         ]
     );
 });
@@ -86,12 +116,22 @@ test('reply heading discovery supports current Title-HRvkwB headings', () => {
 test('mixed reply heading variants keep DOM order and levels within the current reply', () => {
     const runtime = loadReplyNavigationRuntime();
     const reply = makeReplyHeadingRoot([
-        {tagName: 'H3', className: 'Title-HRvkwB', text: 'New first'},
+        {
+            tagName: 'H3',
+            className: 'TextBase-qM5iDq Title-mwq_Iy',
+            dataComponent: 'title',
+            text: 'New first'
+        },
         {tagName: 'H1', className: 'Heading-Ro3lZr', text: 'Old second'},
         {tagName: 'H5', className: 'Heading-Ro3lZr', text: 'Old third'},
-        {tagName: 'H2', className: 'TextBase-hXhSqg Title-HRvkwB', text: 'New fourth'},
+        {
+            tagName: 'H2',
+            className: 'RenamedTitle-kLmNoP',
+            dataComponent: 'title',
+            text: 'New fourth'
+        },
         {tagName: 'H4', className: 'OtherHeadingClass', text: 'Unrelated class'},
-        {tagName: 'DIV', className: 'Title-HRvkwB', text: 'Not a heading'}
+        {tagName: 'DIV', className: 'Title-mwq_Iy', dataComponent: 'title', text: 'Not a heading'}
     ]);
     const conversation = makeTestElement();
     const otherReply = makeReplyHeadingRoot([
@@ -111,22 +151,33 @@ test('mixed reply heading variants keep DOM order and levels within the current 
     );
 });
 
-test('reply heading discovery excludes headings inside the exact Box container', () => {
+test('reply heading discovery excludes headings inside semantic box containers', () => {
     const runtime = loadReplyNavigationRuntime();
     const reply = makeReplyHeadingRoot([
-        {tagName: 'H2', className: 'Title-HRvkwB', text: 'Before Box'},
+        {
+            tagName: 'H2',
+            className: 'TextBase-qM5iDq Title-mwq_Iy',
+            dataComponent: 'title',
+            text: 'Before Box'
+        },
         {
             tagName: 'DIV',
             className: 'Grid-CGRmTR',
             children: [
                 {
                     tagName: 'DIV',
-                    className: 'Box-qIMv6G',
+                    className: 'Box-renamedClass',
+                    dataComponent: 'box',
                     children: [
-                        {tagName: 'H1', className: 'Title-HRvkwB', text: 'Direct Box heading'},
                         {
-                            tagName: 'DIV',
-                            className: 'Box-qIMv6G',
+                            tagName: 'H1',
+                            className: 'Title-mwq_Iy',
+                            dataComponent: 'title',
+                            text: 'Direct Box heading'
+                        },
+                        {
+                            tagName: 'SPAN',
+                            dataComponent: 'box',
                             children: [
                                 {tagName: 'H6', className: 'Heading-Ro3lZr', text: 'Nested Box heading'}
                             ]
@@ -137,30 +188,30 @@ test('reply heading discovery excludes headings inside the exact Box container',
         },
         {
             tagName: 'DIV',
-            className: 'Box-qIMv6G',
+            dataComponent: 'box',
             children: [
-                {tagName: 'H3', className: 'Title-HRvkwB', text: 'Box without grid'}
+                {tagName: 'H3', className: 'Title-newHash', dataComponent: 'title', text: 'Box without grid'}
             ]
         },
         {
             tagName: 'DIV',
-            className: 'Box-OtherClass',
+            className: 'Box-classOnly',
             children: [
                 {tagName: 'H4', className: 'Heading-Ro3lZr', text: 'Other Box class'}
             ]
         },
         {
             tagName: 'SECTION',
-            className: 'Box-qIMv6G',
+            className: 'Box-classOnly',
             children: [
-                {tagName: 'H5', className: 'Title-HRvkwB', text: 'Non-div Box class'}
+                {tagName: 'H5', className: 'Heading-Ro3lZr', text: 'Non-box heading'}
             ]
         },
         {tagName: 'H2', className: 'Heading-Ro3lZr', text: 'After Box'}
     ]);
     const conversation = makeTestElement();
     const otherReply = makeReplyHeadingRoot([
-        {tagName: 'H1', className: 'Title-HRvkwB', text: 'Other reply'}
+        {tagName: 'H1', className: 'Title-mwq_Iy', dataComponent: 'title', text: 'Other reply'}
     ]);
     conversation.appendChild(reply);
     conversation.appendChild(otherReply);
@@ -170,7 +221,7 @@ test('reply heading discovery excludes headings inside the exact Box container',
         [
             {text: 'Before Box', level: 2},
             {text: 'Other Box class', level: 4},
-            {text: 'Non-div Box class', level: 5},
+            {text: 'Non-box heading', level: 5},
             {text: 'After Box', level: 2}
         ]
     );
@@ -530,9 +581,10 @@ test('outline tooltip stays static while the accessible toggle label follows ope
     assert.equal(ui.outlineTooltip.textContent, '展开大纲');
 });
 
-test('outline pin preference restores only the exact saved true value for new runtimes', () => {
+test('outline preferences restore only exact saved true values for new runtimes', () => {
     const storage = makeTestStorage([
-        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+        [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
     ]);
     const restoredRuntime = loadReplyNavigationRuntime({localStorage: storage});
     const restoredUI = makeNavigationTestUI();
@@ -559,6 +611,69 @@ test('outline pin preference restores only the exact saved true value for new ru
     assert.equal(invalidValueRuntime.state().open, false);
 });
 
+test('saved open preference requires both pinned and open without implicit pin migration', () => {
+    const cases = [
+        {pinned: 'true', open: 'true', expectedPinned: true, expectedOpen: true},
+        {pinned: 'true', open: 'false', expectedPinned: true, expectedOpen: false},
+        {pinned: 'true', open: null, expectedPinned: true, expectedOpen: false},
+        {pinned: 'false', open: 'true', expectedPinned: false, expectedOpen: false},
+        {pinned: 'false', open: 'false', expectedPinned: false, expectedOpen: false},
+        {pinned: 'True', open: 'true', expectedPinned: false, expectedOpen: false},
+        {pinned: 'true', open: 'True', expectedPinned: true, expectedOpen: false}
+    ];
+
+    for (const preference of cases) {
+        const entries = [[REPLY_OUTLINE_PINNED_STORAGE_KEY, preference.pinned]];
+        if (preference.open !== null) {
+            entries.push([REPLY_OUTLINE_OPEN_STORAGE_KEY, preference.open]);
+        }
+        const runtime = loadReplyNavigationRuntime({
+            localStorage: makeTestStorage(entries)
+        });
+        runtime.install({ui: makeNavigationTestUI()});
+
+        assert.equal(runtime.state().pinned, preference.expectedPinned, preference.pinned);
+        assert.equal(runtime.state().open, preference.expectedOpen, preference.open);
+        assert.equal(
+            runtime.state().openPreference,
+            preference.open === 'true',
+            `saved open intent for ${preference.open}`
+        );
+    }
+});
+
+test('explicit open state persists independently of pin state', () => {
+    const storage = makeTestStorage([
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false']
+    ]);
+    const runtime = loadReplyNavigationRuntime({localStorage: storage});
+    const ui = makeNavigationTestUI();
+    const context = {reply: {isConnected: true}};
+    runtime.install({ui, currentReplyContext: context});
+
+    runtime.setReplyOutlineOpen(true);
+    assert.equal(runtime.state().pinned, false);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().openPreference, true);
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), 'true');
+
+    const unpinnedReload = loadReplyNavigationRuntime({localStorage: storage});
+    unpinnedReload.install({ui: makeNavigationTestUI()});
+    assert.equal(unpinnedReload.state().pinned, false);
+    assert.equal(unpinnedReload.state().openPreference, true);
+    assert.equal(unpinnedReload.state().open, false);
+
+    runtime.click(ui.outlinePinButton);
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), 'true');
+
+    const pinnedReload = loadReplyNavigationRuntime({localStorage: storage});
+    pinnedReload.install({ui: makeNavigationTestUI()});
+    assert.equal(pinnedReload.state().pinned, true);
+    assert.equal(pinnedReload.state().open, true);
+});
+
 test('unset or unavailable pin preference starts with the outline closed', () => {
     for (const localStorage of [
         undefined,
@@ -574,7 +689,8 @@ test('unset or unavailable pin preference starts with the outline closed', () =>
 
 test('saved pin opens before UI creation and shows the outline when a reply becomes ready', () => {
     const storage = makeTestStorage([
-        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+        [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
     ]);
     const runtime = loadReplyNavigationRuntime({localStorage: storage});
     const ui = makeNavigationTestUI();
@@ -589,7 +705,12 @@ test('saved pin opens before UI creation and shows the outline when a reply beco
     assert.equal(runtime.state().rootHidden, true);
 
     const reply = makeReplyHeadingRoot([
-        {tagName: 'H2', className: 'Title-HRvkwB', text: 'Chapter'}
+        {
+            tagName: 'H2',
+            className: 'TextBase-qM5iDq Title-mwq_Iy',
+            dataComponent: 'title',
+            text: 'Chapter'
+        }
     ]);
     const currentReplyContext = {
         identity: 'reply-1',
@@ -610,7 +731,7 @@ test('saved pin opens before UI creation and shows the outline when a reply beco
     assert.equal(runtime.state().outlineHidden, false);
 });
 
-test('pin preference persists for new runtimes while open tabs ignore storage events', () => {
+test('pin preference persists separately while open tabs ignore storage events', () => {
     const storage = makeTestStorage();
     const firstRuntime = loadReplyNavigationRuntime({localStorage: storage});
     const secondRuntime = loadReplyNavigationRuntime({localStorage: storage});
@@ -622,6 +743,7 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
 
     firstRuntime.click(firstUI.outlinePinButton);
     assert.equal(storage.getItem(REPLY_OUTLINE_PINNED_STORAGE_KEY), 'true');
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), null);
     secondRuntime.dispatchStorage({
         key: REPLY_OUTLINE_PINNED_STORAGE_KEY,
         oldValue: null,
@@ -648,10 +770,12 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
     const restoredPinnedUI = makeNavigationTestUI();
     restoredPinnedRuntime.install({ui: restoredPinnedUI});
     assert.equal(restoredPinnedRuntime.state().pinned, true);
-    assert.equal(restoredPinnedRuntime.state().open, true);
+    assert.equal(restoredPinnedRuntime.state().open, false);
 
     restoredPinnedRuntime.click(restoredPinnedUI.outlinePinButton);
     assert.equal(storage.getItem(REPLY_OUTLINE_PINNED_STORAGE_KEY), 'false');
+    assert.equal(restoredPinnedRuntime.state().open, false);
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), 'false');
     firstRuntime.dispatchStorage({
         key: REPLY_OUTLINE_PINNED_STORAGE_KEY,
         oldValue: 'true',
@@ -668,9 +792,10 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
     assert.equal(restoredUnpinnedRuntime.state().open, false);
 });
 
-test('pinned outline reopens on an actual conversation route change after clearing stale state', () => {
+test('pinned and saved-open outline reopens on a conversation route change', () => {
     const storage = makeTestStorage([
-        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+        [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
     ]);
     const runtime = loadReplyNavigationRuntime({localStorage: storage});
     const ui = makeNavigationTestUI();
@@ -693,15 +818,16 @@ test('pinned outline reopens on an actual conversation route change after cleari
     runtime.renderOutline(oldContext, [
         {element: makeTestElement(), text: 'Old chapter', level: 1}
     ]);
-    runtime.setReplyOutlineOpen(false);
     assert.equal(runtime.state().pinned, true);
-    assert.equal(runtime.state().open, false);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().openPreference, true);
     assert.equal(ui.list.children.length, 1);
 
-    // The current tab retains its in-memory pin even if shared storage changes.
+    // Route resets use this tab's saved intent, even if shared storage changes.
     storage.setItem(REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false');
+    storage.setItem(REPLY_OUTLINE_OPEN_STORAGE_KEY, 'false');
     runtime.handleRouteChange();
-    assert.equal(runtime.state().open, false, 'same-identity updates preserve manual collapse');
+    assert.equal(runtime.state().open, true, 'same-identity updates preserve current state');
     assert.equal(ui.list.children.length, 1);
 
     runtime.setPathname('/c/new');
@@ -730,10 +856,51 @@ test('pinned outline reopens on an actual conversation route change after cleari
     assert.equal(runtime.state().outlineHidden, false);
 });
 
+test('pinned closed outline stays closed on route changes and after reload', () => {
+    const storage = makeTestStorage([
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+        [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
+    ]);
+    const runtime = loadReplyNavigationRuntime({localStorage: storage});
+    const ui = makeNavigationTestUI();
+    const oldContext = {
+        identity: 'old-reply',
+        chatIdentity: 'conversation:old',
+        reply: makeReplyHeadingRoot([]),
+        visibleTop: 200,
+        rect: {left: 300, right: 700, top: 100, bottom: 800, width: 400},
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    runtime.install({ui, currentReplyContext: oldContext});
+    runtime.setCurrentChatIdentity('conversation:old');
+    runtime.setPathname('/c/old');
+    runtime.stubRouteNativeStartup();
+    runtime.setReplyOutlineOpen(false);
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), 'false');
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, false);
+
+    runtime.setPathname('/c/new');
+    runtime.handleRouteChange();
+    assert.equal(runtime.currentChatIdentity(), 'conversation:new');
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, false);
+    assert.equal(runtime.state().openPreference, false);
+    assert.equal(runtime.state().rootHidden, true);
+
+    const reloadedRuntime = loadReplyNavigationRuntime({localStorage: storage});
+    reloadedRuntime.install({ui: makeNavigationTestUI()});
+    assert.equal(reloadedRuntime.state().pinned, true);
+    assert.equal(reloadedRuntime.state().open, false);
+});
+
 test('unpinned outline stays closed across a conversation route change', () => {
     const runtime = loadReplyNavigationRuntime({
         localStorage: makeTestStorage([
-            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false']
+            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false'],
+            [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
         ])
     });
     const ui = makeNavigationTestUI();
@@ -774,7 +941,8 @@ test('unpinned outline stays closed across a conversation route change', () => {
 test('pinned outline is restored through pending new-conversation URL adoption', () => {
     const runtime = loadReplyNavigationRuntime({
         localStorage: makeTestStorage([
-            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+            [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
         ])
     });
     const ui = makeNavigationTestUI();
@@ -794,25 +962,59 @@ test('pinned outline is restored through pending new-conversation URL adoption',
     assert.equal(runtime.replyNavigationContext(), null);
 });
 
-test('pin remains usable when localStorage is unavailable or throws', () => {
+test('pinned closed outline stays closed through pending new-conversation adoption', () => {
+    const runtime = loadReplyNavigationRuntime({
+        localStorage: makeTestStorage([
+            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true'],
+            [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'false']
+        ])
+    });
+    const ui = makeNavigationTestUI();
+    runtime.install({ui});
+    runtime.setCurrentChatIdentity('route:/');
+    runtime.setPathname('/');
+    runtime.setNewConversationSubmissionPending(true);
+    runtime.stubRouteNativeStartup();
+
+    runtime.setPathname('/c/created');
+    runtime.handleRouteChange();
+
+    assert.equal(runtime.currentChatIdentity(), 'conversation:created');
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, false);
+    assert.equal(runtime.state().rootHidden, true);
+    assert.equal(runtime.replyNavigationContext(), null);
+});
+
+test('pin and open preferences remain usable when localStorage is unavailable or throws', () => {
     for (const localStorage of [
         undefined,
         () => { throw new Error('blocked localStorage'); }
     ]) {
         const runtime = loadReplyNavigationRuntime({localStorage});
         const ui = makeNavigationTestUI();
-        runtime.install({ui, outlineOpen: true});
+        runtime.install({
+            ui,
+            currentReplyContext: {reply: {isConnected: true}}
+        });
 
         assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'false');
         runtime.click(ui.outlinePinButton);
         assert.equal(runtime.state().pinned, true);
         assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'true');
+        assert.equal(runtime.state().open, false, 'pinning does not open a closed outline');
+        runtime.setReplyOutlineOpen(true);
         assert.equal(runtime.state().open, true);
+        assert.equal(runtime.state().openPreference, true);
+        runtime.setReplyOutlineOpen(false);
+        assert.equal(runtime.state().open, false);
+        assert.equal(runtime.state().openPreference, false);
     }
 });
 
 test('outline pin starts off and toggles its icon and accessibility state without closing', () => {
-    const runtime = loadReplyNavigationRuntime();
+    const storage = makeTestStorage();
+    const runtime = loadReplyNavigationRuntime({localStorage: storage});
     const ui = makeNavigationTestUI();
     const context = {reply: {isConnected: true}};
     runtime.install({ui, outlineOpen: true, currentReplyContext: context});
@@ -833,6 +1035,8 @@ test('outline pin starts off and toggles its icon and accessibility state withou
     assert.equal(pinEvent.defaultPrevented, true);
     assert.equal(pinEvent.propagationStopped, true);
     assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().openPreference, false);
+    assert.equal(storage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), null);
     assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'true');
     assert.equal(ui.outlinePinButton.getAttribute('aria-label'), '取消固定大纲');
     assert.equal(ui.outlinePinButton.getAttribute('title'), '取消固定大纲');
@@ -847,10 +1051,14 @@ test('outline pin starts off and toggles its icon and accessibility state withou
     assert.equal(ui.outlinePinButton.getAttribute('aria-pressed'), 'false');
     assert.equal(ui.outlinePinButton.getAttribute('aria-label'), '固定大纲');
     assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().openPreference, false);
 });
 
 test('outside clicks collapse an unpinned outline and preserve a pinned one', () => {
-    const unpinnedRuntime = loadReplyNavigationRuntime();
+    const unpinnedStorage = makeTestStorage([
+        [REPLY_OUTLINE_OPEN_STORAGE_KEY, 'true']
+    ]);
+    const unpinnedRuntime = loadReplyNavigationRuntime({localStorage: unpinnedStorage});
     const unpinnedUI = makeNavigationTestUI();
     unpinnedRuntime.install({
         ui: unpinnedUI,
@@ -860,6 +1068,8 @@ test('outside clicks collapse an unpinned outline and preserve a pinned one', ()
 
     unpinnedRuntime.click(makeTestElement());
     assert.equal(unpinnedRuntime.state().open, false);
+    assert.equal(unpinnedRuntime.state().openPreference, false);
+    assert.equal(unpinnedStorage.getItem(REPLY_OUTLINE_OPEN_STORAGE_KEY), 'false');
     assert.equal(unpinnedUI.outline.hidden, true);
 
     const pinnedRuntime = loadReplyNavigationRuntime();
@@ -1510,10 +1720,11 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             install({ui, headerToolbar = null, outlineOpen,
                 currentReplyContext = null, turns: testTurns = [],
                 sidebarGeometry = null}) {
-                initializeReplyOutlinePinnedPreference();
+                initializeReplyOutlinePreferences();
                 testState.preUIPreference = {
                     pinned: replyOutlinePinned,
-                    open: replyOutlineOpen
+                    open: replyOutlineOpen,
+                    openPreference: replyOutlineOpenPreference
                 };
                 replyNavigationUI = ui;
                 replyTopButton = {hidden: false, dataset: {}};
@@ -1584,7 +1795,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             getReplyHeadingEntries,
             setReplyOutlineOpen,
             click(target) { return document.dispatchClick(target); },
-            initializeSettings: initializeReplyOutlinePinnedPreference,
+            initializeSettings: initializeReplyOutlinePreferences,
             preUIPreference() { return testState.preUIPreference; },
             dispatchStorage(event) { return window.dispatchStorage(event); },
             storageListenerCount() { return window.storageListenerCount(); },
@@ -1637,7 +1848,8 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
                     outlineHidden: replyNavigationUI.outline.hidden,
                     toggleHidden: replyNavigationUI.outlineToggle.hidden,
                     expanded: replyNavigationUI.outlineToggle.getAttribute('aria-expanded'),
-                    pinned: replyOutlinePinned
+                    pinned: replyOutlinePinned,
+                    openPreference: replyOutlineOpenPreference
                 };
             }
         };
@@ -1720,6 +1932,9 @@ function makeReplyHeadingRoot(specs) {
         element.tagName = spec.tagName;
         element.className = spec.className;
         element.textContent = spec.text || '';
+        if (spec.dataComponent) {
+            element.setAttribute('data-d-component', spec.dataComponent);
+        }
         element.matches = selector =>
             matchesTestHeadingSelector(element, selector) ||
             matchesTestBoxContainerSelector(element, selector);
@@ -1748,16 +1963,20 @@ function summarizeReplyHeadingEntries(runtime, reply) {
 function matchesTestHeadingSelector(element, selector) {
     const className = String(element.className || '');
     return selector.split(',').some(part => {
-        const match = part.trim().match(/^(h[1-6])\.([\w-]+)$/i);
-        return match && element.tagName?.toLowerCase() === match[1].toLowerCase() &&
-            className.split(/\s+/).includes(match[2]);
+        const trimmed = part.trim();
+        const classMatch = trimmed.match(/^(h[1-6])\.([\w-]+)$/i);
+        if (classMatch && element.tagName?.toLowerCase() === classMatch[1].toLowerCase()) {
+            return className.split(/\s+/).includes(classMatch[2]);
+        }
+        const componentMatch = trimmed.match(/^(h[1-6])\[data-d-component="title"\]$/i);
+        return componentMatch && element.tagName?.toLowerCase() === componentMatch[1].toLowerCase() &&
+            element.getAttribute('data-d-component') === 'title';
     });
 }
 
 function matchesTestBoxContainerSelector(element, selector) {
-    return selector === 'div.Box-qIMv6G' &&
-        element.tagName?.toLowerCase() === 'div' &&
-        String(element.className || '').split(/\s+/).includes('Box-qIMv6G');
+    return selector === '[data-d-component="box"]' &&
+        element.getAttribute('data-d-component') === 'box';
 }
 
 function configureOutlineSearch(root, {named = [], flex = [], buttons = []} = {}) {

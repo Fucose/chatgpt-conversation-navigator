@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.10
+// @version      0.5.0
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -2514,6 +2514,8 @@
     const REPLY_NAV_ID = 'yw-chatgpt-reply-navigation';
     const REPLY_OUTLINE_PINNED_STORAGE_KEY =
         'yw-chatgpt-conversation-navigator:reply-outline-pinned';
+    const REPLY_OUTLINE_OPEN_STORAGE_KEY =
+        'yw-chatgpt-conversation-navigator:reply-outline-open';
     const REPLY_NAV_TOOLBAR_HEIGHT = 202;
     const REPLY_NAV_TOOLBAR_GAP = 12;
     const REPLY_NAV_VIEWPORT_INSET = 8;
@@ -2619,6 +2621,7 @@
     let replyNavigationUI = null;
     let replyNavigationContext = null;
     let replyOutlineOpen = false;
+    let replyOutlineOpenPreference = false;
     let replyOutlinePinned = false;
     let replyOutlineOutsideClickListenerInstalled = false;
     const replyOutlinePinButtonBindings = new WeakSet();
@@ -2928,9 +2931,6 @@
             .yw-reply-top svg {
                 width: 20px;
                 height: 20px;
-                fill: currentColor;
-                stroke: none;
-                transform: rotate(180deg);
             }
 
             #${RAIL_ID} .yw-history-control.yw-history-loading svg {
@@ -3392,17 +3392,19 @@
                 background:
                     var(
                         --main-surface-primary,
-                        rgba(255, 255, 255, 0.97)
+                        var(--color-surface, rgba(255, 255, 255, 0.97))
                     );
 
-                color: var(--text-primary, #171717);
+                color: var(--text-primary, var(--color-text-primary, #171717));
 
-                border: 1px solid
+                border: 1px solid var(
+                    --color-border,
                     color-mix(
                         in srgb,
-                        var(--text-primary, #111) 10%,
+                        var(--text-primary, var(--color-text-primary, #111)) 10%,
                         transparent
-                    );
+                    )
+                );
 
                 box-shadow:
                     0 10px 35px rgba(0, 0, 0, 0.10),
@@ -3451,7 +3453,7 @@
                 line-height: 1.48;
                 font-weight: 600;
 
-                color: var(--text-primary, #171717);
+                color: var(--text-primary, var(--color-text-primary, #171717));
 
                 white-space: pre-wrap;
                 overflow-wrap: anywhere;
@@ -3481,7 +3483,7 @@
                 color:
                     color-mix(
                         in srgb,
-                        var(--text-primary, #171717) 62%,
+                        var(--text-primary, var(--color-text-primary, #171717)) 62%,
                         transparent
                     );
 
@@ -3515,6 +3517,30 @@
                     width: min(380px, calc(100vw - 72px));
                 }
             }
+
+            html.chatgpt-theme[data-theme="dark"] #${REPLY_NAV_ID} .yw-reply-outline,
+            html.dark #${REPLY_NAV_ID} .yw-reply-outline,
+            html.chatgpt-theme[data-theme="dark"] #${PREVIEW_ID},
+            html.dark #${PREVIEW_ID} {
+                background: #2B2B2B;
+            }
+
+            html.chatgpt-theme[data-theme="dark"] #${RAIL_ID} .yw-turn-bar,
+            html.dark #${RAIL_ID} .yw-turn-bar {
+                background: #666666;
+            }
+
+            html.chatgpt-theme[data-theme="dark"] #${RAIL_ID} .yw-turn-bar:hover,
+            html.chatgpt-theme[data-theme="dark"] #${RAIL_ID} .yw-turn-bar:focus-visible,
+            html.dark #${RAIL_ID} .yw-turn-bar:hover,
+            html.dark #${RAIL_ID} .yw-turn-bar:focus-visible {
+                background: #AAAAAA;
+            }
+
+            html.chatgpt-theme[data-theme="dark"] #${RAIL_ID} .yw-turn-bar.yw-active,
+            html.dark #${RAIL_ID} .yw-turn-bar.yw-active {
+                background: #EDEDED;
+            }
         `;
 
         (document.head || document.documentElement).appendChild(style);
@@ -3524,51 +3550,6 @@
     /******************************************************************
      * 创建 UI
      ******************************************************************/
-
-    function getNativeScrollToBottomButton() {
-        return document.querySelector('button[aria-label="滚动到底部"]') ||
-            document.querySelector('button[class*="scroll-to-bottom"]');
-    }
-
-    function syncReplyTopButtonIcon() {
-        if (!replyTopButton) return;
-        const nativeSvg = getNativeScrollToBottomButton()?.querySelector('svg');
-        const nativeUse = nativeSvg?.querySelector('use');
-        const nativeHref = nativeUse?.getAttribute('href') ||
-            nativeUse?.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
-        const signature = nativeSvg
-            ? [
-                nativeSvg.getAttribute('viewBox') || '',
-                nativeHref,
-                nativeSvg.getAttribute('class') || '',
-                nativeSvg.getAttribute('style') || '',
-                nativeSvg.innerHTML
-            ].join('|')
-            : 'local-arrow-up';
-        if (
-            replyTopButton.dataset.iconSignature === signature &&
-            replyTopButton.querySelector('svg')
-        ) {
-            return;
-        }
-
-        let svg;
-        if (nativeSvg) {
-            svg = nativeSvg.cloneNode(true);
-            svg.removeAttribute('tabindex');
-            svg.setAttribute('viewBox', nativeSvg.getAttribute('viewBox') || '0 0 20 20');
-            svg.setAttribute('width', '20');
-            svg.setAttribute('height', '20');
-        } else {
-            const wrapper = document.createElement('div');
-            wrapper.innerHTML = '<svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true"><path d="M10 4v12m-5-5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-            svg = wrapper.firstElementChild;
-        }
-        svg.setAttribute('aria-hidden', 'true');
-        svg.removeAttribute('focusable');
-        replyTopButton.replaceChildren(svg);
-        replyTopButton.dataset.iconSignature = signature;
-    }
 
     function createReplyNavigationIcon(pathData) {
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -3620,9 +3601,31 @@
         }
     }
 
-    function initializeReplyOutlinePinnedPreference() {
+    function readReplyOutlineOpenPreference() {
+        try {
+            return window.localStorage.getItem(
+                REPLY_OUTLINE_OPEN_STORAGE_KEY
+            ) === 'true';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function persistReplyOutlineOpenPreference() {
+        try {
+            window.localStorage.setItem(
+                REPLY_OUTLINE_OPEN_STORAGE_KEY,
+                replyOutlineOpenPreference ? 'true' : 'false'
+            );
+        } catch (_) {
+            // The in-memory preference remains usable when storage is blocked.
+        }
+    }
+
+    function initializeReplyOutlinePreferences() {
         replyOutlinePinned = readReplyOutlinePinnedPreference();
-        replyOutlineOpen = replyOutlinePinned;
+        replyOutlineOpenPreference = readReplyOutlineOpenPreference();
+        replyOutlineOpen = replyOutlinePinned && replyOutlineOpenPreference;
         updateReplyOutlinePinButton();
     }
 
@@ -4183,6 +4186,9 @@
             replyTopButton.className = 'yw-reply-top';
             replyTopButton.hidden = true;
             replyTopButton.setAttribute('aria-label', '回到当前回复顶部');
+            replyTopButton.appendChild(
+                createReplyNavigationIcon(REPLY_NAV_ICONS['previous-reply'])
+            );
             replyTopButton.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -4194,8 +4200,6 @@
             });
             document.body.appendChild(replyTopButton);
         }
-        replyTopButton.removeAttribute('title');
-        syncReplyTopButtonIcon();
 
         ensureReplyNavigationUI();
 
@@ -8386,9 +8390,9 @@
             'h1.Heading-Ro3lZr, h2.Heading-Ro3lZr, ' +
             'h3.Heading-Ro3lZr, h4.Heading-Ro3lZr, ' +
             'h5.Heading-Ro3lZr, h6.Heading-Ro3lZr, ' +
-            'h1.Title-HRvkwB, h2.Title-HRvkwB, ' +
-            'h3.Title-HRvkwB, h4.Title-HRvkwB, ' +
-            'h5.Title-HRvkwB, h6.Title-HRvkwB';
+            'h1[data-d-component="title"], h2[data-d-component="title"], ' +
+            'h3[data-d-component="title"], h4[data-d-component="title"], ' +
+            'h5[data-d-component="title"], h6[data-d-component="title"]';
         const matches = Array.from(context.reply.querySelectorAll(selector));
         if (context.reply.matches?.(selector)) matches.unshift(context.reply);
 
@@ -8396,7 +8400,7 @@
             .filter(element =>
                 element.isConnected &&
                 context.reply.contains(element) &&
-                !element.closest('div.Box-qIMv6G')
+                !element.closest('[data-d-component="box"]')
             )
             .map(element => ({
                 element,
@@ -8548,6 +8552,8 @@
             open && replyNavigationContext?.reply?.isConnected &&
             !ui.root.hidden
         );
+        replyOutlineOpenPreference = canOpen;
+        persistReplyOutlineOpenPreference();
         replyOutlineOpen = canOpen;
         updateReplyOutlineToggleLabel();
         ui.outline.hidden = !replyOutlineOpen;
@@ -8633,7 +8639,7 @@
 
     function resetReplyNavigationForConversationChange() {
         clearReplyNavigation();
-        replyOutlineOpen = replyOutlinePinned;
+        replyOutlineOpen = replyOutlinePinned && replyOutlineOpenPreference;
         updateReplyOutlineToggleLabel();
     }
 
@@ -9287,8 +9293,8 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.10)');
-        initializeReplyOutlinePinnedPreference();
+        console.info('[Conversation Navigator] Started (0.5.0)');
+        initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();
         observeRouteChanges();
