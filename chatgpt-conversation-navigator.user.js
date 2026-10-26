@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.4.9
+// @version      0.4.10
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -509,14 +509,9 @@
     }
 
     const { createNativeAdapter, createNativeLocator, NativeAdapterError } = (() => {
-        const NATIVE_MODULE_CONTRACT = Object.freeze({
-            scope: Object.freeze({id: 'OW', export: 'a'}),
-            conversationState: Object.freeze({id: 'Mr', export: 'j'}),
-            pagination: Object.freeze({id: 'FG', export: 'c'}),
-            loader: Object.freeze({id: 'jfi', export: 'b'}),
-            reactDom: Object.freeze({id: 'v7', export: 'flushSync'}),
-            historySource: Object.freeze({id: 'M3K', export: 'a'}),
-        });
+        const NATIVE_DISCOVERY_CACHE = new WeakMap();
+        const NATIVE_DISCOVERY_MAX_FACTORIES = 20_000;
+        const NATIVE_DISCOVERY_MAX_SOURCE_BYTES = 100_000_000;
 
         const MODULE_PRELOAD_SELECTOR = 'link[rel="modulepreload"][href]';
         const REACT_FIBER_PROPERTY_PREFIXES = [
@@ -539,6 +534,673 @@
 
         function fail(code, message) {
             throw new NativeAdapterError(code, message);
+        }
+
+        function tokenizeFactorySource(source) {
+            const tokens = [];
+            const pairs = new Map();
+            const stack = [];
+            let index = 0;
+
+            while (index < source.length) {
+                const character = source[index];
+                if (/\s/.test(character)) {
+                    index += 1;
+                    continue;
+                }
+                if (character === '/' && source[index + 1] === '/') {
+                    index += 2;
+                    while (index < source.length && source[index] !== '\n') index += 1;
+                    continue;
+                }
+                if (character === '/' && source[index + 1] === '*') {
+                    const close = source.indexOf('*/', index + 2);
+                    index = close < 0 ? source.length : close + 2;
+                    continue;
+                }
+
+                if (character === '"' || character === "'") {
+                    const quote = character;
+                    const start = index++;
+                    let raw = '';
+                    while (index < source.length) {
+                        const current = source[index++];
+                        if (current === '\\') {
+                            if (index < source.length) raw += current + source[index++];
+                            continue;
+                        }
+                        if (current === quote) break;
+                        raw += current;
+                    }
+                    const value = raw
+                        .replace(/\\n/g, '\n')
+                        .replace(/\\r/g, '\r')
+                        .replace(/\\t/g, '\t')
+                        .replace(/\\(['"\\])/g, '$1');
+                    tokens.push({type: 'string', value, start, end: index});
+                    continue;
+                }
+
+                if (character.charCodeAt(0) === 96) {
+                    const start = index++;
+                    while (index < source.length) {
+                        if (source[index] === '\\') {
+                            index += 2;
+                            continue;
+                        }
+                        if (source.charCodeAt(index++) === 96) break;
+                    }
+                    tokens.push({type: 'template', value: null, start, end: index});
+                    continue;
+                }
+
+                if (/[A-Za-z_$]/.test(character)) {
+                    const start = index++;
+                    while (index < source.length && /[A-Za-z0-9_$]/.test(source[index])) index += 1;
+                    tokens.push({type: 'identifier', value: source.slice(start, index), start, end: index});
+                    continue;
+                }
+                if (/[0-9]/.test(character)) {
+                    const start = index++;
+                    while (index < source.length && /[A-Za-z0-9_.]/.test(source[index])) index += 1;
+                    tokens.push({type: 'number', value: source.slice(start, index), start, end: index});
+                    continue;
+                }
+
+                const start = index;
+                const operator = ['===', '!==', '...', '=>', '?.', '??', '==', '!=', '<=', '>=', '&&', '||', '++', '--']
+                    .find(value => source.startsWith(value, index));
+                index += operator ? operator.length : 1;
+                tokens.push({type: 'punct', value: operator || character, start, end: index});
+            }
+
+            for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+                const value = tokens[tokenIndex].value;
+                if (value === '(' || value === '[' || value === '{') {
+                    stack.push(tokenIndex);
+                } else if (value === ')' || value === ']' || value === '}') {
+                    const openIndex = stack.pop();
+                    if (openIndex === undefined) continue;
+                    const open = tokens[openIndex].value;
+                    if (
+                        (open === '(' && value === ')') ||
+                        (open === '[' && value === ']') ||
+                        (open === '{' && value === '}')
+                    ) {
+                        pairs.set(openIndex, tokenIndex);
+                        pairs.set(tokenIndex, openIndex);
+                    }
+                }
+            }
+
+            return {tokens, pairs};
+        }
+
+        function splitTokenRange(tokens, pairs, start, end) {
+            const ranges = [];
+            let rangeStart = start;
+            for (let index = start; index < end; index += 1) {
+                const paired = pairs.get(index);
+                if (paired > index) {
+                    index = paired;
+                    continue;
+                }
+                if (tokens[index].value === ',') {
+                    ranges.push([rangeStart, index]);
+                    rangeStart = index + 1;
+                }
+            }
+            if (rangeStart < end) ranges.push([rangeStart, end]);
+            return ranges;
+        }
+
+        function readStaticMember(tokens, pairs, start, end = tokens.length) {
+            while (
+                end - start >= 2 &&
+                tokens[start]?.value === '(' &&
+                pairs.get(start) === end - 1
+            ) {
+                start += 1;
+                end -= 1;
+            }
+            const object = tokens[start];
+            if (object?.type !== 'identifier') return null;
+
+            if (
+                tokens[start + 1]?.value === '.' &&
+                tokens[start + 2]?.type === 'identifier' &&
+                start + 3 === end
+            ) {
+                return {object: object.value, property: tokens[start + 2].value};
+            }
+            if (
+                tokens[start + 1]?.value === '[' &&
+                tokens[start + 2]?.type === 'string' &&
+                pairs.get(start + 1) === start + 3 &&
+                start + 4 === end
+            ) {
+                return {object: object.value, property: tokens[start + 2].value};
+            }
+            return null;
+        }
+
+        function getMemberAt(tokens, index) {
+            const object = tokens[index];
+            if (object?.type !== 'identifier') return null;
+            if (tokens[index + 1]?.value === '.' && tokens[index + 2]?.type === 'identifier') {
+                return {object: object.value, property: tokens[index + 2].value, end: index + 3};
+            }
+            if (
+                tokens[index + 1]?.value === '[' &&
+                tokens[index + 2]?.type === 'string' &&
+                tokens[index + 3]?.value === ']'
+            ) {
+                return {object: object.value, property: tokens[index + 2].value, end: index + 4};
+            }
+            return null;
+        }
+
+        function getMemberCalls(parsed, start = 0, end = parsed.tokens.length) {
+            const {tokens, pairs} = parsed;
+            const calls = [];
+            for (let index = start; index < end; index += 1) {
+                const member = getMemberAt(tokens, index);
+                if (!member) continue;
+
+                let openIndex = member.end;
+                if (tokens[openIndex]?.value === ')' && tokens[openIndex + 1]?.value === '(') {
+                    openIndex += 1;
+                }
+                if (tokens[openIndex]?.value !== '(' || pairs.get(openIndex) === undefined) continue;
+                const closeIndex = pairs.get(openIndex);
+                if (closeIndex > end) continue;
+                const calleeStart =
+                    tokens[index - 3]?.value === '(' &&
+                    tokens[index - 2]?.value === '0' &&
+                    tokens[index - 1]?.value === ',' &&
+                    tokens[member.end]?.value === ')'
+                        ? index - 3
+                        : index;
+                calls.push({
+                    object: member.object,
+                    property: member.property,
+                    start: calleeStart,
+                    args: splitTokenRange(tokens, pairs, openIndex + 1, closeIndex),
+                });
+            }
+            return calls;
+        }
+
+        function getAssignedIdentifier(tokens, pairs, expressionStart) {
+            const assignmentStart = tokens[expressionStart - 1]?.value === 'async'
+                ? expressionStart - 1
+                : expressionStart;
+            const equals = assignmentStart - 1;
+            const identifier = tokens[equals - 1];
+            if (tokens[equals]?.value !== '=' || identifier?.type !== 'identifier') return null;
+            if (!['const', 'let', 'var', ',', ';', '{', '}'].includes(tokens[equals - 2]?.value)) return null;
+            return identifier.value;
+        }
+
+        function getFunctionParameters(tokens, pairs, openIndex, closeIndex) {
+            return splitTokenRange(tokens, pairs, openIndex + 1, closeIndex)
+                .map(([start]) => tokens[start]?.type === 'identifier' ? tokens[start].value : null)
+                .filter(Boolean);
+        }
+
+        function getFactoryParameters(source) {
+            const patterns = [
+                /^\s*(?:async\s+)?function(?:\s+[$A-Za-z_][$\w]*)?\s*\(([^)]*)\)/,
+                /^\s*(?:async\s*)?\(([^)]*)\)\s*=>/,
+                /^\s*(?:async\s+)?([$A-Za-z_][$\w]*)\s*=>/,
+            ];
+            for (const pattern of patterns) {
+                const match = source.match(pattern);
+                if (!match) continue;
+                return (match[1] || '')
+                    .split(',')
+                    .map(value => value.trim().split('=')[0].trim())
+                    .filter(value => /^[A-Za-z_$][\w$]*$/.test(value));
+            }
+            return [];
+        }
+
+        function getFactoryBodyRange(parsed) {
+            const {tokens, pairs} = parsed;
+            let paramsOpen = -1;
+            let paramsClose = -1;
+            if (tokens[0]?.value === 'function') {
+                paramsOpen = 1;
+                while (paramsOpen < tokens.length && tokens[paramsOpen].value !== '(') paramsOpen += 1;
+                paramsClose = pairs.get(paramsOpen) ?? -1;
+                const bodyOpen = paramsClose + 1;
+                if (tokens[bodyOpen]?.value === '{') {
+                    return {start: bodyOpen + 1, end: pairs.get(bodyOpen)};
+                }
+            } else if (tokens[0]?.value === '(') {
+                paramsClose = pairs.get(0) ?? -1;
+                if (tokens[paramsClose + 1]?.value === '=>') {
+                    const bodyOpen = paramsClose + 2;
+                    if (tokens[bodyOpen]?.value === '{') {
+                        return {start: bodyOpen + 1, end: pairs.get(bodyOpen)};
+                    }
+                }
+            }
+            return null;
+        }
+
+        function getFactoryFunctions(parsed) {
+            const {tokens, pairs} = parsed;
+            const functions = new Map();
+            const body = getFactoryBodyRange(parsed);
+            if (!body || body.end === undefined) return functions;
+
+            function add(name, params, bodyOpen) {
+                const bodyClose = pairs.get(bodyOpen);
+                if (!name || bodyClose === undefined) return;
+                const existing = functions.get(name) || [];
+                existing.push({name, params, start: bodyOpen + 1, end: bodyClose});
+                functions.set(name, existing);
+            }
+
+            for (let index = body.start; index < body.end;) {
+                if (tokens[index].value === 'function') {
+                    let open = index + 1;
+                    const name = tokens[open]?.type === 'identifier'
+                        ? tokens[open++].value
+                        : getAssignedIdentifier(tokens, pairs, index);
+                    while (open < body.end && tokens[open].value !== '(') open += 1;
+                    const close = pairs.get(open);
+                    const bodyOpen = close === undefined ? -1 : close + 1;
+                    if (tokens[bodyOpen]?.value === '{' && pairs.has(bodyOpen)) {
+                        add(name, getFunctionParameters(tokens, pairs, open, close), bodyOpen);
+                        index = pairs.get(bodyOpen) + 1;
+                        continue;
+                    }
+                }
+
+                if (tokens[index].value === '=>') {
+                    let paramsOpen = -1;
+                    let paramsClose = -1;
+                    if (tokens[index - 1]?.value === ')') {
+                        paramsClose = index - 1;
+                        paramsOpen = pairs.get(paramsClose) ?? -1;
+                    }
+                    const params = paramsOpen >= 0
+                        ? getFunctionParameters(tokens, pairs, paramsOpen, paramsClose)
+                        : tokens[index - 1]?.type === 'identifier'
+                            ? [tokens[index - 1].value]
+                            : [];
+                    const assignmentStart = paramsOpen >= 0 ? paramsOpen : index - 1;
+                    const name = getAssignedIdentifier(tokens, pairs, assignmentStart);
+                    const bodyOpen = index + 1;
+                    if (tokens[bodyOpen]?.value === '{' && pairs.has(bodyOpen)) {
+                        add(name, params, bodyOpen);
+                        index = pairs.get(bodyOpen) + 1;
+                        continue;
+                    }
+                }
+
+                if (tokens[index].value === '{' && pairs.has(index)) {
+                    index = pairs.get(index) + 1;
+                    continue;
+                }
+                index += 1;
+            }
+            return functions;
+        }
+
+        function getStaticModuleId(tokens, range) {
+            if (!range || range[1] - range[0] !== 1) return null;
+            const token = tokens[range[0]];
+            return token?.type === 'string' || token?.type === 'number'
+                ? token.value
+                : null;
+        }
+
+        function getObjectExportMappings(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            if (tokens[start]?.value !== '{' || pairs.get(start) !== end - 1) return [];
+            const mappings = [];
+            for (const [propertyStart, propertyEnd] of splitTokenRange(tokens, pairs, start + 1, end - 1)) {
+                let colon = propertyStart;
+                while (colon < propertyEnd && tokens[colon].value !== ':') colon += 1;
+                if (colon === propertyEnd) continue;
+                const keyToken = tokens[propertyStart];
+                const key = keyToken?.type === 'identifier' || keyToken?.type === 'string'
+                    ? keyToken.value
+                    : null;
+                if (!key) continue;
+
+                let local = null;
+                let arrow = colon + 1;
+                while (arrow < propertyEnd && tokens[arrow].value !== '=>') arrow += 1;
+                if (arrow < propertyEnd) {
+                    const body = arrow + 1;
+                    if (tokens[body]?.type === 'identifier') local = tokens[body].value;
+                    if (tokens[body]?.value === '{') {
+                        for (let index = body + 1; index < (pairs.get(body) ?? body); index += 1) {
+                            if (tokens[index].value === 'return' && tokens[index + 1]?.type === 'identifier') {
+                                local = tokens[index + 1].value;
+                                break;
+                            }
+                        }
+                    }
+                } else if (propertyEnd - colon === 2 && tokens[colon + 1]?.type === 'identifier') {
+                    local = tokens[colon + 1].value;
+                }
+                if (local) mappings.push([key, local]);
+            }
+            return mappings;
+        }
+
+        function parseFactorySource(id, source) {
+            const parsed = tokenizeFactorySource(source);
+            const {tokens, pairs} = parsed;
+            const parameters = getFactoryParameters(source);
+            const requireName = parameters[2];
+            const exportsName = parameters[1];
+            const imports = new Map();
+            const exports = new Map();
+
+            if (requireName) {
+                for (let index = 0; index < tokens.length; index += 1) {
+                    if (
+                        tokens[index].value !== requireName ||
+                        tokens[index + 1]?.value !== '(' ||
+                        pairs.get(index + 1) === undefined
+                    ) continue;
+                    const args = splitTokenRange(tokens, pairs, index + 2, pairs.get(index + 1));
+                    const moduleId = getStaticModuleId(tokens, args[0]);
+                    const alias = tokens[index - 2];
+                    if (moduleId !== null && tokens[index - 1]?.value === '=' && alias?.type === 'identifier') {
+                        imports.set(alias.value, moduleId);
+                    }
+                }
+            }
+
+            if (exportsName) {
+                for (let index = 0; index < tokens.length; index += 1) {
+                    if (tokens[index].value !== exportsName) continue;
+                    const member = getMemberAt(tokens, index);
+                    if (
+                        member &&
+                        tokens[member.end]?.value === '=' &&
+                        tokens[member.end + 1]?.type === 'identifier'
+                    ) {
+                        exports.set(member.property, tokens[member.end + 1].value);
+                    }
+                }
+            }
+
+            if (requireName && exportsName) {
+                for (const call of getMemberCalls(parsed)) {
+                    if (call.object !== requireName || call.property !== 'd' || call.args.length < 2) continue;
+                    const firstArg = call.args[0];
+                    if (firstArg[1] - firstArg[0] !== 1 || tokens[firstArg[0]]?.value !== exportsName) continue;
+                    for (const [start, end] of call.args.slice(1)) {
+                        for (const [key, local] of getObjectExportMappings(parsed, start, end)) {
+                            exports.set(key, local);
+                        }
+                    }
+                }
+            }
+
+            return {
+                id,
+                source,
+                parsed,
+                imports,
+                exports,
+                functions: getFactoryFunctions(parsed),
+                anchorsPresent: tokens.some(token => token.type === 'string' && token.value === 'chatgpt-conversation-page') &&
+                    tokens.some(token => token.type === 'string' && token.value.includes('/conversations/{conversation_id}/messages')),
+            };
+        }
+
+        function getFunctionForLocal(factory, local) {
+            const functions = factory.functions.get(local) || [];
+            return functions.length === 1 ? functions[0] : null;
+        }
+
+        function getLoaderCandidates(factory) {
+            if (!factory.anchorsPresent) return [];
+            const candidates = [];
+            const {tokens, pairs} = factory.parsed;
+
+            for (const [exportName, local] of factory.exports) {
+                const fn = getFunctionForLocal(factory, local);
+                if (!fn || fn.params.length < 3) continue;
+                const hasPageKey = tokens.slice(fn.start, fn.end).some(token =>
+                    token.type === 'string' && token.value === 'chatgpt-conversation-page'
+                );
+                const hasEndpoint = tokens.slice(fn.start, fn.end).some(token =>
+                    token.type === 'string' && token.value.includes('/conversations/{conversation_id}/messages')
+                );
+                if (!hasPageKey || !hasEndpoint) continue;
+
+                for (const call of getMemberCalls(factory.parsed, fn.start, fn.end)) {
+                    if (
+                        call.object !== fn.params[0] ||
+                        call.property !== 'get' ||
+                        call.args.length < 2 ||
+                        call.args[1][1] - call.args[1][0] !== 1 ||
+                        tokens[call.args[1][0]]?.value !== fn.params[1]
+                    ) continue;
+                    const selector = readStaticMember(tokens, pairs, ...call.args[0]);
+                    const paginationId = selector && factory.imports.get(selector.object);
+                    if (!selector || paginationId === undefined) continue;
+                    candidates.push({
+                        loaderId: factory.id,
+                        loaderExport: exportName,
+                        paginationId,
+                        paginationExport: selector.property,
+                    });
+                }
+            }
+            return candidates;
+        }
+
+        function findHookInitializer(factory, fn, local) {
+            const {tokens, pairs} = factory.parsed;
+            for (const call of getMemberCalls(factory.parsed, fn.start, fn.end)) {
+                if (
+                    !factory.imports.has(call.object) ||
+                    getAssignedIdentifier(tokens, pairs, call.start) !== local ||
+                    !call.args.length
+                ) continue;
+                const selector = readStaticMember(tokens, pairs, ...call.args[0]);
+                const selectorId = selector && factory.imports.get(selector.object);
+                if (selector && selectorId !== undefined) {
+                    return {moduleId: selectorId, exportName: selector.property};
+                }
+            }
+            return null;
+        }
+
+        function usesPaginationSelector(factory, fn, paginationId, paginationExport) {
+            const {tokens, pairs} = factory.parsed;
+            return getMemberCalls(factory.parsed, fn.start, fn.end).some(call => {
+                if (!factory.imports.has(call.object) || !call.args.length) return false;
+                const selector = readStaticMember(tokens, pairs, ...call.args[0]);
+                return selector?.property === paginationExport &&
+                    factory.imports.get(selector.object) === paginationId &&
+                    Boolean(getAssignedIdentifier(tokens, pairs, call.start));
+            });
+        }
+
+        function findComponentGraphs(factories, loader) {
+            const graphs = [];
+            for (const factory of factories) {
+                if (!factory.source.includes(loader.loaderId)) continue;
+                for (const [historyExport, local] of factory.exports) {
+                    const fn = getFunctionForLocal(factory, local);
+                    if (!fn) continue;
+                    const {tokens, pairs} = factory.parsed;
+                    for (const call of getMemberCalls(factory.parsed, fn.start, fn.end)) {
+                        if (
+                            factory.imports.get(call.object) !== loader.loaderId ||
+                            call.property !== loader.loaderExport ||
+                            call.args.length < 3
+                        ) continue;
+
+                        const scopeLocal = call.args[0][1] - call.args[0][0] === 1
+                            ? tokens[call.args[0][0]]?.value
+                            : null;
+                        const keyLocal = call.args[1][1] - call.args[1][0] === 1
+                            ? tokens[call.args[1][0]]?.value
+                            : null;
+                        const flush = readStaticMember(tokens, pairs, ...call.args[2]);
+                        const scope = scopeLocal && findHookInitializer(factory, fn, scopeLocal);
+                        const state = keyLocal && findHookInitializer(factory, fn, keyLocal);
+                        const reactDomId = flush && factory.imports.get(flush.object);
+                        if (
+                            !scope ||
+                            !state ||
+                            !flush ||
+                            reactDomId === undefined ||
+                            !usesPaginationSelector(factory, fn, loader.paginationId, loader.paginationExport)
+                        ) continue;
+
+                        graphs.push({
+                            scopeId: scope.moduleId,
+                            scopeExport: scope.exportName,
+                            stateId: state.moduleId,
+                            stateExport: state.exportName,
+                            paginationId: loader.paginationId,
+                            paginationExport: loader.paginationExport,
+                            loaderId: loader.loaderId,
+                            loaderExport: loader.loaderExport,
+                            reactDomId,
+                            reactDomExport: flush.property,
+                            historyId: factory.id,
+                            historyExport,
+                        });
+                    }
+                }
+            }
+            return graphs;
+        }
+
+        function captureModuleState(requireFunction) {
+            const moduleMap = requireFunction.m;
+            let ids;
+            try {
+                ids = Object.keys(moduleMap).sort();
+            } catch (_error) {
+                fail('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT module table could not be inspected safely.');
+            }
+            if (ids.length > NATIVE_DISCOVERY_MAX_FACTORIES) {
+                fail('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT module table exceeds the safe discovery limit.');
+            }
+            return {ids, factories: ids.map(id => moduleMap[id])};
+        }
+
+        function sameModuleState(left, right) {
+            return left.ids.length === right.ids.length &&
+                left.ids.every((id, index) => id === right.ids[index] && left.factories[index] === right.factories[index]);
+        }
+
+        function discoverNativeGraph(requireFunction, state) {
+            const factories = [];
+            const loaders = [];
+            let sourceBytes = 0;
+            let unsupportedAnchoredSource = false;
+
+            for (let index = 0; index < state.ids.length; index += 1) {
+                const factoryFunction = state.factories[index];
+                if (typeof factoryFunction !== 'function') continue;
+                let source;
+                try {
+                    source = Function.prototype.toString.call(factoryFunction);
+                } catch (_error) {
+                    continue;
+                }
+                if (typeof source !== 'string') continue;
+                sourceBytes += source.length;
+                if (source.length > 2_000_000 || sourceBytes > NATIVE_DISCOVERY_MAX_SOURCE_BYTES) {
+                    fail('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT module source exceeds the safe discovery limit.');
+                }
+                if (
+                    !source.includes('chatgpt-conversation-page') ||
+                    !source.includes('/conversations/{conversation_id}/messages')
+                ) continue;
+
+                let parsed;
+                try {
+                    parsed = parseFactorySource(state.ids[index], source);
+                } catch (_error) {
+                    unsupportedAnchoredSource = true;
+                    continue;
+                }
+                if (!parsed.anchorsPresent) continue;
+                const candidates = getLoaderCandidates(parsed);
+                if (!candidates.length) unsupportedAnchoredSource = true;
+                loaders.push(...candidates);
+                factories.push(parsed);
+            }
+
+            const connected = [];
+            if (loaders.length) {
+                const loaderIds = new Set(loaders.map(loader => loader.loaderId));
+                for (let index = 0; index < state.ids.length; index += 1) {
+                    const factoryFunction = state.factories[index];
+                    if (typeof factoryFunction !== 'function') continue;
+                    let source;
+                    try {
+                        source = Function.prototype.toString.call(factoryFunction);
+                    } catch (_error) {
+                        continue;
+                    }
+                    if (typeof source !== 'string' || ![...loaderIds].some(id => source.includes(id))) continue;
+                    if (factories.some(factory => factory.id === state.ids[index])) continue;
+                    sourceBytes += source.length;
+                    if (source.length > 2_000_000 || sourceBytes > NATIVE_DISCOVERY_MAX_SOURCE_BYTES * 2) {
+                        fail('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT module source exceeds the safe discovery limit.');
+                    }
+                    try {
+                        factories.push(parseFactorySource(state.ids[index], source));
+                    } catch (_error) {
+                        unsupportedAnchoredSource = true;
+                    }
+                }
+
+                for (const loader of loaders) {
+                    connected.push(...findComponentGraphs(factories, loader));
+                }
+            }
+
+            const unique = new Map();
+            for (const graph of connected) unique.set(JSON.stringify(graph), graph);
+            if (unique.size > 1) {
+                fail('NATIVE_MODULE_DISCOVERY_AMBIGUOUS', 'More than one source-linked ChatGPT history module graph was found.');
+            }
+            if (unique.size === 1) return unique.values().next().value;
+            if (unsupportedAnchoredSource || loaders.length) {
+                fail('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT history module source could not be linked safely.');
+            }
+            fail('NATIVE_MODULE_DISCOVERY_NOT_FOUND', 'The current ChatGPT history module graph was not found.');
+        }
+
+        function getNativeGraph(requireFunction) {
+            const state = captureModuleState(requireFunction);
+            const cached = NATIVE_DISCOVERY_CACHE.get(requireFunction);
+            if (cached && sameModuleState(cached.state, state)) {
+                if (cached.error) throw new NativeAdapterError(cached.error.code, cached.error.message);
+                return cached.graph;
+            }
+
+            try {
+                const graph = discoverNativeGraph(requireFunction, state);
+                NATIVE_DISCOVERY_CACHE.set(requireFunction, {state, graph, error: null});
+                return graph;
+            } catch (error) {
+                const nativeError = error instanceof NativeAdapterError
+                    ? error
+                    : new NativeAdapterError('NATIVE_MODULE_SOURCE_UNSUPPORTED', 'The current ChatGPT history module source could not be read safely.');
+                NATIVE_DISCOVERY_CACHE.set(requireFunction, {state, graph: null, error: nativeError});
+                throw nativeError;
+            }
         }
 
         function isObject(value) {
@@ -767,38 +1429,35 @@
         }
 
         function requireSupportedModules(requireFunction) {
-            const moduleMap = requireFunction.m;
-            const requiredIds = Object.values(NATIVE_MODULE_CONTRACT).map(({id}) => id);
-            for (const id of requiredIds) {
-                if (!Object.prototype.hasOwnProperty.call(moduleMap, id)) {
-                    fail('SUPPORTED_MODULES_UNAVAILABLE', 'The current ChatGPT bundle does not contain the supported navigation modules.');
-                }
-            }
-
-            let exportsByName;
+            const graph = getNativeGraph(requireFunction);
+            const selected = [
+                ['scope', graph.scopeId, graph.scopeExport],
+                ['conversationState', graph.stateId, graph.stateExport],
+                ['pagination', graph.paginationId, graph.paginationExport],
+                ['loader', graph.loaderId, graph.loaderExport],
+                ['reactDom', graph.reactDomId, graph.reactDomExport],
+                ['historySource', graph.historyId, graph.historyExport],
+            ];
+            const exportsByName = {};
             try {
-                exportsByName = Object.fromEntries(
-                    Object.entries(NATIVE_MODULE_CONTRACT).map(([name, contract]) => [
-                        name,
-                        requireFunction(contract.id),
-                    ])
-                );
-            } catch (_error) {
-                fail('SUPPORTED_MODULES_UNAVAILABLE', 'The current ChatGPT navigation modules could not be loaded.');
+                for (const [name, id, exportName] of selected) {
+                    if (!Object.prototype.hasOwnProperty.call(requireFunction.m, id)) {
+                        fail('NATIVE_MODULE_EXPORT_SHAPE_UNKNOWN', 'A source-linked ChatGPT navigation module is missing.');
+                    }
+                    const namespace = requireFunction(id);
+                    exportsByName[name] = namespace?.[exportName];
+                }
+            } catch (error) {
+                if (error instanceof NativeAdapterError) throw error;
+                fail('NATIVE_MODULE_EXPORT_SHAPE_UNKNOWN', 'A source-linked ChatGPT navigation module could not be loaded.');
             }
 
-            const scopeToken = exportsByName.scope?.[NATIVE_MODULE_CONTRACT.scope.export];
-            const conversationStateSelector = exportsByName.conversationState?.[
-                NATIVE_MODULE_CONTRACT.conversationState.export
-            ];
-            const paginationSelector = exportsByName.pagination?.[
-                NATIVE_MODULE_CONTRACT.pagination.export
-            ];
-            const loadPrevious = exportsByName.loader?.[NATIVE_MODULE_CONTRACT.loader.export];
-            const flushSync = exportsByName.reactDom?.[NATIVE_MODULE_CONTRACT.reactDom.export];
-            const historyComponent = exportsByName.historySource?.[
-                NATIVE_MODULE_CONTRACT.historySource.export
-            ];
+            const scopeToken = exportsByName.scope;
+            const conversationStateSelector = exportsByName.conversationState;
+            const paginationSelector = exportsByName.pagination;
+            const loadPrevious = exportsByName.loader;
+            const flushSync = exportsByName.reactDom;
+            const historyComponent = exportsByName.historySource;
 
             if (
                 !isObject(scopeToken) ||
@@ -810,7 +1469,7 @@
                 typeof flushSync !== 'function' ||
                 typeof historyComponent !== 'function'
             ) {
-                fail('SUPPORTED_MODULE_SHAPE_UNKNOWN', 'The current ChatGPT navigation module exports have changed.');
+                fail('NATIVE_MODULE_EXPORT_SHAPE_UNKNOWN', 'The current ChatGPT navigation module exports have changed.');
             }
 
             return {
@@ -1919,8 +2578,9 @@
         'CURRENT_ROUTE_UNAVAILABLE',
         'CURRENT_RUNTIME_UNAVAILABLE',
         'SUPPORTED_RUNTIME_NOT_FOUND',
-        'SUPPORTED_MODULES_UNAVAILABLE',
-        'SUPPORTED_MODULE_SHAPE_UNKNOWN',
+        'NATIVE_MODULE_DISCOVERY_NOT_FOUND',
+        'NATIVE_MODULE_SOURCE_UNSUPPORTED',
+        'NATIVE_MODULE_EXPORT_SHAPE_UNKNOWN',
         'REACT_FIBERS_UNAVAILABLE',
         'REACT_FIBER_LIMIT_EXCEEDED',
         'ACTIVE_CONVERSATION_NOT_FOUND',
@@ -2962,6 +3622,7 @@
 
     function initializeReplyOutlinePinnedPreference() {
         replyOutlinePinned = readReplyOutlinePinnedPreference();
+        replyOutlineOpen = replyOutlinePinned;
         updateReplyOutlinePinButton();
     }
 
@@ -7732,7 +8393,11 @@
         if (context.reply.matches?.(selector)) matches.unshift(context.reply);
 
         return matches
-            .filter(element => element.isConnected && context.reply.contains(element))
+            .filter(element =>
+                element.isConnected &&
+                context.reply.contains(element) &&
+                !element.closest('div.Box-qIMv6G')
+            )
             .map(element => ({
                 element,
                 level: Number(element.tagName.slice(1)),
@@ -8616,7 +9281,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.4.9)');
+        console.info('[Conversation Navigator] Started (0.4.10)');
         initializeReplyOutlinePinnedPreference();
         currentChatIdentity = getChatIdentity();
         ensureUI();

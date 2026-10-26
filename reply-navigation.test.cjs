@@ -111,6 +111,75 @@ test('mixed reply heading variants keep DOM order and levels within the current 
     );
 });
 
+test('reply heading discovery excludes headings inside the exact Box container', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const reply = makeReplyHeadingRoot([
+        {tagName: 'H2', className: 'Title-HRvkwB', text: 'Before Box'},
+        {
+            tagName: 'DIV',
+            className: 'Grid-CGRmTR',
+            children: [
+                {
+                    tagName: 'DIV',
+                    className: 'Box-qIMv6G',
+                    children: [
+                        {tagName: 'H1', className: 'Title-HRvkwB', text: 'Direct Box heading'},
+                        {
+                            tagName: 'DIV',
+                            className: 'Box-qIMv6G',
+                            children: [
+                                {tagName: 'H6', className: 'Heading-Ro3lZr', text: 'Nested Box heading'}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            tagName: 'DIV',
+            className: 'Box-qIMv6G',
+            children: [
+                {tagName: 'H3', className: 'Title-HRvkwB', text: 'Box without grid'}
+            ]
+        },
+        {
+            tagName: 'DIV',
+            className: 'Box-OtherClass',
+            children: [
+                {tagName: 'H4', className: 'Heading-Ro3lZr', text: 'Other Box class'}
+            ]
+        },
+        {
+            tagName: 'SECTION',
+            className: 'Box-qIMv6G',
+            children: [
+                {tagName: 'H5', className: 'Title-HRvkwB', text: 'Non-div Box class'}
+            ]
+        },
+        {tagName: 'H2', className: 'Heading-Ro3lZr', text: 'After Box'}
+    ]);
+    const conversation = makeTestElement();
+    const otherReply = makeReplyHeadingRoot([
+        {tagName: 'H1', className: 'Title-HRvkwB', text: 'Other reply'}
+    ]);
+    conversation.appendChild(reply);
+    conversation.appendChild(otherReply);
+
+    assert.deepEqual(
+        summarizeReplyHeadingEntries(runtime, reply),
+        [
+            {text: 'Before Box', level: 2},
+            {text: 'Other Box class', level: 4},
+            {text: 'Non-div Box class', level: 5},
+            {text: 'After Box', level: 2}
+        ]
+    );
+    assert.deepEqual(
+        summarizeReplyHeadingEntries(runtime, otherReply),
+        [{text: 'Other reply', level: 1}]
+    );
+});
+
 test('heading navigation advances from the visible top edge and reverses to the prior heading', () => {
     const headings = [100, 300, 500].map(top => ({top}));
 
@@ -470,6 +539,7 @@ test('outline pin preference restores only the exact saved true value for new ru
     restoredRuntime.install({ui: restoredUI});
 
     assert.equal(restoredRuntime.state().pinned, true);
+    assert.equal(restoredRuntime.state().open, true);
     assert.equal(restoredUI.outlinePinButton.getAttribute('aria-pressed'), 'true');
     assert.equal(restoredRuntime.storageListenerCount(), 0);
 
@@ -478,6 +548,7 @@ test('outline pin preference restores only the exact saved true value for new ru
     const restoredOffUI = makeNavigationTestUI();
     restoredOffRuntime.install({ui: restoredOffUI});
     assert.equal(restoredOffRuntime.state().pinned, false);
+    assert.equal(restoredOffRuntime.state().open, false);
     assert.equal(restoredOffUI.outlinePinButton.getAttribute('aria-pressed'), 'false');
 
     storage.setItem(REPLY_OUTLINE_PINNED_STORAGE_KEY, 'True');
@@ -485,6 +556,58 @@ test('outline pin preference restores only the exact saved true value for new ru
     const invalidValueUI = makeNavigationTestUI();
     invalidValueRuntime.install({ui: invalidValueUI});
     assert.equal(invalidValueRuntime.state().pinned, false);
+    assert.equal(invalidValueRuntime.state().open, false);
+});
+
+test('unset or unavailable pin preference starts with the outline closed', () => {
+    for (const localStorage of [
+        undefined,
+        () => { throw new Error('blocked localStorage'); }
+    ]) {
+        const runtime = loadReplyNavigationRuntime({localStorage});
+        runtime.install({ui: makeNavigationTestUI()});
+
+        assert.equal(runtime.state().pinned, false);
+        assert.equal(runtime.state().open, false);
+    }
+});
+
+test('saved pin opens before UI creation and shows the outline when a reply becomes ready', () => {
+    const storage = makeTestStorage([
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+    ]);
+    const runtime = loadReplyNavigationRuntime({localStorage: storage});
+    const ui = makeNavigationTestUI();
+    ui.root.hidden = true;
+    ui.outline.hidden = true;
+    ui.outlineToggle.hidden = true;
+    runtime.install({ui});
+
+    assert.equal(runtime.preUIPreference().pinned, true);
+    assert.equal(runtime.preUIPreference().open, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().rootHidden, true);
+
+    const reply = makeReplyHeadingRoot([
+        {tagName: 'H2', className: 'Title-HRvkwB', text: 'Chapter'}
+    ]);
+    const currentReplyContext = {
+        identity: 'reply-1',
+        chatIdentity: 'chat-1',
+        reply,
+        rect: {left: 300, right: 700, top: 100, bottom: 800, width: 400},
+        visibleTop: 200,
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    runtime.setCurrentReplyContext(currentReplyContext);
+    runtime.updateReplyNavigationControls(currentReplyContext, []);
+
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().rootHidden, false);
+    assert.equal(runtime.state().outlineHidden, false);
 });
 
 test('pin preference persists for new runtimes while open tabs ignore storage events', () => {
@@ -525,6 +648,7 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
     const restoredPinnedUI = makeNavigationTestUI();
     restoredPinnedRuntime.install({ui: restoredPinnedUI});
     assert.equal(restoredPinnedRuntime.state().pinned, true);
+    assert.equal(restoredPinnedRuntime.state().open, true);
 
     restoredPinnedRuntime.click(restoredPinnedUI.outlinePinButton);
     assert.equal(storage.getItem(REPLY_OUTLINE_PINNED_STORAGE_KEY), 'false');
@@ -541,6 +665,7 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
     const restoredUnpinnedUI = makeNavigationTestUI();
     restoredUnpinnedRuntime.install({ui: restoredUnpinnedUI});
     assert.equal(restoredUnpinnedRuntime.state().pinned, false);
+    assert.equal(restoredUnpinnedRuntime.state().open, false);
 });
 
 test('pin remains usable when localStorage is unavailable or throws', () => {
@@ -1255,15 +1380,19 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
         const testState = globalThis.__replyTestState;
         const renderReplyOutlineForTest = renderReplyOutline;
         globalThis.__replyNavigationTest = {
-            install({ui, headerToolbar = null, outlineOpen = false,
+            install({ui, headerToolbar = null, outlineOpen,
                 currentReplyContext = null, turns: testTurns = [],
                 sidebarGeometry = null}) {
                 initializeReplyOutlinePinnedPreference();
+                testState.preUIPreference = {
+                    pinned: replyOutlinePinned,
+                    open: replyOutlineOpen
+                };
                 replyNavigationUI = ui;
                 replyTopButton = {hidden: false, dataset: {}};
                 replyOutlineHeaderToolbar = headerToolbar;
                 replyOutlineHeaderLookupAttempted = true;
-                replyOutlineOpen = outlineOpen;
+                if (typeof outlineOpen === 'boolean') replyOutlineOpen = outlineOpen;
                 replyNavigationContext = currentReplyContext;
                 turns = testTurns;
                 currentChatIdentity = 'chat-1';
@@ -1329,6 +1458,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             setReplyOutlineOpen,
             click(target) { return document.dispatchClick(target); },
             initializeSettings: initializeReplyOutlinePinnedPreference,
+            preUIPreference() { return testState.preUIPreference; },
             dispatchStorage(event) { return window.dispatchStorage(event); },
             storageListenerCount() { return window.storageListenerCount(); },
             directJump(identity, options = {replyTop: false}) {
@@ -1444,15 +1574,29 @@ function makeReplyHeadingRoot(specs) {
         return matches;
     };
 
-    for (const spec of specs) {
-        const heading = makeTestElement({
+    const makeNode = spec => {
+        const element = makeTestElement({
             rect: {left: 300, right: 700, top: 100, bottom: 124, width: 400, height: 24}
         });
-        heading.tagName = spec.tagName;
-        heading.className = spec.className;
-        heading.textContent = spec.text;
-        reply.appendChild(heading);
-    }
+        element.tagName = spec.tagName;
+        element.className = spec.className;
+        element.textContent = spec.text || '';
+        element.matches = selector =>
+            matchesTestHeadingSelector(element, selector) ||
+            matchesTestBoxContainerSelector(element, selector);
+        element.closest = selector => {
+            for (let current = element; current; current = current.parentElement) {
+                if (current.matches?.(selector)) return current;
+            }
+            return null;
+        };
+        for (const child of spec.children || []) {
+            element.appendChild(makeNode(child));
+        }
+        return element;
+    };
+
+    for (const spec of specs) reply.appendChild(makeNode(spec));
     return reply;
 }
 
@@ -1469,6 +1613,12 @@ function matchesTestHeadingSelector(element, selector) {
         return match && element.tagName?.toLowerCase() === match[1].toLowerCase() &&
             className.split(/\s+/).includes(match[2]);
     });
+}
+
+function matchesTestBoxContainerSelector(element, selector) {
+    return selector === 'div.Box-qIMv6G' &&
+        element.tagName?.toLowerCase() === 'div' &&
+        String(element.className || '').split(/\s+/).includes('Box-qIMv6G');
 }
 
 function configureOutlineSearch(root, {named = [], flex = [], buttons = []} = {}) {
