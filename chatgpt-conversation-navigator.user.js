@@ -4802,7 +4802,7 @@
 
         if (barList) barList.replaceChildren();
         if (rail) rail.style.display = 'none';
-        clearReplyNavigation();
+        resetReplyNavigationForConversationChange();
         railDensityCacheKey = '';
         railLayoutSignature = '';
 
@@ -4840,7 +4840,7 @@
             lastLocatorDiagnostic = '';
             lastHistoryCapabilityDiagnostic = '';
             lastHistoryControlDiagnostic = '';
-            clearReplyNavigation();
+            resetReplyNavigationForConversationChange();
             clearNewConversationSubmission();
             startNativeLocator(identity);
             startNativeAdapter(identity);
@@ -8629,6 +8629,12 @@
         }
         syncReplyOutlineToggleBinding();
         if (replyOutlineOpen && replyNavigationUI) positionReplyOutline();
+    }
+
+    function resetReplyNavigationForConversationChange() {
+        clearReplyNavigation();
+        replyOutlineOpen = replyOutlinePinned;
+        updateReplyOutlineToggleLabel();
     }
 
     function getAssistantReplyNavigationEntries() {

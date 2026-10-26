@@ -668,6 +668,132 @@ test('pin preference persists for new runtimes while open tabs ignore storage ev
     assert.equal(restoredUnpinnedRuntime.state().open, false);
 });
 
+test('pinned outline reopens on an actual conversation route change after clearing stale state', () => {
+    const storage = makeTestStorage([
+        [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+    ]);
+    const runtime = loadReplyNavigationRuntime({localStorage: storage});
+    const ui = makeNavigationTestUI();
+    const headerToolbar = makeTestParent();
+    headerToolbar.insertBefore(makeTestElement(), null);
+    const oldContext = {
+        identity: 'old-reply',
+        chatIdentity: 'conversation:old',
+        reply: makeReplyHeadingRoot([]),
+        visibleTop: 200,
+        rect: {left: 300, right: 700, top: 100, bottom: 800, width: 400},
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    runtime.install({ui, headerToolbar, currentReplyContext: oldContext});
+    runtime.setCurrentChatIdentity('conversation:old');
+    runtime.setPathname('/c/old');
+    runtime.stubRouteNativeStartup();
+    runtime.renderOutline(oldContext, [
+        {element: makeTestElement(), text: 'Old chapter', level: 1}
+    ]);
+    runtime.setReplyOutlineOpen(false);
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, false);
+    assert.equal(ui.list.children.length, 1);
+
+    // The current tab retains its in-memory pin even if shared storage changes.
+    storage.setItem(REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false');
+    runtime.handleRouteChange();
+    assert.equal(runtime.state().open, false, 'same-identity updates preserve manual collapse');
+    assert.equal(ui.list.children.length, 1);
+
+    runtime.setPathname('/c/new');
+    runtime.handleRouteChange();
+    assert.equal(runtime.currentChatIdentity(), 'conversation:new');
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().rootHidden, true);
+    assert.equal(runtime.replyNavigationContext(), null);
+    assert.equal(ui.list.children.length, 0);
+    assert.equal(ui.outlineEntries.length, 0);
+    assert.equal(ui.outlineChatIdentity, null);
+    assert.equal(ui.outlineIdentity, null);
+    assert.equal(ui.outlineReply, null);
+
+    const newContext = {
+        ...oldContext,
+        identity: 'new-reply',
+        chatIdentity: 'conversation:new',
+        reply: makeReplyHeadingRoot([])
+    };
+    runtime.setCurrentReplyContext(newContext);
+    runtime.updateReplyNavigationControls(newContext, []);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().rootHidden, false);
+    assert.equal(runtime.state().outlineHidden, false);
+});
+
+test('unpinned outline stays closed across a conversation route change', () => {
+    const runtime = loadReplyNavigationRuntime({
+        localStorage: makeTestStorage([
+            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'false']
+        ])
+    });
+    const ui = makeNavigationTestUI();
+    const oldContext = {
+        identity: 'old-reply',
+        chatIdentity: 'conversation:old',
+        reply: makeReplyHeadingRoot([]),
+        visibleTop: 200,
+        rect: {left: 300, right: 700, top: 100, bottom: 800, width: 400},
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    runtime.install({ui, currentReplyContext: oldContext});
+    runtime.setCurrentChatIdentity('conversation:old');
+    runtime.setPathname('/c/old');
+    runtime.stubRouteNativeStartup();
+
+    runtime.setPathname('/c/new');
+    runtime.handleRouteChange();
+    assert.equal(runtime.currentChatIdentity(), 'conversation:new');
+    assert.equal(runtime.state().pinned, false);
+    assert.equal(runtime.state().open, false);
+    assert.equal(runtime.state().rootHidden, true);
+
+    const newContext = {
+        ...oldContext,
+        identity: 'new-reply',
+        chatIdentity: 'conversation:new',
+        reply: makeReplyHeadingRoot([])
+    };
+    runtime.setCurrentReplyContext(newContext);
+    runtime.updateReplyNavigationControls(newContext, []);
+    assert.equal(runtime.state().rootHidden, false);
+    assert.equal(runtime.state().outlineHidden, true);
+});
+
+test('pinned outline is restored through pending new-conversation URL adoption', () => {
+    const runtime = loadReplyNavigationRuntime({
+        localStorage: makeTestStorage([
+            [REPLY_OUTLINE_PINNED_STORAGE_KEY, 'true']
+        ])
+    });
+    const ui = makeNavigationTestUI();
+    runtime.install({ui, outlineOpen: false});
+    runtime.setCurrentChatIdentity('route:/');
+    runtime.setPathname('/');
+    runtime.setNewConversationSubmissionPending(true);
+    runtime.stubRouteNativeStartup();
+
+    runtime.setPathname('/c/created');
+    runtime.handleRouteChange();
+
+    assert.equal(runtime.currentChatIdentity(), 'conversation:created');
+    assert.equal(runtime.state().pinned, true);
+    assert.equal(runtime.state().open, true);
+    assert.equal(runtime.state().rootHidden, true);
+    assert.equal(runtime.replyNavigationContext(), null);
+});
+
 test('pin remains usable when localStorage is unavailable or throws', () => {
     for (const localStorage of [
         undefined,
@@ -1349,6 +1475,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
     const window = {
         innerWidth: 1200,
         innerHeight: 800,
+        location: {pathname: '/'},
         addEventListener(type, listener) {
             const listeners = windowListeners.get(type) || [];
             listeners.push(listener);
@@ -1479,6 +1606,18 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
                 testState.currentReplyContext = context;
                 replyNavigationContext = context;
             },
+            setCurrentChatIdentity(identity) { currentChatIdentity = identity; },
+            currentChatIdentity() { return currentChatIdentity; },
+            setPathname(pathname) { window.location.pathname = pathname; },
+            setNewConversationSubmissionPending(value) {
+                newConversationSubmissionPending = Boolean(value);
+            },
+            stubRouteNativeStartup() {
+                startNativeLocator = () => {};
+                startNativeAdapter = () => {};
+            },
+            handleRouteChange,
+            replyNavigationContext() { return replyNavigationContext; },
             clearPendingAssistantNavigation() {
                 assistantReplyNavigationCursor = null;
             },
