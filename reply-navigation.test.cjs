@@ -1858,7 +1858,10 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
         __replyTestState: testState,
         document,
         window,
-        console
+        console,
+        // Projection scheduling is exercised with a clock in navigation-updates.test.cjs.
+        setTimeout() { return 1; },
+        clearTimeout() {}
     };
     vm.runInNewContext(
         `${source.slice(0, closureEnd)}${instrumentation}${source.slice(closureEnd)}`,

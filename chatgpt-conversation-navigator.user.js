@@ -20,6 +20,8 @@
     function createConversationIndex() {
         const entries = [];
         let aliases = new Map();
+        let aliasMembers = new Map();
+        const entryPositions = new Map();
         let authoritative = false;
         let branchKey = null;
         const suppressed = new Map();
@@ -49,10 +51,102 @@
 
         function rebuildAliases() {
             aliases = new Map();
-            for (const entry of entries) {
+            aliasMembers = new Map();
+            entryPositions.clear();
+            for (let index = 0; index < entries.length; index += 1) {
+                const entry = entries[index];
+                if (!entryPositions.has(entry)) {
+                    entryPositions.set(entry, index);
+                }
                 for (const alias of getAliases(entry)) {
+                    let members = aliasMembers.get(alias);
+                    if (!members) {
+                        members = new Set();
+                        aliasMembers.set(alias, members);
+                    }
+                    members.add(entry);
                     if (!aliases.has(alias)) aliases.set(alias, entry);
                 }
+            }
+        }
+
+        function findFirstAliasMember(alias) {
+            let first = null;
+            let firstPosition = Infinity;
+            for (const entry of aliasMembers.get(alias) || []) {
+                const position = entryPositions.get(entry);
+                if (position !== undefined && position < firstPosition) {
+                    first = entry;
+                    firstPosition = position;
+                }
+            }
+            return first;
+        }
+
+        function addAliasMember(alias, entry) {
+            let members = aliasMembers.get(alias);
+            if (!members) {
+                members = new Set();
+                aliasMembers.set(alias, members);
+            }
+            members.add(entry);
+            const current = aliases.get(alias);
+            if (
+                !current ||
+                entryPositions.get(entry) < entryPositions.get(current)
+            ) {
+                aliases.set(alias, entry);
+            }
+        }
+
+        function removeAliasMember(alias, entry) {
+            const members = aliasMembers.get(alias);
+            if (!members) return;
+            members.delete(entry);
+            if (members.size === 0) {
+                aliasMembers.delete(alias);
+                aliases.delete(alias);
+            } else if (aliases.get(alias) === entry) {
+                aliases.set(alias, findFirstAliasMember(alias));
+            }
+        }
+
+        function replaceEntryAt(index, nextEntry) {
+            const previous = entries[index];
+            if (previous === nextEntry) return;
+            const previousAliases = getAliases(previous);
+            const nextAliases = getAliases(nextEntry);
+            entries[index] = nextEntry;
+            entryPositions.delete(previous);
+            entryPositions.set(nextEntry, index);
+
+            for (const alias of previousAliases) {
+                const members = aliasMembers.get(alias);
+                if (nextAliases.has(alias)) {
+                    if (members) {
+                        members.delete(previous);
+                        members.add(nextEntry);
+                    }
+                    if (aliases.get(alias) === previous) {
+                        aliases.set(alias, nextEntry);
+                    }
+                } else {
+                    removeAliasMember(alias, previous);
+                }
+            }
+            for (const alias of nextAliases) {
+                if (!previousAliases.has(alias)) {
+                    addAliasMember(alias, nextEntry);
+                }
+            }
+        }
+
+        function appendEntry(entry) {
+            const index = entries.length;
+            entries.push(entry);
+            entryPositions.set(entry, index);
+            for (const alias of getAliases(entry)) {
+                addAliasMember(alias, entry);
             }
         }
 
@@ -112,7 +206,6 @@
         }
 
         function resolveEntry(record, options = {}) {
-            rebuildAliases();
             if (!record?.identity) return null;
             if (options.kind) {
                 for (const alias of getAliases(record)) {
@@ -153,29 +246,42 @@
 
         function upsertObserved(records) {
             const incoming = Array.isArray(records) ? records : [records];
-            rebuildAliases();
             const orderedObserved = [];
+            const orderedObservedPositions = new Map();
+            let observedRecordCount = 0;
 
             for (const item of incoming) {
                 if (!item?.identity) continue;
                 let match = findMatch(item);
                 if (match) {
                     const merged = mergeEntry(match, item, 'observed');
-                    const index = entries.indexOf(match);
-                    entries[index] = merged;
-                    orderedObserved.push(merged);
-                    rebuildAliases();
+                    const index = entryPositions.get(match);
+                    replaceEntryAt(index, merged);
+                    const observedPosition = orderedObservedPositions.get(match);
+                    if (observedPosition === undefined) {
+                        orderedObservedPositions.set(
+                            merged,
+                            orderedObserved.length
+                        );
+                        orderedObserved.push(merged);
+                    } else {
+                        orderedObserved[observedPosition] = merged;
+                        orderedObservedPositions.delete(match);
+                        orderedObservedPositions.set(merged, observedPosition);
+                    }
+                    observedRecordCount += 1;
                     continue;
                 }
                 if (authoritative && isSuppressed(item)) continue;
 
                 const created = mergeEntry({}, item, 'observed');
-                entries.push(created);
+                appendEntry(created);
+                orderedObservedPositions.set(created, orderedObserved.length);
                 orderedObserved.push(created);
-                rebuildAliases();
+                observedRecordCount += 1;
             }
 
-            if (!authoritative && orderedObserved.length > 1) {
+            if (!authoritative && observedRecordCount > 1) {
                 const observedSet = new Set(orderedObserved);
                 const unobserved = entries.filter(entry => !observedSet.has(entry));
                 replaceEntries([...orderedObserved, ...unobserved]);
@@ -191,12 +297,7 @@
             const nextBranchKey = snapshot?.branchKey ?? null;
             const branchChanged = branchKey !== null &&
                 nextBranchKey !== null && nextBranchKey !== branchKey;
-            const nextAliases = new Map();
-            for (const entry of entries) {
-                for (const alias of getAliases(entry)) {
-                    if (!nextAliases.has(alias)) nextAliases.set(alias, entry);
-                }
-            }
+            const nextAliases = aliases;
 
             const incomingSuppressed = next.some(isSuppressed);
             if (incomingSuppressed && !branchChanged) {
@@ -1640,7 +1741,7 @@
         }
 
         function findAppScopeBinding({fibers, chatId, historyComponent, scopeToken}) {
-            const bindings = new Set();
+            const bindings = new Map();
             for (const fiber of fibers) {
                 if (
                     (fiber?.type !== historyComponent && fiber?.elementType !== historyComponent) ||
@@ -1650,18 +1751,18 @@
                 }
 
                 const wrapper = getCachedScopeWrapper(fiber, scopeToken);
-                if (wrapper) bindings.add(wrapper);
+                if (wrapper && !bindings.has(wrapper)) bindings.set(wrapper, fiber);
             }
 
             if (bindings.size === 0) return null;
             if (bindings.size > 1) {
-                const [first, ...rest] = bindings;
+                const [first, ...rest] = bindings.keys();
                 if (rest.some(binding => binding.node !== first.node || binding.chain !== first.chain)) {
                     fail('AMBIGUOUS_APP_SCOPE_BINDING', 'More than one native AppScope binding matched this conversation.');
                 }
-                return first;
             }
-            return bindings.values().next().value;
+            const [scope, fiber] = bindings.entries().next().value;
+            return {scope, fiber};
         }
 
         function getConversationStateKey({scope, chatId, modules}) {
@@ -1981,15 +2082,16 @@
                     fail('STALE_NATIVE_ADAPTER', 'The active ChatGPT conversation changed during page loading.');
                 }
                 const {tree, target} = resolveNativeTarget(documentObject, requestedChatId);
-                const scope = findAppScopeBinding({
+                const binding = findAppScopeBinding({
                     fibers: tree.fibers,
                     chatId: requestedChatId,
                     historyComponent: modules.historyComponent,
                     scopeToken: modules.scopeToken,
                 });
-                if (!scope) {
+                if (!binding) {
                     fail('APP_SCOPE_BINDING_UNAVAILABLE', 'The native AppScope binding for this conversation is unavailable.');
                 }
+                const {scope, fiber: scopeFiber} = binding;
                 const conversationStateKey = getConversationStateKey({
                     scope,
                     chatId: requestedChatId,
@@ -2004,8 +2106,10 @@
                 const pagination = normalizeNativePagination(rawPagination);
 
                 return {
+                    root: tree.root,
                     target,
                     scope,
+                    scopeFiber,
                     conversationStateKey,
                     rawPagination,
                     pagination
@@ -2028,26 +2132,49 @@
                 return timer.bind(windowObject || globalThis);
             }
 
-            async function waitForPaginationIdle(scope, conversationStateKey, baseline) {
+            async function waitForPaginationIdle(initialState, baseline) {
                 const setTimer = getCurrentTimer();
                 const startedAt = Date.now();
+                const {scope, conversationStateKey} = initialState;
+                let current = initialState;
                 while (true) {
                     assertActive();
-                    const current = resolveCurrentState();
-                    if (current.scope !== scope || current.conversationStateKey !== conversationStateKey) {
+                    if (getRouteConversationId(windowObject) !== requestedChatId) {
                         fail('STALE_NATIVE_ADAPTER', 'The active ChatGPT conversation changed during page loading.');
                     }
 
-                    const pagination = current.pagination;
-                    const entriesAdvanced = current.target.props.entries.length > baseline.entryCount;
-                    const cursorAdvanced = pagination.cursor !== baseline.cursor;
-                    const completionChanged = pagination.complete !== baseline.complete;
-                    const loadFailed = pagination.hasError && baseline.hasError !== true;
-                    const progressed = entriesAdvanced || cursorAdvanced || completionChanged || loadFailed;
-
+                    /* Reuse a verified binding only within this page request. */
+                    if (
+                        getCurrentRoot(current.target.fiber) !== current.root ||
+                        getCurrentRoot(current.scopeFiber) !== current.root ||
+                        current.target.fiber.memoizedProps?.conversationId !== requestedChatId ||
+                        getCachedScopeWrapper(current.scopeFiber, modules.scopeToken) !== scope
+                    ) {
+                        current = resolveCurrentState();
+                    }
+                    const currentKey = getConversationStateKey({scope: current.scope,
+                        chatId: requestedChatId, modules});
+                    if (current.scope !== scope || currentKey !== conversationStateKey) {
+                        fail('STALE_NATIVE_ADAPTER', 'The active ChatGPT conversation changed during page loading.');
+                    }
+                    let pagination = normalizeNativePagination(getRawPagination(
+                        scope, modules.paginationSelector, conversationStateKey
+                    ));
                     if (!pagination.isLoading) {
-                        if (progressed) return;
-                        fail('NATIVE_PAGE_NO_PROGRESS', 'ChatGPT finished the page request without advancing its conversation history.');
+                        /* Recheck uniqueness across all roots before accepting progress. */
+                        current = resolveCurrentState();
+                        if (current.scope !== scope || current.conversationStateKey !== conversationStateKey) {
+                            fail('STALE_NATIVE_ADAPTER', 'The active ChatGPT conversation changed during page loading.');
+                        }
+                        pagination = current.pagination;
+                        if (!pagination.isLoading) {
+                            const entriesAdvanced = current.target.props.entries.length > baseline.entryCount;
+                            const cursorAdvanced = pagination.cursor !== baseline.cursor;
+                            const completionChanged = pagination.complete !== baseline.complete;
+                            const loadFailed = pagination.hasError && baseline.hasError !== true;
+                            if (entriesAdvanced || cursorAdvanced || completionChanged || loadFailed) return;
+                            fail('NATIVE_PAGE_NO_PROGRESS', 'ChatGPT finished the page request without advancing its conversation history.');
+                        }
                     }
                     if (Date.now() - startedAt >= PAGE_LOAD_WAIT_MS) {
                         fail('NATIVE_PAGE_LOAD_TIMEOUT', 'ChatGPT did not finish loading the previous page in time.');
@@ -2057,13 +2184,14 @@
             }
 
             async function performLoadPreviousPage() {
+                const initialState = resolveCurrentState();
                 const {
                     target,
                     scope,
                     conversationStateKey,
                     rawPagination,
                     pagination
-                } = resolveCurrentState();
+                } = initialState;
                 if (pagination.complete) {
                     return readSnapshot();
                 }
@@ -2088,7 +2216,7 @@
                 };
 
                 if (rawPagination.isLoading === true) {
-                    await waitForPaginationIdle(scope, conversationStateKey, baseline);
+                    await waitForPaginationIdle(initialState, baseline);
                     return readSnapshot();
                 }
 
@@ -2108,7 +2236,7 @@
                     );
                 }
 
-                await waitForPaginationIdle(scope, conversationStateKey, baseline);
+                await waitForPaginationIdle(initialState, baseline);
                 return readSnapshot();
             }
 
@@ -2601,6 +2729,7 @@
         RETRYABLE_NATIVE_BINDING_CODES.has(error?.code);
     const NATIVE_ADAPTER_RETRY_BASE_MS = 800;
     const NATIVE_ADAPTER_RETRY_MAX_MS = 30_000;
+    const MAX_CACHED_CONVERSATIONS = 8;
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
@@ -2638,7 +2767,6 @@
     let turnSignature = '';
     let activeIndex = -1;
     let turnRecordsByChat = new Map();
-    let conversationIndexesByChat = new Map();
     let mountedTurnsByIdentity = new Map();
     let activeJumpSearch = null;
     let nativeAdapter = null;
@@ -2670,6 +2798,9 @@
     let extendedScrollRange = null;
 
     let rebuildTimer = null;
+    let rebuildMaxWaitTimer = null;
+    let rebuildDirty = false;
+    let rebuildImmediatePending = false;
     let activeRAF = null;
     let replyNavigationRAF = null;
     let hideTimer = null;
@@ -2679,6 +2810,7 @@
     let chatOwnersByTurnIdentity = new Map();
     let userEditCandidates = new Map();
     let fallbackTurnOwnersByNode = new WeakMap();
+    const stableTurnOwnersByNode = new WeakMap();
     let newConversationSubmissionPending = false;
     let newConversationSubmissionTimer = null;
     let assistantLabelRefreshTimer = null;
@@ -4643,6 +4775,7 @@
 
     function rememberTurnIdentity(chatIdentity, turnIdentity) {
         if (!chatIdentity || !turnIdentity) return;
+        getTurnRecordStore(chatIdentity);
 
         if (!turnIdentitiesByChat.has(chatIdentity)) {
             turnIdentitiesByChat.set(chatIdentity, new Set());
@@ -4667,7 +4800,10 @@
         );
         return fallbackNodes.some(node => {
             const owner = fallbackTurnOwnersByNode.get(node);
-            return owner && owner !== chatIdentity;
+            const stableOwner = stableTurnOwnersByNode.get(node);
+            return (owner && owner !== chatIdentity) ||
+                (turn.stableIdentity && stableOwner?.identity === turn.identity &&
+                    stableOwner.owner.chatIdentity !== chatIdentity);
         });
     }
 
@@ -4692,6 +4828,12 @@
         }
 
         rememberTurnIdentity(currentChatIdentity, turn.identity);
+        for (const node of fallbackNodes) {
+            stableTurnOwnersByNode.set(node, {
+                identity: turn.identity,
+                owner: turnRecordsByChat.get(currentChatIdentity).nodeOwner
+            });
+        }
 
         if (turn.kind === 'user') {
             for (const assistantUnit of getPairedAssistantUnits(turn)) {
@@ -4714,6 +4856,8 @@
     }
 
     function transferChatTurnIdentities(fromIdentity, toIdentity) {
+        const sourceStore = turnRecordsByChat.get(fromIdentity);
+        if (sourceStore) sourceStore.nodeOwner.chatIdentity = toIdentity;
         for (const turn of turns) {
             if (turn.stableIdentity) continue;
 
@@ -4738,7 +4882,6 @@
             turnIdentitiesByChat.delete(fromIdentity);
         }
 
-        const sourceStore = turnRecordsByChat.get(fromIdentity);
         if (!sourceStore) return;
 
         const targetStore = getTurnRecordStore(toIdentity);
@@ -4787,7 +4930,6 @@
 
         /* Route identities such as `route:/` can be reused by later chats. */
         turnRecordsByChat.delete(fromIdentity);
-        conversationIndexesByChat.delete(fromIdentity);
     }
 
     function clearNavigation() {
@@ -4818,7 +4960,7 @@
         if (previewAssistant) previewAssistant.textContent = '';
     }
 
-    function handleRouteChange() {
+    function handleRouteChange(scheduleProjection = true) {
         const identity = getChatIdentity();
 
         if (currentChatIdentity === null) {
@@ -4828,8 +4970,13 @@
 
         if (identity === currentChatIdentity) return;
 
+        cancelRebuildSchedule();
+
         cancelJumpSearch();
         userEditCandidates.clear();
+        clearTimeout(assistantLabelRefreshTimer);
+        assistantLabelRefreshTimer = null;
+        pendingAssistantLabelUnits.clear();
         latestNativePagination = null;
         nativeAdapterRetryPending = false;
         resetNativeAdapterRetryBackoff();
@@ -4848,23 +4995,21 @@
             clearNewConversationSubmission();
             startNativeLocator(identity);
             startNativeAdapter(identity);
+            if (scheduleProjection) scheduleRebuild(0);
             return;
         }
 
         clearNewConversationSubmission();
+        releaseConversationDOM(currentChatIdentity);
         currentChatIdentity = identity;
         lastLocatorDiagnostic = '';
         lastHistoryCapabilityDiagnostic = '';
         lastHistoryControlDiagnostic = '';
 
-        if (rebuildTimer !== null) {
-            clearTimeout(rebuildTimer);
-            rebuildTimer = null;
-        }
-
         clearNavigation();
         startNativeLocator(identity);
         startNativeAdapter(identity);
+        if (scheduleProjection) scheduleRebuild(0);
     }
 
     function isConversationUrlPromotion(previousIdentity, identity) {
@@ -5472,13 +5617,7 @@
     }
 
     function getConversationIndex(chatIdentity) {
-        if (!conversationIndexesByChat.has(chatIdentity)) {
-            conversationIndexesByChat.set(
-                chatIdentity,
-                createConversationIndex()
-            );
-        }
-        return conversationIndexesByChat.get(chatIdentity);
+        return getTurnRecordStore(chatIdentity).index;
     }
 
     function getTurnMessageIds(turn) {
@@ -5545,18 +5684,45 @@
     function getTurnRecordStore(chatIdentity) {
         if (!turnRecordsByChat.has(chatIdentity)) {
             turnRecordsByChat.set(chatIdentity, {
+                nodeOwner: {chatIdentity},
                 turns: [],
                 byIdentity: new Map(),
                 identityAliases: new Map(),
                 identitiesByNode: new WeakMap(),
                 pairedAssistantToUser: new Map(),
                 suppressedRemovedIdentities: new Map(),
-                index: getConversationIndex(chatIdentity),
-                nativeBranchKey: null
+                index: createConversationIndex()
             });
         }
 
-        return turnRecordsByChat.get(chatIdentity);
+        const store = turnRecordsByChat.get(chatIdentity);
+        // Map insertion order is the recency list; the current chat is protected.
+        turnRecordsByChat.delete(chatIdentity);
+        turnRecordsByChat.set(chatIdentity, store);
+        for (const identity of turnRecordsByChat.keys()) {
+            if (turnRecordsByChat.size <= MAX_CACHED_CONVERSATIONS) break;
+            if (identity === currentChatIdentity) continue;
+            releaseConversationDOM(identity);
+            turnRecordsByChat.delete(identity);
+            for (const turnIdentity of turnIdentitiesByChat.get(identity) || []) {
+                const owners = chatOwnersByTurnIdentity.get(turnIdentity);
+                owners?.delete(identity);
+                if (owners?.size === 0) chatOwnersByTurnIdentity.delete(turnIdentity);
+            }
+            turnIdentitiesByChat.delete(identity);
+        }
+        return store;
+    }
+
+    function releaseConversationDOM(chatIdentity) {
+        const store = turnRecordsByChat.get(chatIdentity);
+        if (!store) return;
+        for (const record of new Set([...store.turns, ...store.byIdentity.values()])) {
+            record.root = null;
+            record.userBubble = null;
+            record.assistantUnit = null;
+        }
+        store.identitiesByNode = new WeakMap();
     }
 
     function makeTurnRecord(entry) {
@@ -5610,14 +5776,16 @@
         const result = store.index.applySnapshot(snapshot);
         if (!result.accepted) return false;
 
+        const entries = store.index.getEntries();
+        const fallbackRecordsByEntry = buildFirstRecordByEntry(
+            store,
+            entries,
+            store.byIdentity.values()
+        );
         const nextRecords = [];
-        for (const entry of store.index.getEntries()) {
+        for (const entry of entries) {
             let record = store.byIdentity.get(entry.identity);
-            if (!record) {
-                record = Array.from(store.byIdentity.values()).find(candidate =>
-                    store.index.resolveEntry(toIndexRecord(candidate)) === entry
-                );
-            }
+            if (!record) record = fallbackRecordsByEntry.get(entry);
             if (!record) {
                 record = makeTurnRecord(entry);
                 store.byIdentity.set(record.identity, record);
@@ -5639,7 +5807,6 @@
         }
 
         store.turns.splice(0, store.turns.length, ...nextRecords);
-        store.nativeBranchKey = snapshot.branchKey ?? store.nativeBranchKey;
         return true;
     }
 
@@ -5653,7 +5820,7 @@
                 reportRouteCapability('Native history', 'ready');
             }
             latestNativePagination = snapshot?.pagination || null;
-            renderTurns();
+            scheduleRebuild(0);
             updateHistoryControl();
         }
         return true;
@@ -6709,11 +6876,15 @@
 
     function buildRenderedTurns(observedTurns) {
         const store = getTurnRecordStore(currentChatIdentity);
-        const rendered = store.index.getEntries().map(entry => {
+        const entries = store.index.getEntries();
+        const fallbackRecordsByEntry = buildFirstRecordByEntry(
+            store,
+            entries,
+            store.turns
+        );
+        const rendered = entries.map(entry => {
             const record = store.byIdentity.get(entry.identity) ||
-                store.turns.find(candidate =>
-                    store.index.resolveEntry(toIndexRecord(candidate)) === entry
-                );
+                fallbackRecordsByEntry.get(entry);
             const mounted = mountedTurnsByIdentity.get(entry.identity);
             return {
                 ...(record || {}),
@@ -6771,6 +6942,22 @@
         });
 
         return rendered;
+    }
+
+    function buildFirstRecordByEntry(store, entries, records) {
+        const needed = new Set(entries.filter(entry =>
+            !store.byIdentity.has(entry.identity)
+        ));
+        if (!needed.size) return new Map();
+
+        const recordsByEntry = new Map();
+        for (const record of records) {
+            const entry = store.index.resolveEntry(toIndexRecord(record));
+            if (!needed.has(entry) || recordsByEntry.has(entry)) continue;
+            recordsByEntry.set(entry, record);
+            if (recordsByEntry.size === needed.size) break;
+        }
+        return recordsByEntry;
     }
 
     function getTurnBarLabel(turn, index, contentTurn = turn) {
@@ -8152,31 +8339,27 @@
     }
 
     function renderTurns() {
-        handleRouteChange();
+        cancelRebuildSchedule();
+        handleRouteChange(false);
         ensureUI();
 
         const observedTurns = collectTurns().filter(trackCurrentRouteTurn);
         mergeObservedTurnRecords(observedTurns, true, true, true);
         const index = getConversationIndex(currentChatIdentity);
         mountedTurnsByIdentity = new Map();
-        for (const turn of observedTurns) {
-            if (!turn.root?.isConnected) continue;
-            const indexedEntry = index.resolveEntry(
-                toIndexRecord(turn),
-                {kind: turn.kind}
-            );
-            mountedTurnsByIdentity.set(indexedEntry?.identity || turn.identity, turn);
-        }
-        syncThreadResizeTargets(observedTurns);
-        const newTurns = buildRenderedTurns(observedTurns);
         const labelSources = new Map();
         for (const turn of observedTurns) {
             const indexedEntry = index.resolveEntry(
                 toIndexRecord(turn),
                 {kind: turn.kind}
             );
-            labelSources.set(indexedEntry?.identity || turn.identity, turn);
+            const identity = indexedEntry?.identity || turn.identity;
+            labelSources.set(identity, turn);
+            if (!turn.root?.isConnected) continue;
+            mountedTurnsByIdentity.set(identity, turn);
         }
+        syncThreadResizeTargets(observedTurns);
+        const newTurns = buildRenderedTurns(observedTurns);
 
         const newSignature = newTurns
             .map(turn => turn.identity)
@@ -8940,13 +9123,58 @@
      * DOM 改变时重新扫描
      ******************************************************************/
 
-    function scheduleRebuild() {
-        clearTimeout(rebuildTimer);
+    function cancelRebuildSchedule() {
+        if (rebuildTimer !== null) {
+            clearTimeout(rebuildTimer);
+            rebuildTimer = null;
+        }
+        if (rebuildMaxWaitTimer !== null) {
+            clearTimeout(rebuildMaxWaitTimer);
+            rebuildMaxWaitTimer = null;
+        }
+        rebuildDirty = false;
+        rebuildImmediatePending = false;
+    }
 
-        rebuildTimer = setTimeout(() => {
-            renderTurns();
-            retryNativeAdapterBinding();
-        }, 180);
+    function flushScheduledRebuild() {
+        const shouldRender = rebuildDirty;
+        cancelRebuildSchedule();
+        if (!shouldRender) return;
+        renderTurns();
+        retryNativeAdapterBinding();
+    }
+
+    function scheduleRebuild(delay = 180) {
+        rebuildDirty = true;
+        if (rebuildMaxWaitTimer === null) {
+            rebuildMaxWaitTimer = setTimeout(flushScheduledRebuild, 2500);
+        }
+
+        if (delay <= 0) {
+            if (rebuildImmediatePending) return;
+            rebuildImmediatePending = true;
+        } else if (rebuildImmediatePending) {
+            return;
+        }
+
+        if (rebuildTimer !== null) clearTimeout(rebuildTimer);
+        rebuildTimer = setTimeout(
+            flushScheduledRebuild,
+            rebuildImmediatePending ? 0 : delay
+        );
+    }
+
+    function pollForUnobservedChanges() {
+        handleRouteChange();
+        if (rebuildDirty && rebuildTimer === null && !rebuildImmediatePending) {
+            scheduleRebuild();
+        }
+        retryNativeLocatorBinding();
+        retryNativeAdapterBinding();
+    }
+
+    function startFallbackPolling() {
+        setInterval(pollForUnobservedChanges, 2500);
     }
 
     function nodeIsWithinMountedThread(node) {
@@ -9241,11 +9469,13 @@
                     nodeContainsTurn(mutation.target)
                 ) {
                     relevant = true;
+                    collectTurns(mutation.target).forEach(trackCurrentRouteTurn);
                 }
 
                 for (const node of mutation.addedNodes) {
                     if (nodeContainsTurn(node)) {
                         relevant = true;
+                        collectTurns(node).forEach(trackCurrentRouteTurn);
                     }
                 }
 
@@ -9259,10 +9489,11 @@
             }
 
             if (relevant) {
-                collectTurns().forEach(trackCurrentRouteTurn);
                 invalidateThreadLayout();
                 scheduleNativeSnapshotRefresh();
                 scheduleRebuild();
+            } else if (hasExternalMutation) {
+                rebuildDirty = true;
             }
         });
 
@@ -9331,11 +9562,7 @@
          * ChatGPT 是 SPA + virtualization，
          * 即便某次 DOM 更新模式改变，也能自动恢复。
          */
-        setInterval(() => {
-            renderTurns();
-            retryNativeLocatorBinding();
-            retryNativeAdapterBinding();
-        }, 2500);
+        startFallbackPolling();
     }
 
     if (document.readyState === 'loading') {

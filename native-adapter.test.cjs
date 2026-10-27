@@ -307,19 +307,24 @@ function makeFixture({
     }
 
     const scopeReads = [];
-    const scopeNode = {token: values.scopeToken};
-    const scope = {
-        scope: values.scopeToken,
-        node: scopeNode,
-        chain: {get: id => id === values.scopeToken.id ? scopeNode : null},
-        get(selector, key) {
-            scopeReads.push({selector, key});
-            if (selector === values.stateSelector && key === chatId) return stateKey;
-            if (selector === values.paginationSelector && key === stateKey) return pagination;
-            return undefined;
-        },
-        set() {}, watch() {}, when() {}
-    };
+    function createScope({key = stateKey, paginationState = pagination} = {}) {
+        const scopeNode = {token: values.scopeToken};
+        let currentKey = key;
+        return {
+            scope: values.scopeToken,
+            node: scopeNode,
+            chain: {get: id => id === values.scopeToken.id ? scopeNode : null},
+            get(selector, requestedKey) {
+                scopeReads.push({selector, key: requestedKey});
+                if (selector === values.stateSelector && requestedKey === chatId) return currentKey;
+                if (selector === values.paginationSelector && requestedKey === currentKey) return paginationState;
+                return undefined;
+            },
+            setStateKey(nextKey) { currentKey = nextKey; },
+            set() {}, watch() {}, when() {}
+        };
+    }
+    let scope = createScope();
     const entries = [{
         id: 'entry-1',
         turnKey: 'turn-1',
@@ -332,18 +337,28 @@ function makeFixture({
         }
     }];
     const historyComponent = requireModule(names.ids.history)[names.exports.history];
-    const fiber = {
-        return: null, sibling: null, child: null,
-        type: historyComponent, elementType: historyComponent,
-        memoizedProps: {
-            conversationId: chatId, entries,
-            ref: {current: {scrollToMessage() {}}}
-        },
-        memoizedState: {memoizedState: {current: scope}, next: null}
-    };
-    const root = {return: null, child: fiber, sibling: null, stateNode: null};
-    root.stateNode = {current: root};
-    fiber.return = root;
+    function createTargetTree({targetEntries = entries, targetScope = scope, targetChatId = chatId} = {}) {
+        const targetFiber = {
+            return: null, sibling: null, child: null,
+            type: historyComponent, elementType: historyComponent,
+            memoizedProps: {
+                conversationId: targetChatId, entries: targetEntries,
+                ref: {current: {scrollToMessage() {}}}
+            },
+            memoizedState: {memoizedState: {current: targetScope}, next: null}
+        };
+        const targetRoot = {return: null, child: targetFiber, sibling: null, stateNode: null};
+        targetRoot.stateNode = {current: targetRoot};
+        targetFiber.return = targetRoot;
+        const targetElement = {};
+        Object.defineProperty(targetElement, '__reactFiber$test', {value: targetFiber});
+        return {root: targetRoot, fiber: targetFiber, pageElement: targetElement};
+    }
+    let currentTree = createTargetTree();
+    const {root, fiber, pageElement} = currentTree;
+    const pageElements = [pageElement];
+    const documentStats = {wholePageEnumerations: 0};
+    const timerStats = {calls: 0, delays: [], onWait: null};
 
     values.safeGet = async (endpoint, request) => {
         values.lastRequest = {endpoint, request};
@@ -357,13 +372,14 @@ function makeFixture({
         return {ok: true};
     };
 
-    const pageElement = {};
-    Object.defineProperty(pageElement, '__reactFiber$test', {value: fiber});
     const document = {
         documentElement: pageElement,
         querySelectorAll(selector) {
             if (selector === 'link[rel="modulepreload"][href]') return [];
-            if (selector === '*') return [pageElement];
+            if (selector === '*') {
+                documentStats.wholePageEnumerations++;
+                return pageElements;
+            }
             return [];
         }
     };
@@ -384,8 +400,37 @@ function makeFixture({
             }
         },
         performance: {getEntriesByType: () => []},
-        setTimeout: (...args) => setTimeout(...args)
+        setTimeout(callback, delay) {
+            timerStats.calls++;
+            timerStats.delays.push(delay);
+            if (typeof timerStats.onWait === 'function') {
+                timerStats.onWait({callCount: timerStats.calls, delay, callback});
+                callback();
+                return timerStats.calls;
+            }
+            return setTimeout(callback, delay);
+        }
     };
+
+    function replaceScope(nextScope, targetFiber = currentTree.fiber) {
+        scope = nextScope;
+        targetFiber.memoizedState.memoizedState.current = nextScope;
+    }
+
+    function replaceCurrentRoot({targetEntries = entries, targetScope = scope} = {}) {
+        const nextTree = createTargetTree({targetEntries, targetScope});
+        root.alternate = nextTree.root;
+        root.stateNode.current = nextTree.root;
+        currentTree = nextTree;
+        scope = targetScope;
+        return nextTree;
+    }
+
+    function addSecondRoot({targetEntries = entries, targetScope = scope, targetChatId = chatId} = {}) {
+        const tree = createTargetTree({targetEntries, targetScope, targetChatId});
+        pageElements.push(tree.pageElement);
+        return tree;
+    }
 
     function addUnrelatedFactory(id = 'growth-unrelated-factory') {
         addFactory(id, 'throw new Error("A source-only factory must not be executed.");');
@@ -405,6 +450,12 @@ function makeFixture({
         stateSelector: values.stateSelector,
         paginationSelector: values.paginationSelector,
         assetUrl, importUrls, values, scanCounter, moduleTableStats,
+        documentStats, timerStats, entries, pagination, root, createScope,
+        get scope() { return scope; },
+        get fiber() { return currentTree.fiber; },
+        get currentTree() { return currentTree; },
+        get currentRoot() { return root.stateNode.current; },
+        replaceScope, replaceCurrentRoot, addSecondRoot,
         moduleMap, moduleCache, webpackRequire: requireModule,
         addUnrelatedFactory, replaceSelectedLoaderFactory
     };
@@ -419,6 +470,25 @@ function adapterOptions(fixture, chatId = fixture.chatId) {
             return {__webpack_require__: fixture.webpackRequire};
         },
         chatId
+    };
+}
+
+function configurePendingPageLoad(fixture) {
+    fixture.values.safeGet = async (endpoint, request) => {
+        fixture.values.lastRequest = {endpoint, request};
+        fixture.pagination.isLoading = true;
+        return {ok: true};
+    };
+}
+
+function olderEntry(id = 'entry-0', messageId = 'message-0') {
+    return {
+        id,
+        turnKey: 'turn-0',
+        turn: {
+            messageIds: [messageId],
+            items: [{type: 'user-message', messageId, message: 'older'}]
+        }
     };
 }
 
@@ -613,4 +683,151 @@ test('rejects an adapter when the requested conversation ID differs from the rou
         core.createNativeAdapter(adapterOptions(fixture, 'another-chat')),
         error => error.code === 'STALE_NATIVE_ADAPTER'
     );
+});
+
+test('reuses an unchanged root during pagination polling and returns the updated entries and cursor', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const enumerationsBeforeLoad = fixture.documentStats.wholePageEnumerations;
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = ({callCount}) => {
+        if (callCount !== 6) return;
+        fixture.entries.unshift(olderEntry());
+        fixture.pagination.cursor = 'cursor-2';
+        fixture.pagination.isLoading = false;
+    };
+
+    const snapshot = await adapter.loadPreviousPage();
+
+    assert.equal(fixture.timerStats.calls, 6);
+    assert.deepEqual(fixture.timerStats.delays, Array(6).fill(250));
+    const enumerationDelta = fixture.documentStats.wholePageEnumerations - enumerationsBeforeLoad;
+    assert.ok(
+        enumerationDelta <= 3,
+        `unchanged-root polling should not enumerate the whole page once per wait round ` +
+        `(actual ${enumerationDelta} enumerations over ${fixture.timerStats.calls} rounds)`
+    );
+    assert.equal(snapshot.entries.length, 2);
+    assert.equal(snapshot.entries[0].userText, 'older');
+    assert.equal(snapshot.pagination.cursor, 'cursor-2');
+    adapter.dispose();
+});
+
+test('rejects pagination polling when the conversation route changes', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = () => {
+        fixture.window.location.pathname = '/c/another-chat';
+    };
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'STALE_NATIVE_ADAPTER'
+    );
+    adapter.dispose();
+});
+
+test('rejects pagination polling after the adapter is disposed', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = () => adapter.dispose();
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'ADAPTER_DISPOSED'
+    );
+});
+
+test('re-resolves a new React root during pagination polling when its scope is unchanged', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const replacementEntries = fixture.entries.slice();
+    let replacementTree;
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = ({callCount}) => {
+        if (callCount === 1) {
+            replacementTree = fixture.replaceCurrentRoot({targetEntries: replacementEntries});
+        }
+        if (callCount === 3) {
+            replacementEntries.unshift(olderEntry('entry-new-root', 'message-new-root'));
+            fixture.pagination.cursor = 'cursor-new-root';
+            fixture.pagination.isLoading = false;
+        }
+    };
+
+    const snapshot = await adapter.loadPreviousPage();
+
+    assert.notEqual(fixture.currentRoot, fixture.root);
+    assert.equal(replacementTree, fixture.currentTree);
+    assert.equal(snapshot.entries.length, 2);
+    assert.equal(snapshot.entries[0].messageId, 'message-new-root');
+    assert.equal(snapshot.pagination.cursor, 'cursor-new-root');
+    adapter.dispose();
+});
+
+test('rejects pagination polling when the active AppScope wrapper is replaced', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = () => {
+        fixture.replaceScope(fixture.createScope({
+            key: 'replacement-state-key',
+            paginationState: {...fixture.pagination}
+        }));
+    };
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'STALE_NATIVE_ADAPTER'
+    );
+    adapter.dispose();
+});
+
+test('rejects pagination polling when the conversation state key changes in the same scope', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = () => fixture.scope.setStateKey('replacement-state-key');
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'STALE_NATIVE_ADAPTER'
+    );
+    adapter.dispose();
+});
+
+test('rejects a newly ambiguous native target when pagination finishes', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = ({callCount}) => {
+        if (callCount !== 4) return;
+        fixture.entries.unshift(olderEntry());
+        fixture.pagination.cursor = 'cursor-2';
+        fixture.pagination.isLoading = false;
+        fixture.addSecondRoot();
+    };
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'AMBIGUOUS_ACTIVE_CONVERSATION'
+    );
+    adapter.dispose();
+});
+
+test('still rejects a completed pagination request that made no progress', async () => {
+    const fixture = makeFixture();
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    configurePendingPageLoad(fixture);
+    fixture.timerStats.onWait = ({callCount}) => {
+        if (callCount === 2) fixture.pagination.isLoading = false;
+    };
+
+    await assert.rejects(
+        adapter.loadPreviousPage(),
+        error => error.code === 'NATIVE_PAGE_NO_PROGRESS'
+    );
+    adapter.dispose();
 });
