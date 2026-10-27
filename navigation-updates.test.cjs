@@ -56,6 +56,7 @@ function createFakeTimers() {
 function loadPipelineRuntime() {
     const timers = createFakeTimers();
     const eventListeners = new Map();
+    let structureNodes = [];
     const document = {
         readyState: 'loading',
         body: {},
@@ -64,14 +65,16 @@ function loadPipelineRuntime() {
             listeners.push(callback);
             eventListeners.set(type, listeners);
         },
-        getElementById() { return null; }
+        getElementById() { return null; },
+        querySelectorAll() { return structureNodes; }
     };
     let observerCallback = null;
+    let observerOptions = null;
     class FakeMutationObserver {
         constructor(callback) {
             observerCallback = callback;
         }
-        observe() {}
+        observe(target, options) { observerOptions = options; }
         disconnect() {}
     }
     class FakeElement {}
@@ -130,7 +133,7 @@ function loadPipelineRuntime() {
             findKnownUserContentTurn: value => { findKnownUserContentTurn = value; },
             nodeIsWithinMountedThread: value => { nodeIsWithinMountedThread = value; },
             nodeContainsTurn: value => { nodeContainsTurn = value; },
-            queueAssistantBarRefresh: value => { queueAssistantBarRefresh = value; },
+            queueTurnContentRefresh: value => { queueTurnContentRefresh = value; },
             invalidateThreadLayout: value => { invalidateThreadLayout = value; },
             scheduleNativeSnapshotRefresh: value => { scheduleNativeSnapshotRefresh = value; },
             retryNativeLocatorBinding: value => { retryNativeLocatorBinding = value; },
@@ -140,15 +143,21 @@ function loadPipelineRuntime() {
         const renderCalls = [];
         return {
             scheduleRebuild,
+            cancelRebuildSchedule,
             pollForUnobservedChanges,
             startFallbackPolling,
             observeChatChanges,
             acceptNativeSnapshot,
             get renderTurns() { return renderTurns; },
             handleRouteChange,
-            buildFirstRecordByEntry,
             getTurnRecordStore,
             getConversationIndex,
+            setMountedAndRenderedTurns(mounted, rendered) {
+                mountedTurnsByIdentity = new Map(mounted);
+                turns = rendered;
+            },
+            unmountTurn(identity) { mountedTurnsByIdentity.delete(identity); },
+            setEditCandidate(identity) { userEditCandidates.set(identity, {}); },
             setCurrentChatIdentity(value) { currentChatIdentity = value; },
             setSubmissionPending(value) { newConversationSubmissionPending = value; },
             setRenderElements(elements) {
@@ -170,6 +179,7 @@ function loadPipelineRuntime() {
             },
             get renderCalls() { return renderCalls; },
             get observerCallback() { return globalThis.__observerState.callback; },
+            get observerOptions() { return globalThis.__observerState.options; },
             get state() {
                 return {
                     currentChatIdentity,
@@ -177,6 +187,7 @@ function loadPipelineRuntime() {
                     rebuildTimer,
                     rebuildMaxWaitTimer,
                     rebuildImmediatePending,
+                    contentRefreshTimer,
                     latestNativePagination
                 };
             }
@@ -186,7 +197,10 @@ function loadPipelineRuntime() {
     const instrumentedSource = scriptSource.replace(/\}\)\(\);\s*$/, `${hooks}\n})();`);
     assert.notEqual(instrumentedSource, scriptSource, 'IIFE test hook was inserted');
     vm.runInNewContext(instrumentedSource, sandbox, {filename: scriptPath});
-    sandbox.__observerState = {get callback() { return observerCallback; }};
+    sandbox.__observerState = {
+        get callback() { return observerCallback; },
+        get options() { return observerOptions; }
+    };
     const pipeline = sandbox.__pipeline;
     pipeline.setRenderElements({
         barList: {children: [], replaceChildren() { this.children = []; }},
@@ -194,7 +208,10 @@ function loadPipelineRuntime() {
         preview: {classList: {remove() {}}}
     });
 
-    return {pipeline, sandbox, timers, eventListeners};
+    return {
+        pipeline, sandbox, timers, eventListeners,
+        setStructureNodes(nodes) { structureNodes = nodes; }
+    };
 }
 
 function prepareRenderer(runtime) {
@@ -225,6 +242,144 @@ function prepareRenderer(runtime) {
         get collectCount() { return collectCount; },
         setObservedTurns(turns) { observedTurns = turns; }
     };
+}
+
+function makeMountedElement(runtime, attributes = {}, value = '') {
+    const node = new runtime.sandbox.Element();
+    node.attributes = {...attributes};
+    node.children = [];
+    node.parentElement = null;
+    node.isConnected = true;
+    node.textReads = 0;
+    node.value = value;
+    Object.defineProperties(node, {
+        innerText: {get() { this.textReads += 1; return this.value; }},
+        textContent: {get() { this.textReads += 1; return this.value; }}
+    });
+    node.getAttribute = name => node.attributes[name] ?? null;
+    node.matches = selector => {
+        if (selector === '[data-user-message-bubble="true"]') {
+            return node.attributes['data-user-message-bubble'] === 'true';
+        }
+        if (selector === '[data-chatgpt-selection-message-id]') {
+            return Boolean(node.attributes['data-chatgpt-selection-message-id']);
+        }
+        if (selector === '[data-turn-key]') return Boolean(node.attributes['data-turn-key']);
+        if (selector === '[data-content-search-turn-key]') {
+            return Boolean(node.attributes['data-content-search-turn-key']);
+        }
+        if (selector.includes('data-content-search-unit-key')) {
+            return Boolean(node.attributes['data-content-search-unit-key'] ||
+                node.attributes['data-chatgpt-search-unit-key']);
+        }
+        return false;
+    };
+    node.closest = selector => {
+        for (let current = node; current; current = current.parentElement) {
+            if (current.matches(selector)) return current;
+        }
+        return null;
+    };
+    node.contains = target => target === node || node.children.some(child => child.contains(target));
+    node.querySelectorAll = selector => {
+        const descendants = [];
+        const visit = current => {
+            for (const child of current.children) {
+                if (child.matches(selector)) descendants.push(child);
+                visit(child);
+            }
+        };
+        visit(node);
+        return descendants;
+    };
+    node.querySelector = selector => node.querySelectorAll(selector)[0] || null;
+    node.append = child => {
+        child.parentElement = node;
+        node.children.push(child);
+    };
+    return node;
+}
+
+function makeBar(identity) {
+    return {
+        dataset: {ywIdentity: identity},
+        attributes: {},
+        setAttribute(name, value) { this.attributes[name] = value; }
+    };
+}
+
+function prepareContentFixture(runtime) {
+    const metrics = prepareRenderer(runtime);
+    const {pipeline} = runtime;
+    pipeline.setStub('captureUserEditCandidatesFromMutation', () => {});
+    pipeline.setStub('replyOutlineHeaderMayHaveChanged', () => false);
+    pipeline.setStub('isReplySidebarMutation', () => false);
+    pipeline.setStub('invalidateThreadLayout', () => {});
+    pipeline.setStub('scheduleNativeSnapshotRefresh', () => {});
+    const root = makeMountedElement(runtime, {'data-turn-key': 'turn-one'});
+    const bubble = makeMountedElement(runtime, {
+        'data-user-message-bubble': 'true',
+        'data-chatgpt-search-message-ids': 'question-id'
+    }, 'new question');
+    const paired = makeMountedElement(runtime, {
+        'data-content-search-unit-key': 'paired:assistant',
+        'data-chatgpt-search-message-ids': 'paired-id',
+        'data-chatgpt-selection-message-id': 'paired-id'
+    }, 'new paired answer');
+    root.append(bubble);
+    root.append(paired);
+    const standalone = makeMountedElement(runtime, {
+        'data-content-search-unit-key': 'standalone:assistant',
+        'data-chatgpt-search-message-ids': 'answer-id',
+        'data-chatgpt-selection-message-id': 'answer-id'
+    }, 'new answer');
+    const untouched = makeMountedElement(runtime, {
+        'data-content-search-unit-key': 'untouched:assistant',
+        'data-chatgpt-search-message-ids': 'untouched-id',
+        'data-chatgpt-selection-message-id': 'untouched-id'
+    }, 'untouched');
+    const observedUser = {
+        identity: 'user:turn-one', kind: 'user', stableIdentity: true,
+        root, userBubble: bubble, pairedAssistantUnits: [paired],
+        pairedAssistantIdentities: ['assistant:paired-id']
+    };
+    const observedAssistant = {
+        identity: 'assistant:standalone', kind: 'assistant', stableIdentity: true,
+        root: standalone, assistantUnit: standalone
+    };
+    const observedUntouched = {
+        identity: 'assistant:untouched', kind: 'assistant', stableIdentity: true,
+        root: untouched, assistantUnit: untouched
+    };
+    const snapshot = {
+        chatId: 'chat', branchKey: 'branch',
+        entries: [
+            {identity: 'native-user', kind: 'user', turnKey: 'turn-one',
+                userMessageId: 'question-id', assistantMessageIds: ['paired-id'],
+                userText: 'old question', assistantText: 'old paired answer'},
+            {identity: 'native-assistant', kind: 'assistant', messageId: 'answer-id',
+                assistantMessageIds: ['answer-id'], assistantText: 'old answer'},
+            {identity: 'native-untouched', kind: 'assistant', messageId: 'untouched-id',
+                assistantMessageIds: ['untouched-id'], assistantText: 'untouched'}
+        ]
+    };
+    assert.equal(pipeline.acceptNativeSnapshot(snapshot), true);
+    pipeline.cancelRebuildSchedule();
+    const store = pipeline.getTurnRecordStore('conversation:chat');
+    const rendered = store.index.getEntries();
+    const bars = rendered.map(turn => makeBar(turn.identity));
+    pipeline.setMountedAndRenderedTurns([
+        ['native-user', observedUser],
+        ['native-assistant', observedAssistant],
+        ['native-untouched', observedUntouched]
+    ], rendered);
+    pipeline.setRenderElements({
+        barList: {children: bars, replaceChildren() { this.children = []; }},
+        rail: {style: {}},
+        preview: {classList: {remove() {}}}
+    });
+    pipeline.observeChatChanges();
+    return {metrics, store, bars, root, bubble, paired, standalone, untouched, observedUser, snapshot};
 }
 
 function prepareRouteEffects(pipeline) {
@@ -297,7 +452,59 @@ test('snapshot projections are queued immediately and merge with following DOM c
     assert.equal(metrics.collectCount, 1);
 });
 
-test('unclassified mutations wait for the periodic dirty poll; idle polls do not scan', () => {
+test('a DOM body update after a native snapshot flushes one authoritative record', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, store, bars, bubble, snapshot} = prepareContentFixture(runtime);
+    const record = store.byIdentity.get('native-user');
+
+    assert.equal(pipeline.acceptNativeSnapshot({
+        ...snapshot,
+        entries: snapshot.entries.map((entry, index) => index === 0
+            ? {...entry, userText: 'native after snapshot'}
+            : entry)
+    }), true);
+    bubble.value = 'DOM after snapshot';
+    pipeline.observerCallback([{
+        type: 'characterData',
+        target: {parentElement: bubble},
+        addedNodes: [],
+        removedNodes: []
+    }]);
+    assert.equal(metrics.collectCount, 0);
+
+    timers.advance(0);
+
+    assert.equal(metrics.collectCount, 0);
+    assert.strictEqual(store.byIdentity.get('native-user'), record);
+    assert.equal(record.userText, 'DOM after snapshot');
+    assert.match(bars[0].attributes['aria-label'], /DOM after snapshot/);
+});
+
+test('a branch rebuild supersedes a queued native body projection', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, snapshot} = prepareContentFixture(runtime);
+
+    assert.equal(pipeline.acceptNativeSnapshot({
+        ...snapshot,
+        entries: snapshot.entries.map((entry, index) => index === 0
+            ? {...entry, userText: 'native body update'}
+            : entry)
+    }), true);
+    assert.equal(pipeline.acceptNativeSnapshot({
+        ...snapshot,
+        branchKey: 'next-branch'
+    }), true);
+    assert.equal(pipeline.state.rebuildDirty, true);
+
+    timers.advance(0);
+
+    assert.equal(metrics.collectCount, 1);
+    assert.equal(pipeline.state.rebuildDirty, false);
+});
+
+test('unclassified mutations and idle polls do not scan turns or read message text', () => {
     const runtime = loadPipelineRuntime();
     const metrics = prepareRenderer(runtime);
     const {pipeline, timers} = runtime;
@@ -306,29 +513,189 @@ test('unclassified mutations wait for the periodic dirty poll; idle polls do not
     let adapterRetries = 0;
     pipeline.setStub('retryNativeLocatorBinding', () => { locatorRetries += 1; });
     pipeline.setStub('retryNativeAdapterBinding', () => { adapterRetries += 1; });
+    pipeline.setStub('getChatIdentity', () => 'conversation:chat');
+    runtime.setStructureNodes([{
+        getAttribute() { return null; },
+        get innerText() { throw new Error('Idle polling read message text'); },
+        get textContent() { throw new Error('Idle polling read message text'); }
+    }]);
+    pipeline.renderTurns();
     pipeline.startFallbackPolling();
 
-    timers.advance(2500);
-    assert.equal(renderCalls.length, 0);
-    assert.equal(metrics.collectCount, 0);
-    assert.equal(locatorRetries, 1);
-    assert.equal(adapterRetries, 1);
-
     fireUnclassifiedMutation(pipeline);
-    assert.equal(pipeline.state.rebuildDirty, true);
+    assert.equal(pipeline.state.rebuildDirty, false);
     assert.equal(pipeline.state.rebuildTimer, null);
-    assert.equal(metrics.collectCount, 0);
-    timers.advance(2499);
-    assert.equal(renderCalls.length, 0);
-    assert.equal(metrics.collectCount, 0);
-
-    timers.advance(1);
-    assert.equal(pipeline.state.rebuildTimer !== null, true);
-    assert.equal(renderCalls.length, 0);
-    timers.advance(180);
-
+    timers.advance(10000);
     assert.equal(renderCalls.length, 1);
     assert.equal(metrics.collectCount, 1);
+    assert.equal(locatorRetries, 4);
+    assert.equal(adapterRetries, 4);
+});
+
+test('fingerprint recovers unobserved identity changes and same-identity node replacements', () => {
+    const runtime = loadPipelineRuntime();
+    const metrics = prepareRenderer(runtime);
+    const {pipeline, timers} = runtime;
+    pipeline.setStub('getChatIdentity', () => 'conversation:chat');
+    const makeNode = id => ({
+        id,
+        getAttribute(name) { return name === 'data-message-id' ? this.id : null; },
+        get innerText() { throw new Error('Fingerprint read message text'); },
+        get textContent() { throw new Error('Fingerprint read message text'); }
+    });
+    const node = makeNode('old');
+    runtime.setStructureNodes([node]);
+    const renderCalls = pipeline.wrapRender();
+    pipeline.renderTurns();
+    pipeline.startFallbackPolling();
+
+    node.id = 'new';
+    timers.advance(2500);
+    assert.equal(renderCalls.length, 1);
+    assert.equal(pipeline.state.rebuildDirty, true);
+    timers.advance(180);
+    assert.equal(renderCalls.length, 2);
+
+    runtime.setStructureNodes([makeNode('new')]);
+    timers.advance(2320);
+    assert.equal(pipeline.state.rebuildDirty, true);
+    timers.advance(180);
+    assert.equal(renderCalls.length, 3);
+    assert.equal(metrics.collectCount, 3);
+
+    timers.advance(5000);
+    assert.equal(renderCalls.length, 3);
+});
+
+test('streaming content updates only affected authoritative records and labels', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const fixture = prepareContentFixture(runtime);
+    const {metrics, store, bars, bubble, paired, standalone, untouched} = fixture;
+    const initialEntries = store.index.getEntries();
+    pipeline.observerCallback([
+        {type: 'characterData', target: {parentElement: bubble}, addedNodes: [], removedNodes: []},
+        {type: 'characterData', target: {parentElement: paired}, addedNodes: [], removedNodes: []},
+        {type: 'characterData', target: {parentElement: standalone}, addedNodes: [], removedNodes: []},
+        {type: 'childList', target: standalone,
+            addedNodes: [makeMountedElement(runtime)], removedNodes: []}
+    ]);
+
+    assert.equal(pipeline.state.rebuildDirty, false);
+    timers.advance(249);
+    assert.equal(bubble.textReads + paired.textReads + standalone.textReads, 0);
+    timers.advance(1);
+
+    const entries = store.index.getEntries();
+    assert.equal(metrics.collectCount, 0);
+    assert.equal(entries[0].userText, 'new question');
+    assert.equal(entries[0].assistantText, 'new paired answer');
+    assert.equal(entries[1].assistantText, 'new answer');
+    assert.strictEqual(store.byIdentity.get('native-user'), entries[0]);
+    assert.strictEqual(store.turns[0], entries[0]);
+    assert.strictEqual(entries[2], initialEntries[2]);
+    assert.equal(bubble.textReads, 1);
+    assert.equal(paired.textReads, 1);
+    assert.equal(standalone.textReads, 1);
+    assert.equal(untouched.textReads, 0);
+    assert.match(bars[0].attributes['aria-label'], /new question/);
+    assert.match(bars[1].attributes['aria-label'], /new answer/);
+    assert.equal(pipeline.state.rebuildDirty, false);
+});
+
+test('native text-only snapshots refresh affected labels without collecting turns', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, store, bars, snapshot, bubble, paired, standalone, untouched} =
+        prepareContentFixture(runtime);
+    pipeline.unmountTurn('native-untouched');
+    assert.equal(pipeline.acceptNativeSnapshot(snapshot), true);
+    assert.equal(pipeline.state.contentRefreshTimer, null);
+    assert.equal(pipeline.state.rebuildDirty, false);
+
+    const next = {
+        ...snapshot,
+        entries: snapshot.entries.map((entry, index) => ({
+            ...entry,
+            ...(index === 0 ? {userText: 'native question'} : {}),
+            ...(index === 2 ? {assistantText: 'native unmounted answer'} : {})
+        }))
+    };
+    assert.equal(pipeline.acceptNativeSnapshot(next), true);
+    assert.equal(pipeline.state.rebuildDirty, false);
+    timers.advance(0);
+
+    const entries = store.index.getEntries();
+    assert.equal(metrics.collectCount, 0);
+    assert.equal(entries[0].userText, 'new question');
+    assert.equal(entries[2].assistantText, 'native unmounted answer');
+    assert.match(bars[0].attributes['aria-label'], /new question/);
+    assert.match(bars[2].attributes['aria-label'], /native unmounted answer/);
+    assert.equal(bubble.textReads, 1);
+    assert.equal(paired.textReads, 1);
+    assert.equal(standalone.textReads, 0);
+    assert.equal(untouched.textReads, 0);
+});
+
+test('a native branch change with unchanged identities still rebuilds', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, snapshot} = prepareContentFixture(runtime);
+    assert.equal(pipeline.acceptNativeSnapshot({...snapshot, branchKey: 'other-branch'}), true);
+    assert.equal(pipeline.state.rebuildDirty, true);
+    timers.advance(0);
+    assert.equal(metrics.collectCount, 1);
+});
+
+test('a pending user edit uses the full branch reconciliation path', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, bubble} = prepareContentFixture(runtime);
+    pipeline.setEditCandidate('native-user');
+    pipeline.observerCallback([{
+        type: 'characterData', target: {parentElement: bubble},
+        addedNodes: [], removedNodes: []
+    }]);
+    assert.equal(pipeline.state.rebuildDirty, true);
+    timers.advance(180);
+    assert.equal(metrics.collectCount, 1);
+});
+
+test('an unresolved mounted record falls back to one full rebuild', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, timers} = runtime;
+    const {metrics, store, standalone} = prepareContentFixture(runtime);
+    store.byIdentity.delete('native-assistant');
+    pipeline.observerCallback([{
+        type: 'characterData', target: {parentElement: standalone},
+        addedNodes: [], removedNodes: []
+    }]);
+    timers.advance(250);
+    assert.equal(pipeline.state.rebuildDirty, true);
+    assert.equal(metrics.collectCount, 0);
+    timers.advance(180);
+    assert.equal(metrics.collectCount, 1);
+    timers.advance(2500);
+    assert.equal(metrics.collectCount, 1);
+});
+
+test('route changes discard a pending content refresh from the previous conversation', () => {
+    const runtime = loadPipelineRuntime();
+    const {pipeline, sandbox, timers} = runtime;
+    const {metrics, store, standalone} = prepareContentFixture(runtime);
+    prepareRouteEffects(pipeline);
+    pipeline.observerCallback([{
+        type: 'characterData', target: {parentElement: standalone},
+        addedNodes: [], removedNodes: []
+    }]);
+    sandbox.window.location.pathname = '/c/new';
+    pipeline.handleRouteChange();
+    timers.advance(250);
+
+    assert.equal(store.index.getEntries()[1].assistantText, 'old answer');
+    assert.equal(standalone.textReads, 0);
+    assert.equal(metrics.collectCount, 1);
+    assert.equal(pipeline.state.currentChatIdentity, 'conversation:new');
 });
 
 test('identity attributes and added subtrees are tracked locally', () => {
@@ -357,6 +724,13 @@ test('identity attributes and added subtrees are tracked locally', () => {
         node === attributeTarget || node === addedTarget
     );
     pipeline.observeChatChanges();
+    for (const name of [
+        'data-chatgpt-search-message-ids',
+        'data-chatgpt-selection-message-id',
+        'data-message-id'
+    ]) {
+        assert.equal(pipeline.observerOptions.attributeFilter.includes(name), true);
+    }
 
     pipeline.observerCallback([
         {
@@ -492,47 +866,4 @@ test('renderTurn alias resolution is shared by mounted and label source maps', (
 
     assert.equal(resolveCount, 2);
     assert.equal(metrics.collectCount, 1);
-});
-
-test('entry fallback records are derived once and retain first-match order', () => {
-    const runtime = loadPipelineRuntime();
-    const {pipeline} = runtime;
-    const store = pipeline.getTurnRecordStore('conversation:fallback');
-    const entries = store.index.applySnapshot({
-        branchKey: 'branch',
-        entries: [
-            {identity: 'target-0', kind: 'user', messageId: 'shared'},
-            {identity: 'target-1', kind: 'user', messageId: 'shared'},
-            ...Array.from({length: 38}, (_, i) => ({
-                identity: `target-${i + 2}`,
-                kind: 'user',
-                userMessageId: `user-${i + 2}`
-            }))
-        ]
-    }).entries;
-    const candidates = [
-        {identity: 'fallback-first', kind: 'user', messageId: 'shared'},
-        {identity: 'fallback-second', kind: 'user', messageId: 'shared'},
-        {identity: 'target-1', kind: 'user'}
-    ];
-    for (let i = 2; i < 40; i += 1) {
-        candidates.push({identity: `target-${i}`, kind: 'user'});
-    }
-    let conversionCount = 0;
-    pipeline.setStub('toIndexRecord', record => {
-        conversionCount += 1;
-        return record;
-    });
-
-    const recordsByEntry = pipeline.buildFirstRecordByEntry(
-        store,
-        entries,
-        candidates
-    );
-
-    assert.equal(conversionCount, candidates.length);
-    assert.equal(recordsByEntry.size, entries.length);
-    assert.equal(recordsByEntry.get(entries[0]), candidates[0]);
-    assert.equal(recordsByEntry.get(entries[1]).identity, 'target-1');
-    assert.equal(Object.hasOwn(store, 'nativeBranchKey'), false);
 });

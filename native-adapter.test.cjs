@@ -473,6 +473,14 @@ function adapterOptions(fixture, chatId = fixture.chatId) {
     };
 }
 
+function installQuietMutationObserver(fixture) {
+    fixture.window.MutationObserver = class {
+        observe() {}
+        takeRecords() { return []; }
+        disconnect() {}
+    };
+}
+
 function configurePendingPageLoad(fixture) {
     fixture.values.safeGet = async (endpoint, request) => {
         fixture.values.lastRequest = {endpoint, request};
@@ -683,6 +691,69 @@ test('rejects an adapter when the requested conversation ID differs from the rou
         core.createNativeAdapter(adapterOptions(fixture, 'another-chat')),
         error => error.code === 'STALE_NATIVE_ADAPTER'
     );
+});
+
+test('rejects another target added to the same Fiber root without a DOM mutation', async () => {
+    const fixture = makeFixture();
+    installQuietMutationObserver(fixture);
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const first = fixture.fiber;
+    first.sibling = {
+        return: fixture.currentRoot, child: null, sibling: null,
+        type: first.type, elementType: first.elementType,
+        memoizedProps: {...first.memoizedProps},
+        memoizedState: {memoizedState: {current: fixture.createScope()}, next: null}
+    };
+
+    assert.throws(() => adapter.readSnapshot(), error => error.code === 'AMBIGUOUS_ACTIVE_CONVERSATION');
+    first.sibling = null;
+    assert.equal(adapter.readSnapshot().chatId, fixture.chatId);
+    adapter.dispose();
+});
+
+test('rejects another AppScope added to the same Fiber root without a DOM mutation', async () => {
+    const fixture = makeFixture();
+    installQuietMutationObserver(fixture);
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const first = fixture.fiber;
+    first.sibling = {
+        return: fixture.currentRoot, child: null, sibling: null,
+        type: first.type, elementType: first.elementType,
+        memoizedProps: {conversationId: fixture.chatId},
+        memoizedState: {memoizedState: {current: fixture.createScope()}, next: null}
+    };
+
+    assert.throws(() => adapter.readSnapshot(), error => error.code === 'AMBIGUOUS_APP_SCOPE_BINDING');
+    first.sibling = null;
+    assert.equal(adapter.readSnapshot().chatId, fixture.chatId);
+    adapter.dispose();
+});
+
+test('detects a new Fiber root attached to an existing DOM element without a DOM mutation', async () => {
+    const fixture = makeFixture();
+    installQuietMutationObserver(fixture);
+    const existingElement = {};
+    const querySelectorAll = fixture.document.querySelectorAll;
+    fixture.document.querySelectorAll = selector => {
+        const elements = querySelectorAll(selector);
+        return selector === '*' ? [...elements, existingElement] : elements;
+    };
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const first = fixture.fiber;
+    const root = {return: null, child: null, sibling: null, stateNode: null};
+    root.stateNode = {current: root};
+    root.child = {
+        return: root, child: null, sibling: null,
+        type: first.type, elementType: first.elementType,
+        memoizedProps: {...first.memoizedProps},
+        memoizedState: {memoizedState: {current: fixture.createScope()}, next: null}
+    };
+    Object.defineProperty(existingElement, '__reactFiber$late', {value: root.child, configurable: true});
+
+    assert.throws(() => adapter.readSnapshot(), error => error.code === 'AMBIGUOUS_ACTIVE_CONVERSATION');
+    delete existingElement.__reactFiber$late;
+    assert.equal(adapter.readSnapshot().chatId, fixture.chatId);
+    adapter.dispose();
 });
 
 test('reuses an unchanged root during pagination polling and returns the updated entries and cursor', async () => {

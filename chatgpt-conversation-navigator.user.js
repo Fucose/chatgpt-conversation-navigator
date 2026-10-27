@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.0
+// @version      0.5.1
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -22,10 +22,10 @@
         let aliases = new Map();
         let aliasMembers = new Map();
         const entryPositions = new Map();
+        const entryAliases = new Map();
         let authoritative = false;
         let branchKey = null;
         const suppressed = new Map();
-        const committedUserText = new Map();
 
         function getAliases(entry) {
             const result = new Set();
@@ -33,18 +33,8 @@
             if (entry?.turnKey && entry?.kind) {
                 result.add(`turn:${entry.kind}:${entry.turnKey}`);
             }
-            const messageIds = [
-                entry?.messageId,
-                entry?.userMessageId,
-                ...(Array.isArray(entry?.userMessageIds)
-                    ? entry.userMessageIds
-                    : []),
-                ...(Array.isArray(entry?.assistantMessageIds)
-                    ? entry.assistantMessageIds
-                    : [])
-            ];
-            for (const messageId of messageIds) {
-                if (messageId) result.add(`message:${messageId}`);
+            for (const messageId of collectMessageEvidenceIds(entry)) {
+                result.add(`message:${messageId}`);
             }
             return result;
         }
@@ -53,12 +43,15 @@
             aliases = new Map();
             aliasMembers = new Map();
             entryPositions.clear();
+            entryAliases.clear();
             for (let index = 0; index < entries.length; index += 1) {
                 const entry = entries[index];
                 if (!entryPositions.has(entry)) {
                     entryPositions.set(entry, index);
                 }
-                for (const alias of getAliases(entry)) {
+                const keys = getAliases(entry);
+                entryAliases.set(entry, keys);
+                for (const alias of keys) {
                     let members = aliasMembers.get(alias);
                     if (!members) {
                         members = new Set();
@@ -70,10 +63,11 @@
             }
         }
 
-        function findFirstAliasMember(alias) {
+        function findFirstAliasMember(alias, kind = null) {
             let first = null;
             let firstPosition = Infinity;
             for (const entry of aliasMembers.get(alias) || []) {
+                if (kind && entry.kind !== kind) continue;
                 const position = entryPositions.get(entry);
                 if (position !== undefined && position < firstPosition) {
                     first = entry;
@@ -113,30 +107,21 @@
 
         function replaceEntryAt(index, nextEntry) {
             const previous = entries[index];
-            if (previous === nextEntry) return;
-            const previousAliases = getAliases(previous);
-            const nextAliases = getAliases(nextEntry);
-            entries[index] = nextEntry;
-            entryPositions.delete(previous);
-            entryPositions.set(nextEntry, index);
+            // Records are shared with the store. Save aliases separately so even
+            // fields changed by a DOM observation can be reindexed correctly.
+            const previousAliases = entryAliases.get(previous) || new Set();
+            if (previous !== nextEntry) Object.assign(previous, nextEntry);
+            const nextAliases = getAliases(previous);
+            entryAliases.set(previous, nextAliases);
 
             for (const alias of previousAliases) {
-                const members = aliasMembers.get(alias);
-                if (nextAliases.has(alias)) {
-                    if (members) {
-                        members.delete(previous);
-                        members.add(nextEntry);
-                    }
-                    if (aliases.get(alias) === previous) {
-                        aliases.set(alias, nextEntry);
-                    }
-                } else {
+                if (!nextAliases.has(alias)) {
                     removeAliasMember(alias, previous);
                 }
             }
             for (const alias of nextAliases) {
                 if (!previousAliases.has(alias)) {
-                    addAliasMember(alias, nextEntry);
+                    addAliasMember(alias, previous);
                 }
             }
         }
@@ -145,7 +130,9 @@
             const index = entries.length;
             entries.push(entry);
             entryPositions.set(entry, index);
-            for (const alias of getAliases(entry)) {
+            const keys = getAliases(entry);
+            entryAliases.set(entry, keys);
+            for (const alias of keys) {
                 addAliasMember(alias, entry);
             }
         }
@@ -153,17 +140,19 @@
         function findMatch(incoming) {
             for (const alias of getAliases(incoming)) {
                 const match = aliases.get(alias);
-                if (match) return match;
+                if (match && (!incoming?.kind || match.kind === incoming.kind)) {
+                    return match;
+                }
+                const sameKind = incoming?.kind &&
+                    findFirstAliasMember(alias, incoming.kind);
+                if (sameKind) return sameKind;
             }
             return null;
         }
 
         function mergeEntry(previous, incoming, source) {
             const merged = { ...previous };
-            const preserveUserText = Boolean(
-                committedUserText.has(previous?.identity) ||
-                previous?.preserveCommittedUserText
-            );
+            const preserveUserText = Boolean(previous?.preserveCommittedUserText);
 
             for (const [key, value] of Object.entries(incoming || {})) {
                 if (value === undefined || value === null) continue;
@@ -178,14 +167,10 @@
                     continue;
                 }
                 if (key === 'assistantMessageIds') {
-                    merged.assistantMessageIds = source === 'snapshot'
-                        ? [...new Set(Array.isArray(value) ? value : [])]
-                        : Array.from(new Set([
-                            ...(Array.isArray(merged.assistantMessageIds)
-                                ? merged.assistantMessageIds
-                                : []),
-                            ...(Array.isArray(value) ? value : [])
-                        ]));
+                    const previousIds = source === 'snapshot'
+                        ? []
+                        : merged.assistantMessageIds;
+                    merged.assistantMessageIds = uniqueMessageIds(previousIds, value);
                     continue;
                 }
                 if (value !== '') merged[key] = value;
@@ -196,6 +181,8 @@
                 (source !== 'snapshot' || !incoming?.identity)) {
                 merged.identity = previous.identity;
             }
+            // Snapshot reads have no ordering guarantee: even a confirmed edit
+            // may be followed by an older snapshot from the same branch.
             if (preserveUserText) merged.preserveCommittedUserText = true;
             return merged;
         }
@@ -211,6 +198,8 @@
                 for (const alias of getAliases(record)) {
                     const match = aliases.get(alias);
                     if (match && match.kind === options.kind) return match;
+                    const sameKind = findFirstAliasMember(alias, options.kind);
+                    if (sameKind) return sameKind;
                 }
                 return null;
             }
@@ -223,7 +212,6 @@
             );
             if (index < 0) return false;
             entries.splice(index, 1);
-            committedUserText.delete(identity);
             rebuildAliases();
             return true;
         }
@@ -260,21 +248,18 @@
                     const observedPosition = orderedObservedPositions.get(match);
                     if (observedPosition === undefined) {
                         orderedObservedPositions.set(
-                            merged,
+                            match,
                             orderedObserved.length
                         );
-                        orderedObserved.push(merged);
-                    } else {
-                        orderedObserved[observedPosition] = merged;
-                        orderedObservedPositions.delete(match);
-                        orderedObservedPositions.set(merged, observedPosition);
+                        orderedObserved.push(match);
                     }
                     observedRecordCount += 1;
                     continue;
                 }
                 if (authoritative && isSuppressed(item)) continue;
 
-                const created = mergeEntry({}, item, 'observed');
+                // An observed record becomes the owned record; no second body copy.
+                const created = item;
                 appendEntry(created);
                 orderedObservedPositions.set(created, orderedObserved.length);
                 orderedObserved.push(created);
@@ -297,23 +282,45 @@
             const nextBranchKey = snapshot?.branchKey ?? null;
             const branchChanged = branchKey !== null &&
                 nextBranchKey !== null && nextBranchKey !== branchKey;
-            const nextAliases = aliases;
+            // Resolve the entire snapshot against the old alias state. Each old
+            // record can be claimed only once, even if snapshot aliases overlap.
+            const previousMembers = new Map(Array.from(aliasMembers, ([alias, members]) =>
+                [alias, Array.from(members).sort((left, right) =>
+                    entryPositions.get(left) - entryPositions.get(right)
+                )]
+            ));
 
-            const incomingSuppressed = next.some(isSuppressed);
-            if (incomingSuppressed && !branchChanged) {
+            const incomingSuppressed = !branchChanged && next.some(isSuppressed);
+            if (incomingSuppressed) {
                 return { accepted: false, entries };
             }
 
             const accepted = [];
+            const claimed = new Set();
+            const identityChanges = [];
             for (const item of next) {
                 if (!item?.identity) continue;
-                if (isSuppressed(item)) continue;
+                if (!branchChanged && isSuppressed(item)) continue;
                 let previous = null;
                 for (const alias of getAliases(item)) {
-                    previous = nextAliases.get(alias);
+                    previous = (previousMembers.get(alias) || []).find(record =>
+                        !claimed.has(record) &&
+                        (!item.kind || !record.kind || item.kind === record.kind)
+                    );
                     if (previous) break;
                 }
-                accepted.push(mergeEntry(previous || {}, item, 'snapshot'));
+                const merged = mergeEntry(previous || {}, item, 'snapshot');
+                if (previous) {
+                    const oldIdentity = previous.identity;
+                    Object.assign(previous, merged);
+                    claimed.add(previous);
+                    if (oldIdentity !== previous.identity) {
+                        identityChanges.push({oldIdentity, identity: previous.identity});
+                    }
+                    accepted.push(previous);
+                } else {
+                    accepted.push(merged);
+                }
             }
 
             for (const [identity, retiredAliases] of Array.from(suppressed)) {
@@ -324,12 +331,18 @@
                             incomingAliases.has(alias)
                         );
                 });
-                if (!stillPresent) suppressed.delete(identity);
+                /*
+                 * A new branch releases entries it contains. Entries absent
+                 * from that branch remain hidden in case stale DOM is mounted.
+                 */
+                if (branchChanged ? stillPresent : !stillPresent) {
+                    suppressed.delete(identity);
+                }
             }
             branchKey = nextBranchKey;
             authoritative = true;
             replaceEntries(accepted);
-            return { accepted: true, entries };
+            return { accepted: true, entries, identityChanges, branchChanged };
         }
 
         function pruneFrom(identity, options = {}) {
@@ -350,9 +363,8 @@
             }
             if (options.keepIdentity && options.userText !== undefined) {
                 const entry = entries[pivot];
-                committedUserText.set(entry.identity, options.userText);
                 entry.userText = options.userText;
-                entry.userTextSnapshot = options.userText;
+                entry.userTextSnapshot = options.userTextSnapshot ?? options.userText;
                 entry.domUserTextBaseline = options.domUserTextBaseline ??
                     options.userText;
                 entry.preserveCommittedUserText = true;
@@ -371,6 +383,17 @@
             resolveEntry,
             hasSnapshot: () => authoritative,
             getBranchKey: () => branchKey,
+            isSuppressed: entry => authoritative && isSuppressed(entry),
+            getSuppression: () => new Map(Array.from(suppressed, ([identity, keys]) =>
+                [identity, new Set(keys)]
+            )),
+            mergeSuppression: other => {
+                for (const [identity, keys] of other) {
+                    if (!suppressed.has(identity)) suppressed.set(identity, new Set(keys));
+                }
+                const retained = entries.filter(entry => !isSuppressed(entry));
+                if (retained.length !== entries.length) replaceEntries(retained);
+            },
             rebuildAliases
         };
     }
@@ -2592,13 +2615,37 @@
         return {left, top, width: clampedWidth, height: clampedHeight};
     }
 
+    function getElementClassName(element) {
+        return typeof element?.className === 'string'
+            ? element.className
+            : element?.className?.baseVal || '';
+    }
+
+    function isNamedReplyHeaderToolbar(element) {
+        return /(?:^|\s)Toolbar-[^\s]+/.test(getElementClassName(element)) ||
+            element?.getAttribute?.('role') === 'toolbar';
+    }
+
+    function updateReplyOutlineHeaderHost(toolbar, toggle, visible) {
+        const previousHost = toggle.parentElement;
+        if (previousHost && previousHost !== toolbar) {
+            previousHost.classList?.remove('yw-reply-outline-header-host');
+        }
+        toolbar?.classList?.toggle(
+            'yw-reply-outline-header-host',
+            Boolean(visible && isNamedReplyHeaderToolbar(toolbar))
+        );
+    }
+
     function bindReplyOutlineToggle(toggle, toolbar, visible = true) {
         if (!toggle) return false;
         if (!toolbar?.isConnected || typeof toolbar.insertBefore !== 'function') {
+            updateReplyOutlineHeaderHost(null, toggle, false);
             toggle.remove();
             toggle.hidden = true;
             return false;
         }
+        updateReplyOutlineHeaderHost(toolbar, toggle, visible);
         if (
             toggle.parentElement !== toolbar ||
             toolbar.firstElementChild !== toggle
@@ -2733,6 +2780,11 @@
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
+    const USER_MESSAGE_ID_SELECTOR =
+        '[data-user-message-bubble="true"][data-chatgpt-search-message-ids], ' +
+        '[data-user-message-bubble="true"][data-message-id]';
+    const MESSAGE_ELEMENT_SELECTOR =
+        '[data-chatgpt-selection-message-id], ' + USER_MESSAGE_ID_SELECTOR;
     const TURN_NODE_SELECTOR =
         '[data-turn-key], [data-content-search-turn-key], ' +
         '[data-user-message-bubble="true"], ' +
@@ -2813,8 +2865,9 @@
     const stableTurnOwnersByNode = new WeakMap();
     let newConversationSubmissionPending = false;
     let newConversationSubmissionTimer = null;
-    let assistantLabelRefreshTimer = null;
-    let pendingAssistantLabelUnits = new Map();
+    let contentRefreshTimer = null;
+    let pendingContentRefreshes = new Map();
+    let mountedStructureFingerprint = null;
     let railDensityCacheKey = '';
     let railLayoutSignature = '';
 
@@ -3184,6 +3237,10 @@
                 color: var(--color-text-primary, #0D0D0D);
                 font: inherit;
                 cursor: pointer;
+            }
+
+            .yw-reply-outline-header-host {
+                justify-content: flex-start;
             }
 
             #${REPLY_NAV_ID}-outline-toggle[aria-expanded="true"] {
@@ -4067,12 +4124,6 @@
                 rect.top <= headerRect.bottom + 12 &&
                 rect.bottom <= headerRect.bottom + 36;
         };
-        const classNameOf = element => typeof element?.className === 'string'
-            ? element.className
-            : element?.className?.baseVal || '';
-        const isNamedToolbar = element =>
-            /(?:^|\s)Toolbar-[^\s]+/.test(classNameOf(element)) ||
-            element?.getAttribute?.('role') === 'toolbar';
         const namedToolbarCandidates = root => [
             ...Array.from(root.querySelectorAll('[class*="Toolbar-"]')),
             ...Array.from(root.querySelectorAll('[role="toolbar"]'))
@@ -4085,7 +4136,7 @@
                 const leftRect = left.getBoundingClientRect();
                 const rightRect = right.getBoundingClientRect();
                 const score = (element, rect) =>
-                    (isNamedToolbar(element) ? 1000 : 0) +
+                    (isNamedReplyHeaderToolbar(element) ? 1000 : 0) +
                     (element.querySelector?.('button, [role="button"]') ? 100 : 0) -
                     Math.abs(rect.top - headerRect.top) - rect.height;
                 return score(right, rightRect) - score(left, leftRect);
@@ -4885,35 +4936,86 @@
         if (!sourceStore) return;
 
         const targetStore = getTurnRecordStore(toIdentity);
+        function transferEditCandidates(resolveIdentity) {
+            for (const [key, candidate] of Array.from(userEditCandidates)) {
+                if (candidate.chatIdentity !== fromIdentity) continue;
+                const nextKey = resolveIdentity(key);
+                candidate.chatIdentity = toIdentity;
+                candidate.identity = resolveIdentity(candidate.identity);
+                candidate.previousUserIdentity = resolveIdentity(candidate.previousUserIdentity);
+                if (nextKey !== key) userEditCandidates.delete(key);
+                userEditCandidates.set(nextKey, candidate);
+            }
+        }
+        if (
+            !targetStore.index.getEntries().length && !targetStore.turns.length &&
+            !targetStore.byIdentity.size && !targetStore.identityAliases.size &&
+            !targetStore.pairedAssistantToUser.size &&
+            !targetStore.suppressedRemovedIdentities.size &&
+            !targetStore.index.getSuppression().size
+        ) {
+            const entries = sourceStore.index.getEntries();
+            if (
+                entries.length !== sourceStore.byIdentity.size ||
+                entries.some(entry => sourceStore.byIdentity.get(entry.identity) !== entry)
+            ) synchronizeStoreWithIndex(sourceStore, [], toIdentity);
+            transferEditCandidates(identity => identity);
+            turnRecordsByChat.set(toIdentity, sourceStore);
+            turnRecordsByChat.delete(fromIdentity);
+            return;
+        }
+
         targetStore.index.upsertObserved(sourceStore.index.getEntries());
+        let identityChanges = [];
         if (sourceStore.index.hasSnapshot()) {
-            targetStore.index.applySnapshot({
+            const result = targetStore.index.applySnapshot({
                 chatId: toIdentity.slice('conversation:'.length),
                 branchKey: sourceStore.index.getBranchKey(),
                 entries: sourceStore.index.getEntries(),
                 pagination: { complete: false, cursor: null, hasError: false }
             });
+            if (result.accepted) identityChanges = result.identityChanges;
         }
-        for (const record of sourceStore.turns) {
-            if (targetStore.byIdentity.has(record.identity)) continue;
-            targetStore.byIdentity.set(record.identity, record);
-            insertTurnRecord(targetStore.turns, record);
-        }
+        targetStore.index.mergeSuppression(sourceStore.index.getSuppression());
+        synchronizeStoreWithIndex(targetStore, identityChanges, toIdentity);
 
+        function resolveTransferredIdentity(identity) {
+            if (!identity) return identity;
+            const canonical = resolveRememberedIdentity(sourceStore, identity) || identity;
+            const record = sourceStore.byIdentity.get(canonical) ||
+                sourceStore.index.resolveEntry({identity: canonical});
+            return (record && targetStore.index.resolveEntry(record, {kind: record.kind})
+                ?.identity) || identity;
+        }
+        transferEditCandidates(resolveTransferredIdentity);
+
+        for (const record of sourceStore.index.getEntries()) {
+            const canonical = resolveTransferredIdentity(record.identity);
+            if (canonical !== record.identity) {
+                targetStore.identityAliases.set(record.identity, canonical);
+            }
+        }
         for (const [alias, canonical] of sourceStore.identityAliases) {
             if (!targetStore.identityAliases.has(alias)) {
-                targetStore.identityAliases.set(alias, canonical);
+                targetStore.identityAliases.set(alias, resolveTransferredIdentity(canonical));
             }
         }
 
         for (const [assistantIdentity, userIdentity] of
             sourceStore.pairedAssistantToUser
         ) {
-            if (!targetStore.pairedAssistantToUser.has(assistantIdentity)) {
+            const assistant = resolveTransferredIdentity(assistantIdentity);
+            if (!targetStore.pairedAssistantToUser.has(assistant)) {
                 targetStore.pairedAssistantToUser.set(
-                    assistantIdentity,
-                    userIdentity
+                    assistant,
+                    resolveTransferredIdentity(userIdentity)
                 );
+            }
+        }
+
+        for (const [identity, suppression] of sourceStore.suppressedRemovedIdentities) {
+            if (!targetStore.suppressedRemovedIdentities.has(identity)) {
+                targetStore.suppressedRemovedIdentities.set(identity, suppression);
             }
         }
 
@@ -4974,9 +5076,9 @@
 
         cancelJumpSearch();
         userEditCandidates.clear();
-        clearTimeout(assistantLabelRefreshTimer);
-        assistantLabelRefreshTimer = null;
-        pendingAssistantLabelUnits.clear();
+        clearTimeout(contentRefreshTimer);
+        contentRefreshTimer = null;
+        pendingContentRefreshes.clear();
         latestNativePagination = null;
         nativeAdapterRetryPending = false;
         resetNativeAdapterRetryBackoff();
@@ -5170,11 +5272,39 @@
             );
     }
 
-    function getFirstMessageId(value) {
+    function getMessageIds(value) {
         return String(value || '')
             .split(/\s+/)
             .map(id => id.trim())
-            .filter(Boolean)[0] || '';
+            .filter(Boolean);
+    }
+
+    function getFirstMessageId(value) {
+        return getMessageIds(value)[0] || '';
+    }
+
+    function collectMessageEvidenceIds(...sources) {
+        const ids = new Set();
+        for (const source of sources) {
+            for (const value of [
+                source?.userMessageId,
+                source?.messageId,
+                ...(Array.isArray(source?.userMessageIds)
+                    ? source.userMessageIds
+                    : []),
+                ...(Array.isArray(source?.assistantMessageIds)
+                    ? source.assistantMessageIds
+                    : [])
+            ]) {
+                if (value) ids.add(value);
+            }
+        }
+        return ids;
+    }
+
+    function uniqueMessageIds(...groups) {
+        return Array.from(new Set(groups.flatMap(group =>
+            Array.isArray(group) ? group : [group]).filter(Boolean)));
     }
 
     function getIdentityValue(identity) {
@@ -5397,22 +5527,15 @@
         return '';
     }
 
-    function getRecordEvidenceIds(record) {
-        const ids = new Set();
-        for (const value of [
-            record?.userMessageId,
-            record?.messageId,
-            ...(record?.userMessageIds || []),
-            ...(record?.assistantMessageIds || [])
-        ]) {
-            if (value) ids.add(value);
-        }
-        if (record?.turnKey && !isFallbackSearchKey(record.turnKey)) {
-            ids.add(record.turnKey);
-        }
-        const identityValue = getIdentityValue(record?.identity);
+    function addEvidenceKeys(ids, identity, turnKey) {
+        if (turnKey && !isFallbackSearchKey(turnKey)) ids.add(turnKey);
+        const identityValue = getIdentityValue(identity);
         if (identityValue) ids.add(identityValue);
         return ids;
+    }
+
+    function getRecordEvidenceIds(record) {
+        return addEvidenceKeys(collectMessageEvidenceIds(record), record?.identity, record?.turnKey);
     }
 
     function evidenceIsCompatible(recordIds, turnIds) {
@@ -5621,11 +5744,7 @@
     }
 
     function getTurnMessageIds(turn) {
-        const splitIds = value => String(value || '')
-            .split(/\s+/)
-            .map(id => id.trim())
-            .filter(Boolean);
-        const userIds = splitIds(
+        const userIds = getMessageIds(
             turn?.userBubble?.getAttribute('data-chatgpt-search-message-ids') ||
             turn?.userBubble?.getAttribute('data-message-id')
         );
@@ -5647,7 +5766,7 @@
                 );
             }
         }
-        const cleanAssistantIds = Array.from(new Set(assistantIds.filter(Boolean)));
+        const cleanAssistantIds = uniqueMessageIds(assistantIds);
         const userMessageId = userIds[0] || '';
         return {
             userMessageId,
@@ -5659,7 +5778,7 @@
         };
     }
 
-    function toIndexRecord(turn) {
+    function toIndexIdentity(turn) {
         const messageIds = getTurnMessageIds(turn);
         const wrapperKey = getTurnWrapperKey(turn.root);
         const turnKey = turn.turnKey ||
@@ -5672,7 +5791,13 @@
             userMessageIds: turn.userMessageIds || messageIds.userMessageIds,
             messageId: turn.messageId || messageIds.messageId,
             assistantMessageIds: turn.assistantMessageIds ||
-                messageIds.assistantMessageIds,
+                messageIds.assistantMessageIds
+        };
+    }
+
+    function toIndexRecord(turn) {
+        return {
+            ...toIndexIdentity(turn),
             userText: turn.userText || getUserText(turn),
             assistantText: turn.assistantText || getAssistantText(turn),
             userTextSnapshot: turn.userTextSnapshot,
@@ -5726,39 +5851,84 @@
     }
 
     function makeTurnRecord(entry) {
-        return {
-            identity: entry.identity,
-            kind: entry.kind,
-            stableIdentity: true,
-            turnKey: entry.turnKey || '',
-            userMessageId: entry.userMessageId || '',
-            userMessageIds: Array.isArray(entry.userMessageIds)
-                ? [...entry.userMessageIds]
-                : [],
-            messageId: entry.messageId || '',
-            assistantMessageIds: Array.isArray(entry.assistantMessageIds)
-                ? [...entry.assistantMessageIds]
-                : [],
-            root: null,
-            userBubble: null,
-            assistantUnit: null,
-            userText: entry.userText || '',
-            userTextSnapshot: entry.userTextSnapshot || '',
-            domUserTextBaseline: typeof entry.domUserTextBaseline === 'string'
-                ? entry.domUserTextBaseline
-                : null,
-            assistantText: entry.assistantText || '',
-            preserveCommittedUserText: Boolean(entry.preserveCommittedUserText)
-        };
+        entry.stableIdentity = true;
+        entry.turnKey ||= '';
+        entry.userMessageId ||= '';
+        if (!Array.isArray(entry.userMessageIds)) entry.userMessageIds = [];
+        entry.messageId ||= '';
+        if (!Array.isArray(entry.assistantMessageIds)) entry.assistantMessageIds = [];
+        entry.root ||= null;
+        entry.userBubble ||= null;
+        entry.assistantUnit ||= null;
+        entry.userText ||= '';
+        entry.userTextSnapshot ||= '';
+        if (typeof entry.domUserTextBaseline !== 'string') {
+            entry.domUserTextBaseline = null;
+        }
+        entry.assistantText ||= '';
+        entry.preserveCommittedUserText = Boolean(entry.preserveCommittedUserText);
+        return entry;
     }
 
-    function applyNativeSnapshot(snapshot, chatIdentity = currentChatIdentity) {
+    function synchronizeStoreWithIndex(store, identityChanges, chatIdentity) {
+        const replacements = new Map(identityChanges.map(change =>
+            [change.oldIdentity, change.identity]
+        ));
+        const remap = identity => replacements.get(identity) || identity;
+
+        for (const [alias, canonical] of store.identityAliases) {
+            store.identityAliases.set(alias, remap(canonical));
+        }
+        for (const [oldIdentity, identity] of replacements) {
+            store.identityAliases.set(oldIdentity, identity);
+            if (turnIdentitiesByChat.get(chatIdentity)?.has(oldIdentity)) {
+                rememberTurnIdentity(chatIdentity, identity);
+            }
+        }
+
+        if (replacements.size) {
+            const pairs = new Map();
+            for (const [assistant, user] of store.pairedAssistantToUser) {
+                pairs.set(remap(assistant), remap(user));
+            }
+            store.pairedAssistantToUser = pairs;
+            for (const [oldIdentity, identity] of replacements) {
+                const suppression = store.suppressedRemovedIdentities.get(oldIdentity);
+                if (suppression) {
+                    store.suppressedRemovedIdentities.delete(oldIdentity);
+                    store.suppressedRemovedIdentities.set(identity, suppression);
+                }
+            }
+            for (const [identity, candidate] of Array.from(userEditCandidates)) {
+                if (candidate.chatIdentity !== chatIdentity) continue;
+                const nextIdentity = remap(identity);
+                candidate.identity = remap(candidate.identity);
+                candidate.previousUserIdentity = remap(candidate.previousUserIdentity);
+                if (nextIdentity !== identity) {
+                    userEditCandidates.delete(identity);
+                    userEditCandidates.set(nextIdentity, candidate);
+                }
+            }
+        }
+
+        const entries = store.index.getEntries();
+        store.byIdentity.clear();
+        for (const entry of entries) {
+            makeTurnRecord(entry);
+            if (!store.byIdentity.has(entry.identity)) {
+                store.byIdentity.set(entry.identity, entry);
+            }
+        }
+        store.turns.splice(0, store.turns.length, ...entries);
+    }
+
+    function applyNativeSnapshotWithChanges(snapshot, chatIdentity = currentChatIdentity) {
         if (
             !snapshot ||
             chatIdentity !== currentChatIdentity ||
             getChatIdentity() !== chatIdentity
         ) {
-            return false;
+            return {accepted: false};
         }
 
         const routeChatId = chatIdentity.startsWith('conversation:')
@@ -5769,49 +5939,64 @@
             snapshot.chatId !== routeChatId &&
             snapshot.chatId !== chatIdentity
         ) {
-            return false;
+            return {accepted: false};
         }
 
         const store = getTurnRecordStore(chatIdentity);
-        const result = store.index.applySnapshot(snapshot);
-        if (!result.accepted) return false;
-
-        const entries = store.index.getEntries();
-        const fallbackRecordsByEntry = buildFirstRecordByEntry(
-            store,
-            entries,
-            store.byIdentity.values()
+        const hadSnapshot = store.index.hasSnapshot();
+        const previousBranch = store.index.getBranchKey();
+        const bodyAndDOM = new Set([
+            'userText', 'assistantText', 'userTextSnapshot',
+            'domUserTextBaseline', 'preserveCommittedUserText',
+            'root', 'userBubble', 'assistantUnit'
+        ]);
+        const structureKey = record => JSON.stringify(
+            Object.keys(record).filter(key => !bodyAndDOM.has(key)).sort()
+                .map(key => [key, record[key]])
         );
-        const nextRecords = [];
-        for (const entry of entries) {
-            let record = store.byIdentity.get(entry.identity);
-            if (!record) record = fallbackRecordsByEntry.get(entry);
-            if (!record) {
-                record = makeTurnRecord(entry);
-                store.byIdentity.set(record.identity, record);
-            }
+        // The comparison is transient; record bodies have one persistent owner.
+        const previous = store.index.getEntries().map(record => ({
+            structure: structureKey(record),
+            userText: record.userText || '',
+            assistantText: record.assistantText || ''
+        }));
+        const result = store.index.applySnapshot(snapshot);
+        if (!result.accepted) return {accepted: false};
 
-            record.kind = entry.kind;
-            record.turnKey = entry.turnKey || record.turnKey || '';
-            record.userMessageId = entry.userMessageId || record.userMessageId || '';
-            record.userMessageIds = Array.isArray(entry.userMessageIds)
-                ? [...entry.userMessageIds]
-                : record.userMessageIds || [];
-            record.messageId = entry.messageId || record.messageId || '';
-            record.assistantMessageIds = [...(entry.assistantMessageIds || [])];
-            if (entry.userText && !record.preserveCommittedUserText) {
-                record.userText = entry.userText;
+        synchronizeStoreWithIndex(store, result.identityChanges, chatIdentity);
+        const entries = store.index.getEntries();
+        if (result.branchChanged) {
+            const acceptedIdentities = new Set(
+                entries.map(record => record.identity)
+            );
+            for (const identity of store.suppressedRemovedIdentities.keys()) {
+                if (acceptedIdentities.has(identity)) {
+                    store.suppressedRemovedIdentities.delete(identity);
+                }
             }
-            if (entry.assistantText) record.assistantText = entry.assistantText;
-            nextRecords.push(record);
         }
+        const structureChanged = !hadSnapshot ||
+            result.branchChanged ||
+            previous.length !== entries.length ||
+            entries.some((record, index) =>
+                structureKey(record) !== previous[index].structure
+            );
+        const changedIdentities = structureChanged ? [] : entries
+            .filter((record, index) =>
+                (record.userText || '') !== previous[index].userText ||
+                (record.assistantText || '') !== previous[index].assistantText
+            )
+            .map(record => record.identity);
+        return {accepted: true, structureChanged, changedIdentities};
+    }
 
-        store.turns.splice(0, store.turns.length, ...nextRecords);
-        return true;
+    function applyNativeSnapshot(snapshot, chatIdentity = currentChatIdentity) {
+        return applyNativeSnapshotWithChanges(snapshot, chatIdentity).accepted;
     }
 
     function acceptNativeSnapshot(snapshot, chatIdentity = currentChatIdentity) {
-        if (!applyNativeSnapshot(snapshot, chatIdentity)) return false;
+        const changes = applyNativeSnapshotWithChanges(snapshot, chatIdentity);
+        if (!changes.accepted) return false;
         if (chatIdentity === currentChatIdentity) {
             nativeAdapterRetryPending = false;
             resetNativeAdapterRetryBackoff();
@@ -5820,7 +6005,7 @@
                 reportRouteCapability('Native history', 'ready');
             }
             latestNativePagination = snapshot?.pagination || null;
-            scheduleRebuild(0);
+            scheduleNativeSnapshotProjection(changes);
             updateHistoryControl();
         }
         return true;
@@ -5953,9 +6138,12 @@
         const fullUserText = getFullUserText(observed);
         const userText = shorten(fullUserText, 1000);
         const assistantText = getAssistantText(observed);
+        const conflictsWithCommittedEdit = record.preserveCommittedUserText &&
+            fullUserText !== record.userTextSnapshot;
         if (
             observed.kind === 'user' &&
             observed.userBubble &&
+            !conflictsWithCommittedEdit &&
             (
                 liveObservation ||
                 (!record.preserveCommittedUserText && !record.userTextSnapshot)
@@ -5964,7 +6152,6 @@
             record.userTextSnapshot = fullUserText;
             record.domUserTextBaseline = fullUserText;
             if (userText) record.userText = userText;
-            if (liveObservation) record.preserveCommittedUserText = false;
         }
         if (
             assistantText &&
@@ -5992,11 +6179,50 @@
         if (wrapperKey && !isFallbackSearchKey(wrapperKey)) {
             record.turnKey = wrapperKey;
         }
-        Object.assign(record, getTurnMessageIds(observed));
+        const ids = getTurnMessageIds(observed);
+        if (ids.userMessageId) record.userMessageId = ids.userMessageId;
+        if (ids.userMessageIds.length) {
+            record.userMessageIds = uniqueMessageIds(record.userMessageIds, ids.userMessageIds);
+        }
+        if (ids.messageId) record.messageId = ids.messageId;
+        if (ids.assistantMessageIds.length) {
+            record.assistantMessageIds = uniqueMessageIds(record.assistantMessageIds, ids.assistantMessageIds);
+        }
+    }
+
+    function updateObservedTurnContent(observed) {
+        if (
+            !currentChatIdentity || getChatIdentity() !== currentChatIdentity ||
+            !observed?.stableIdentity || !observed.root?.isConnected
+        ) return null;
+
+        const store = turnRecordsByChat.get(currentChatIdentity);
+        if (!store) return null;
+        const remembered = resolveRememberedIdentity(store, observed.identity);
+        const record = store.byIdentity.get(remembered) ||
+            store.index.resolveEntry(toIndexIdentity(observed), {kind: observed.kind});
+        if (
+            !record || record.kind !== observed.kind ||
+            store.byIdentity.get(record.identity) !== record ||
+            store.suppressedRemovedIdentities.has(record.identity)
+        ) return null;
+
+        // This path only refreshes body text; identities and order are unchanged.
+        updateTurnRecord(record, observed, false);
+        return record;
     }
 
     function asElement(node) {
         return node instanceof Element ? node : node?.parentElement || null;
+    }
+
+    function getTurnNodes(turn) {
+        return [
+            turn?.root,
+            turn?.userBubble,
+            turn?.assistantUnit,
+            ...(turn?.pairedAssistantUnits || [])
+        ].filter(Boolean);
     }
 
     function findKnownUserTurnContainingNode(node) {
@@ -6080,9 +6306,12 @@
         if (!turn?.stableIdentity || turn.kind !== 'user') return;
 
         const store = turnRecordsByChat.get(currentChatIdentity);
-        const pivotIndex = store?.turns.findIndex(record =>
+        const branchTurns = store?.index.hasSnapshot()
+            ? store.index.getEntries()
+            : store?.turns || [];
+        const pivotIndex = branchTurns.findIndex(record =>
             record.identity === turn.identity
-        ) ?? -1;
+        );
         const record = store?.byIdentity.get(turn.identity);
         if (!record || pivotIndex < 0) return;
 
@@ -6090,8 +6319,8 @@
         if (!candidate) {
             let previousUserIdentity = null;
             for (let index = pivotIndex - 1; index >= 0; index--) {
-                if (store.turns[index].kind === 'user') {
-                    previousUserIdentity = store.turns[index].identity;
+                if (branchTurns[index].kind === 'user') {
+                    previousUserIdentity = branchTurns[index].identity;
                     break;
                 }
             }
@@ -6222,7 +6451,10 @@
         observed,
         replacementIdentity = null
     ) {
-        const boundary = store.turns.findIndex(record =>
+        const branchTurns = store.index.hasSnapshot()
+            ? [...store.index.getEntries()]
+            : [...store.turns];
+        const boundary = branchTurns.findIndex(record =>
             record.identity === identity
         );
         if (boundary < 0) return null;
@@ -6231,13 +6463,19 @@
         const keepRecord = retainedIdentity
             ? store.byIdentity.get(retainedIdentity)
             : null;
+        const editedTurn = keepPivot
+            ? observed.find(turn => turn.identity === identity && turn.kind === 'user')
+            : null;
+        const committedText = editedTurn
+            ? getFullUserText(editedTurn)
+            : (keepRecord?.userTextSnapshot || keepRecord?.userText || '');
         store.index.pruneFrom(identity, {
             keepIdentity: keepPivot,
-            userText: keepPivot
-                ? (keepRecord?.userTextSnapshot || keepRecord?.userText || '')
-                : undefined
+            userText: keepPivot ? shorten(committedText, 1000) : undefined,
+            userTextSnapshot: keepPivot ? committedText : undefined,
+            domUserTextBaseline: keepPivot ? committedText : undefined
         });
-        const removedRecords = store.turns.slice(boundary).filter(record =>
+        const removedRecords = branchTurns.slice(boundary).filter(record =>
             record !== keepRecord
         );
         const removedIdentities = new Set(
@@ -6276,7 +6514,7 @@
             });
         }
 
-        const retainedPrefix = store.turns.slice(0, boundary).filter(record =>
+        const retainedPrefix = branchTurns.slice(0, boundary).filter(record =>
             record !== keepRecord
         );
         store.turns = retainedPrefix;
@@ -6355,28 +6593,8 @@
     }
 
     function getTurnEvidenceIds(turn) {
-        const ids = new Set();
-        const messageIds = getTurnMessageIds(turn);
-        for (const value of [
-            messageIds.userMessageId,
-            messageIds.messageId,
-            ...messageIds.userMessageIds,
-            ...messageIds.assistantMessageIds,
-            turn?.userMessageId,
-            turn?.messageId,
-            ...(turn?.userMessageIds || []),
-            ...(turn?.assistantMessageIds || [])
-        ]) {
-            if (value) ids.add(value);
-        }
-
-        const wrapperKey = getTurnWrapperKey(turn?.root);
-        if (wrapperKey && !isFallbackSearchKey(wrapperKey)) {
-            ids.add(wrapperKey);
-        }
-        const identityValue = getIdentityValue(turn?.identity);
-        if (identityValue) ids.add(identityValue);
-        return ids;
+        return addEvidenceKeys(collectMessageEvidenceIds(getTurnMessageIds(turn), turn),
+            turn?.identity, getTurnWrapperKey(turn?.root));
     }
 
     function findAdjacentRecordOfKind(records, startIndex, direction, kind) {
@@ -6483,11 +6701,7 @@
             const expectedPrefix = turn.kind === 'user'
                 ? 'user:'
                 : 'assistant:';
-            const turnNodes = [
-                turn.root,
-                turn.userBubble,
-                turn.assistantUnit
-            ];
+            const turnNodes = getTurnNodes(turn);
             let canonical = '';
 
             if (turn.stableIdentity) {
@@ -6566,13 +6780,8 @@
         if (record?.turnKey && record?.kind) {
             result.add(`turn:${record.kind}:${record.turnKey}`);
         }
-        for (const messageId of [
-            record?.messageId,
-            record?.userMessageId,
-            ...(record?.userMessageIds || []),
-            ...(record?.assistantMessageIds || [])
-        ]) {
-            if (messageId) result.add(`message:${messageId}`);
+        for (const messageId of collectMessageEvidenceIds(record)) {
+            result.add(`message:${messageId}`);
         }
         return result;
     }
@@ -6595,15 +6804,9 @@
             target.assistantText = source.assistantText;
         }
         target.userMessageId = target.userMessageId || source.userMessageId || '';
-        target.userMessageIds = Array.from(new Set([
-            ...(target.userMessageIds || []),
-            ...(source.userMessageIds || [])
-        ]));
+        target.userMessageIds = uniqueMessageIds(target.userMessageIds, source.userMessageIds);
         target.messageId = target.messageId || source.messageId || '';
-        target.assistantMessageIds = Array.from(new Set([
-            ...(target.assistantMessageIds || []),
-            ...(source.assistantMessageIds || [])
-        ]));
+        target.assistantMessageIds = uniqueMessageIds(target.assistantMessageIds, source.assistantMessageIds);
         if (!target.turnKey && source.turnKey) target.turnKey = source.turnKey;
         for (const key of ['root', 'userBubble', 'assistantUnit']) {
             if (
@@ -6754,6 +6957,11 @@
                 store.suppressedRemovedIdentities.delete(turn.identity);
             }
 
+            if (
+                !store.byIdentity.has(turn.identity) &&
+                store.index.isSuppressed(toIndexIdentity(turn))
+            ) return false;
+
             if (turn.kind === 'user' &&
                 !Array.isArray(turn.pairedAssistantUnits)) {
                 const pairedAssistantUnits = getPairedAssistantUnits(turn);
@@ -6850,7 +7058,9 @@
             updateTurnRecord(record, turn, replaceNodeReferences);
         }
 
-        enforceObservedTurnOrder(store.turns, observed);
+        if (!store.index.hasSnapshot()) {
+            enforceObservedTurnOrder(store.turns, observed);
+        }
 
         for (const record of newRecords) {
             if (
@@ -6871,30 +7081,16 @@
 
         collapseDuplicateTurnRecords(store);
 
-        store.index.upsertObserved(store.turns.map(toIndexRecord));
+        store.index.upsertObserved(store.turns);
+        if (store.index.hasSnapshot()) {
+            store.turns.splice(0, store.turns.length, ...store.index.getEntries());
+        }
     }
 
     function buildRenderedTurns(observedTurns) {
         const store = getTurnRecordStore(currentChatIdentity);
         const entries = store.index.getEntries();
-        const fallbackRecordsByEntry = buildFirstRecordByEntry(
-            store,
-            entries,
-            store.turns
-        );
-        const rendered = entries.map(entry => {
-            const record = store.byIdentity.get(entry.identity) ||
-                fallbackRecordsByEntry.get(entry);
-            const mounted = mountedTurnsByIdentity.get(entry.identity);
-            return {
-                ...(record || {}),
-                ...entry,
-                root: mounted?.root || record?.root || null,
-                userBubble: mounted?.userBubble || record?.userBubble || null,
-                assistantUnit: mounted?.assistantUnit || record?.assistantUnit || null,
-                stableIdentity: true
-            };
-        });
+        const rendered = [...entries];
         const placements = [];
 
         if (!rendered.length) {
@@ -6942,22 +7138,6 @@
         });
 
         return rendered;
-    }
-
-    function buildFirstRecordByEntry(store, entries, records) {
-        const needed = new Set(entries.filter(entry =>
-            !store.byIdentity.has(entry.identity)
-        ));
-        if (!needed.size) return new Map();
-
-        const recordsByEntry = new Map();
-        for (const record of records) {
-            const entry = store.index.resolveEntry(toIndexRecord(record));
-            if (!needed.has(entry) || recordsByEntry.has(entry)) continue;
-            recordsByEntry.set(entry, record);
-            if (recordsByEntry.size === needed.size) break;
-        }
-        return recordsByEntry;
     }
 
     function getTurnBarLabel(turn, index, contentTurn = turn) {
@@ -7437,14 +7617,13 @@
             }
         }
         for (const element of document.querySelectorAll(
-            '[data-user-message-bubble="true"][data-chatgpt-search-message-ids], ' +
-            '[data-user-message-bubble="true"][data-message-id]'
+            USER_MESSAGE_ID_SELECTOR
         )) {
-            const ids = String(
+            const ids = getMessageIds(
                 element.getAttribute('data-chatgpt-search-message-ids') ||
                 element.getAttribute('data-message-id') ||
                 ''
-            ).split(/\s+/);
+            );
             if (ids.includes(messageId)) return element;
         }
         return null;
@@ -7936,19 +8115,15 @@
         }
 
         const candidates = [];
-        for (const element of document.querySelectorAll(
-            '[data-chatgpt-selection-message-id], ' +
-            '[data-user-message-bubble="true"][data-chatgpt-search-message-ids], ' +
-            '[data-user-message-bubble="true"][data-message-id]'
-        )) {
+        for (const element of document.querySelectorAll(MESSAGE_ELEMENT_SELECTOR)) {
             if (!element.isConnected) continue;
             const ids = element.hasAttribute('data-chatgpt-selection-message-id')
                 ? [element.getAttribute('data-chatgpt-selection-message-id')]
-                : String(
+                : getMessageIds(
                     element.getAttribute('data-chatgpt-search-message-ids') ||
                     element.getAttribute('data-message-id') ||
                     ''
-                ).split(/\s+/);
+                );
             const messageId = ids.find(Boolean);
             if (!messageId) continue;
             const rect = element.getBoundingClientRect();
@@ -8342,6 +8517,11 @@
         cancelRebuildSchedule();
         handleRouteChange(false);
         ensureUI();
+
+        clearTimeout(contentRefreshTimer);
+        contentRefreshTimer = null;
+        pendingContentRefreshes.clear();
+        mountedStructureFingerprint = readMountedStructureFingerprint();
 
         const observedTurns = collectTurns().filter(trackCurrentRouteTurn);
         mergeObservedTurnRecords(observedTurns, true, true, true);
@@ -9164,8 +9344,52 @@
         );
     }
 
+    const STRUCTURE_ATTRIBUTES = [
+        'data-turn-key',
+        'data-content-search-turn-key',
+        'data-user-message-bubble',
+        'data-content-search-unit-key',
+        'data-chatgpt-search-unit-key',
+        'data-conversation-role',
+        'data-chatgpt-search-message-ids',
+        'data-chatgpt-selection-message-id',
+        'data-message-id'
+    ];
+    const STRUCTURE_NODE_SELECTOR = TURN_NODE_SELECTOR +
+        ', [data-chatgpt-search-message-ids], ' +
+        '[data-chatgpt-selection-message-id], [data-message-id]';
+
+    function readMountedStructureFingerprint() {
+        return {
+            chatIdentity: currentChatIdentity,
+            nodes: Array.from(document.querySelectorAll(STRUCTURE_NODE_SELECTOR), node => ({
+                node,
+                attributes: STRUCTURE_ATTRIBUTES.map(name => node.getAttribute(name))
+            }))
+        };
+    }
+
+    function mountedStructureChanged(previous, next) {
+        if (previous.nodes.length !== next.nodes.length) return true;
+        return next.nodes.some((item, index) => {
+            const old = previous.nodes[index];
+            return item.node !== old.node || item.attributes.some((value, offset) =>
+                value !== old.attributes[offset]
+            );
+        });
+    }
+
     function pollForUnobservedChanges() {
         handleRouteChange();
+        const fingerprint = readMountedStructureFingerprint();
+        if (
+            !mountedStructureFingerprint ||
+            mountedStructureFingerprint.chatIdentity !== currentChatIdentity
+        ) {
+            mountedStructureFingerprint = fingerprint;
+        } else if (mountedStructureChanged(mountedStructureFingerprint, fingerprint)) {
+            rebuildDirty = true;
+        }
         if (rebuildDirty && rebuildTimer === null && !rebuildImmediatePending) {
             scheduleRebuild();
         }
@@ -9181,13 +9405,7 @@
         const element = asElement(node);
         if (!element) return false;
         for (const turn of mountedTurnsByIdentity.values()) {
-            const roots = [
-                turn.root,
-                turn.userBubble,
-                turn.assistantUnit,
-                ...(turn.pairedAssistantUnits || [])
-            ];
-            if (roots.some(root =>
+            if (getTurnNodes(turn).some(root =>
                 root instanceof Element &&
                 root.isConnected &&
                 (root === element || root.contains(element))
@@ -9208,13 +9426,7 @@
 
         const nextNodes = new Set();
         for (const turn of observedTurns) {
-            const candidates = [
-                turn.root,
-                turn.userBubble,
-                turn.assistantUnit,
-                ...(turn.pairedAssistantUnits || [])
-            ];
-            for (const node of candidates) {
+            for (const node of getTurnNodes(turn)) {
                 if (node instanceof Element && node.isConnected) {
                     nextNodes.add(node);
                 }
@@ -9237,9 +9449,9 @@
     function nodeContainsTurn(node) {
         if (!(node instanceof Element)) return false;
 
-        if (node.matches(TURN_NODE_SELECTOR)) return true;
+        if (node.matches(STRUCTURE_NODE_SELECTOR)) return true;
 
-        return Boolean(node.querySelector(TURN_NODE_SELECTOR));
+        return Boolean(node.querySelector(STRUCTURE_NODE_SELECTOR));
     }
 
     function isKnownCurrentChatTurn(turn) {
@@ -9280,92 +9492,135 @@
         return collectTurns(target).some(isKnownCurrentChatTurn);
     }
 
-    function flushAssistantBarRefreshes() {
-        assistantLabelRefreshTimer = null;
-        const pending = Array.from(pendingAssistantLabelUnits.values());
-        pendingAssistantLabelUnits.clear();
-        const observedTurns = collectTurns();
+    function scheduleContentRefresh(identity, observed, delay) {
+        pendingContentRefreshes.set(identity, {
+            identity,
+            observed,
+            chatIdentity: currentChatIdentity
+        });
+        if (contentRefreshTimer === null) {
+            contentRefreshTimer = setTimeout(flushTurnContentRefreshes, delay);
+        }
+    }
 
+    function scheduleNativeSnapshotProjection(changes) {
+        if (changes.structureChanged) {
+            scheduleRebuild(0);
+            return;
+        }
+        if (rebuildDirty) return;
+        for (const identity of changes.changedIdentities) {
+            scheduleContentRefresh(
+                identity,
+                mountedTurnsByIdentity.get(identity) || null,
+                0
+            );
+        }
+    }
+
+    function flushTurnContentRefreshes() {
+        contentRefreshTimer = null;
+        const pending = Array.from(pendingContentRefreshes.values());
+        pendingContentRefreshes.clear();
+        if (getChatIdentity() !== currentChatIdentity) {
+            handleRouteChange();
+            return;
+        }
+        if (rebuildDirty) return;
         let refreshed = false;
-
-        for (const { identity, assistantUnit, chatIdentity } of pending) {
+        let layoutChanged = false;
+        for (const {identity, observed, chatIdentity} of pending) {
+            if (chatIdentity !== currentChatIdentity) continue;
+            const index = turns.findIndex(turn => turn.identity === identity);
+            const turn = turns[index];
+            const bar = barList?.children[index];
             if (
-                chatIdentity !== currentChatIdentity ||
-                !assistantUnit.isConnected
+                !turn || bar?.dataset.ywIdentity !== identity ||
+                userEditCandidates.has(identity) ||
+                (observed && (
+                    mountedTurnsByIdentity.get(identity) !== observed ||
+                    !observed.root?.isConnected ||
+                    userEditCandidates.has(observed.identity)
+                )) ||
+                (!observed && mountedTurnsByIdentity.has(identity))
             ) {
+                scheduleRebuild();
                 continue;
             }
 
-            for (let index = 0; index < turns.length; index++) {
-                const turn = turns[index];
-                const isMatchingAssistant =
-                    turn.kind === 'assistant' && turn.identity === identity;
-                const containsAssistant =
-                    isPairedAssistantUnit(turn, assistantUnit);
-                if (!isMatchingAssistant && !containsAssistant) continue;
-
-                const observed = observedTurns.find(candidate =>
-                    candidate.identity === turn.identity &&
-                    candidate.stableIdentity
-                );
-                const record = turnRecordsByChat
-                    .get(chatIdentity)?.byIdentity.get(turn.identity);
-                if (record && observed) {
-                    updateTurnRecord(record, observed, true);
-                } else if (record) {
-                    record.assistantUnit = assistantUnit;
-                    record.root = turn.kind === 'assistant'
-                        ? assistantUnit.querySelector(
-                            '[data-chatgpt-selection-message-id]'
-                        ) || assistantUnit
-                        : turn.root;
-                    const assistantText = getAssistantText(record);
-                    if (assistantText) record.assistantText = assistantText;
-                } else {
-                    turn.assistantUnit = assistantUnit;
-                    turn.root = assistantUnit.querySelector(
-                        '[data-chatgpt-selection-message-id]'
-                    ) || assistantUnit;
-                }
-
-                barList?.children[index]?.setAttribute(
-                    'aria-label',
-                    getTurnBarLabel(turn, index, observed || turn)
-                );
-                refreshed = true;
+            const record = observed
+                ? updateObservedTurnContent(observed)
+                : turnRecordsByChat.get(chatIdentity)?.byIdentity.get(identity);
+            if (!record || record !== turn || record.identity !== identity) {
+                scheduleRebuild();
+                continue;
             }
+            bar.setAttribute('aria-label', getTurnBarLabel(turn, index, {
+                kind: record.kind,
+                userText: record.userText,
+                assistantText: record.assistantText
+            }));
+            refreshed = true;
+            if (observed) layoutChanged = true;
         }
 
-        if (refreshed) scheduleActiveUpdate();
+        if (refreshed) {
+            if (layoutChanged) {
+                invalidateThreadLayout();
+                scheduleActiveUpdate();
+            } else {
+                scheduleReplyNavigationUpdate();
+            }
+        }
     }
 
-    function queueAssistantBarRefresh(node) {
-        const element = node instanceof Element ? node : node?.parentElement;
+    function queueTurnContentRefresh(node) {
+        const element = asElement(node);
         if (!element) return false;
+        const store = turnRecordsByChat.get(currentChatIdentity);
+        if (!store) return false;
 
         const assistantUnit = element.matches(ASSISTANT_UNIT_SELECTOR)
             ? element
             : element.closest(ASSISTANT_UNIT_SELECTOR);
-        if (!assistantUnit) return false;
-
-        const unitIdentity = getAssistantUnitIdentity(assistantUnit);
-        if (!unitIdentity) return false;
-
-        const identity = `assistant:${unitIdentity}`;
-        pendingAssistantLabelUnits.set(identity, {
-            identity,
+        let identity = '';
+        let observed = null;
+        for (const owner of [
             assistantUnit,
-            chatIdentity: currentChatIdentity
-        });
-
-        /* 每 250ms 合并一次文本流更新，避免每个字符都读取整段回复。 */
-        if (assistantLabelRefreshTimer === null) {
-            assistantLabelRefreshTimer = setTimeout(
-                flushAssistantBarRefreshes,
-                250
+            element.closest('[data-user-message-bubble="true"]')
+        ]) {
+            identity = resolveRememberedIdentity(
+                store,
+                store.identitiesByNode.get(owner)
             );
+            observed = identity && mountedTurnsByIdentity.get(identity);
+            if (observed) break;
+        }
+        if (!observed) {
+            for (const [mountedIdentity, mounted] of mountedTurnsByIdentity) {
+                const userContent = mounted.userBubble &&
+                    (mounted.userBubble === element ||
+                        mounted.userBubble.contains(element));
+                const assistantContent = assistantUnit && (
+                    mounted.assistantUnit === assistantUnit ||
+                    mounted.pairedAssistantUnits?.includes(assistantUnit)
+                );
+                if (!userContent && !assistantContent) continue;
+                identity = mountedIdentity;
+                observed = mounted;
+                break;
+            }
+        }
+        if (
+            !observed?.stableIdentity || !observed.root?.isConnected ||
+            userEditCandidates.has(identity) ||
+            userEditCandidates.has(observed.identity)
+        ) {
+            return false;
         }
 
+        /* 每 250ms 合并正文更新，流式输出只读取受影响的回合。 */
+        scheduleContentRefresh(identity, observed, 250);
         return true;
     }
 
@@ -9421,10 +9676,10 @@
                 captureUserEditCandidatesFromMutation(mutation);
 
                 if (mutation.type === 'characterData') {
-                    queueAssistantBarRefresh(mutation.target);
                     if (
-                        findKnownUserContentTurn(mutation.target) ||
-                        nodeIsWithinMountedThread(mutation.target)
+                        !queueTurnContentRefresh(mutation.target) &&
+                        (findKnownUserContentTurn(mutation.target) ||
+                            nodeIsWithinMountedThread(mutation.target))
                     ) {
                         relevant = true;
                     }
@@ -9450,37 +9705,42 @@
                     continue;
                 }
 
-                if (
-                    findKnownUserContentTurn(mutation.target) ||
-                    nodeIsWithinMountedThread(mutation.target)
-                ) {
-                    relevant = true;
-                }
-
+                let structural = false;
                 for (const node of mutation.removedNodes) {
                     if (nodeContainsTurn(node)) {
                         removedTurnSnapshots.push(...collectTurns(node));
-                        relevant = true;
+                        structural = true;
                     }
                 }
 
                 if (
                     mutation.type === 'attributes' &&
-                    nodeContainsTurn(mutation.target)
+                    (nodeContainsTurn(mutation.target) ||
+                        nodeIsWithinMountedThread(mutation.target))
                 ) {
-                    relevant = true;
+                    structural = true;
                     collectTurns(mutation.target).forEach(trackCurrentRouteTurn);
                 }
 
                 for (const node of mutation.addedNodes) {
                     if (nodeContainsTurn(node)) {
-                        relevant = true;
+                        structural = true;
                         collectTurns(node).forEach(trackCurrentRouteTurn);
                     }
                 }
 
-                if (mutation.type === 'childList') {
-                    queueAssistantBarRefresh(mutation.target);
+                if (structural) {
+                    relevant = true;
+                } else if (
+                    mutation.type === 'childList' &&
+                    queueTurnContentRefresh(mutation.target)
+                ) {
+                    continue;
+                } else if (
+                    findKnownUserContentTurn(mutation.target) ||
+                    nodeIsWithinMountedThread(mutation.target)
+                ) {
+                    relevant = true;
                 }
             }
 
@@ -9492,8 +9752,6 @@
                 invalidateThreadLayout();
                 scheduleNativeSnapshotRefresh();
                 scheduleRebuild();
-            } else if (hasExternalMutation) {
-                rebuildDirty = true;
             }
         });
 
@@ -9503,12 +9761,7 @@
             attributes: true,
             characterData: true,
             attributeFilter: [
-                'data-turn-key',
-                'data-content-search-turn-key',
-                'data-user-message-bubble',
-                'data-content-search-unit-key',
-                'data-chatgpt-search-unit-key',
-                'data-conversation-role',
+                ...STRUCTURE_ATTRIBUTES,
                 'aria-expanded',
                 'data-state',
                 'style',
@@ -9524,7 +9777,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.0)');
+        console.info('[Conversation Navigator] Started (0.5.1)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();

@@ -1373,12 +1373,23 @@ test('project header row binding inserts first and survives header replacement',
     assert.equal(runtime.findHeaderToolbar(), first.toolbar);
     assert.equal(bindReplyOutlineToggle(toggle, first.toolbar, true), true);
     assert.equal(first.toolbar.firstElementChild, toggle);
+    assert.equal(first.toolbar.classList.contains('yw-reply-outline-header-host'), true);
+    const scriptSource = require('node:fs').readFileSync(
+        require.resolve('./chatgpt-conversation-navigator.user.js'),
+        'utf8'
+    );
+    assert.match(
+        scriptSource,
+        /\.yw-reply-outline-header-host\s*\{[^}]*justify-content:\s*flex-start/
+    );
 
     const replacement = makeProjectHeader();
     runtime.setHeader(replacement.header);
     assert.equal(runtime.findHeaderToolbar(), replacement.toolbar);
     assert.equal(bindReplyOutlineToggle(toggle, replacement.toolbar, true), true);
     assert.equal(replacement.toolbar.firstElementChild, toggle);
+    assert.equal(first.toolbar.classList.contains('yw-reply-outline-header-host'), false);
+    assert.equal(replacement.toolbar.classList.contains('yw-reply-outline-header-host'), true);
     assert.equal(first.toolbar.children.includes(toggle), false);
 });
 
@@ -1472,6 +1483,7 @@ test('normal chat binds to the semantic main titlebar independently of native bu
     assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'false');
     assert.equal(ui.outlineToggle.id, 'outline-toggle-owned-id');
     assert.equal(titlebar.firstElementChild, ui.outlineToggle);
+    assert.equal(titlebar.classList.contains('yw-reply-outline-header-host'), false);
     assert.equal(actionGroup.firstElementChild, shareButton);
     assert.equal(moreButton.parentElement, actionGroup);
     assert.equal(moreButton.className, 'Button-QTscM8 Toolbar-TcAqyt no-drag outline-hidden cursor-interaction');
@@ -2030,6 +2042,27 @@ function makeTestElement({
             removeProperty(name) { delete this[name]; },
             getPropertyValue(name) { return this[name] || ''; },
             setProperty(name, value) { this[name] = value; }
+        },
+        classList: {
+            add(...tokens) {
+                const classes = new Set(String(element.className || '').split(/\s+/).filter(Boolean));
+                for (const token of tokens) classes.add(token);
+                element.className = Array.from(classes).join(' ');
+            },
+            remove(...tokens) {
+                const removed = new Set(tokens);
+                element.className = String(element.className || '').split(/\s+/)
+                    .filter(token => token && !removed.has(token)).join(' ');
+            },
+            contains(token) {
+                return String(element.className || '').split(/\s+/).includes(token);
+            },
+            toggle(token, force) {
+                const enabled = force === undefined ? !this.contains(token) : Boolean(force);
+                if (enabled) this.add(token);
+                else this.remove(token);
+                return enabled;
+            }
         },
         dataset: {},
         closest,

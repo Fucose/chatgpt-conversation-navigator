@@ -158,6 +158,45 @@ test('pruning suppresses a stale snapshot from restoring removed entries', () =>
     );
 });
 
+test('a new branch releases present entries but keeps absent old entries hidden', () => {
+    const index = createConversationIndex();
+    const original = [
+        {identity: 'first', kind: 'user', userMessageId: 'user-first'},
+        {identity: 'second', kind: 'user', userMessageId: 'user-second'},
+        {identity: 'removed', kind: 'user', userMessageId: 'user-removed'}
+    ];
+    index.applySnapshot({branchKey: 'old-branch', entries: original});
+    index.pruneFrom('second');
+
+    const result = index.applySnapshot({
+        branchKey: 'new-branch',
+        entries: original.slice(0, 2)
+    });
+    assert.equal(result.accepted, true);
+    assert.deepEqual(
+        index.getEntries().map(entry => entry.identity),
+        ['first', 'second']
+    );
+
+    index.upsertObserved({
+        identity: 'second',
+        kind: 'user',
+        userMessageId: 'user-second',
+        userText: 'restored branch'
+    });
+    index.upsertObserved({
+        identity: 'removed',
+        kind: 'user',
+        userMessageId: 'user-removed',
+        userText: 'stale old branch'
+    });
+    assert.deepEqual(
+        index.getEntries().map(entry => entry.identity),
+        ['first', 'second']
+    );
+    assert.equal(index.getEntries()[1].userText, 'restored branch');
+});
+
 test('committed user text survives a snapshot with stale text baselines', () => {
     const index = createConversationIndex();
     index.applySnapshot({
@@ -282,4 +321,71 @@ test('public rebuildAliases synchronizes explicit entry mutations', () => {
         index.resolveEntry({identity: 'new-probe', messageId: 'after'}),
         entry
     );
+});
+
+test('updating a shared record reindexes the aliases captured before mutation', () => {
+    const index = createConversationIndex();
+    const entries = index.upsertObserved({
+        identity: 'turn', kind: 'user', messageId: 'before'
+    });
+    const record = entries[0];
+    record.messageId = 'after';
+    index.upsertObserved(record);
+
+    assert.equal(index.getEntries(), entries);
+    assert.equal(index.getEntries()[0], record);
+    assert.equal(index.resolveEntry({identity: 'probe', messageId: 'before'}), null);
+    assert.equal(index.resolveEntry({identity: 'probe', messageId: 'after'}), record);
+});
+
+test('snapshot rekey preserves the record and committed edit through the new identity', () => {
+    const index = createConversationIndex();
+    const entries = index.upsertObserved({
+        identity: 'old', kind: 'user', turnKey: 'round', userText: 'before'
+    });
+    const record = entries[0];
+    index.pruneFrom('old', {keepIdentity: true, userText: 'edited'});
+
+    const result = index.applySnapshot({branchKey: 'branch', entries: [{
+        identity: 'new', kind: 'user', turnKey: 'round', userText: 'before'
+    }]});
+    assert.equal(result.accepted, true);
+    assert.deepEqual(result.identityChanges, [{oldIdentity: 'old', identity: 'new'}]);
+    assert.equal(index.getEntries(), entries);
+    assert.equal(entries[0], record);
+    assert.equal(record.userText, 'edited');
+    assert.equal(index.resolveEntry({identity: 'old'}), null);
+    assert.equal(index.resolveEntry({identity: 'new'}), record);
+});
+
+test('a stale snapshot after a confirmed edit cannot overwrite committed text', () => {
+    const index = createConversationIndex();
+    index.upsertObserved({identity: 'user:B', kind: 'user', turnKey: 'B', userText: 'before'});
+    index.pruneFrom('user:B', {keepIdentity: true, userText: 'edited',
+        domUserTextBaseline: 'edited'});
+    const snapshot = userText => ({branchKey: 'branch', entries: [{
+        identity: 'user:B', kind: 'user', turnKey: 'B', userText
+    }]});
+
+    assert.equal(index.applySnapshot(snapshot('edited')).accepted, true);
+    assert.equal(index.applySnapshot(snapshot('before')).accepted, true);
+    assert.equal(index.getEntries()[0].userText, 'edited');
+    assert.equal(index.getEntries()[0].preserveCommittedUserText, true);
+});
+
+test('an alias shared across kinds resolves and updates the requested kind', () => {
+    const index = createConversationIndex();
+    index.applySnapshot({branchKey: 'branch', entries: [
+        {identity: 'user', kind: 'user', messageId: 'shared'},
+        {identity: 'assistant', kind: 'assistant', messageId: 'shared'}
+    ]});
+    const assistant = index.resolveEntry(
+        {identity: 'probe', messageId: 'shared'}, {kind: 'assistant'}
+    );
+    assert.equal(assistant.identity, 'assistant');
+    index.upsertObserved({identity: 'assistant-dom', kind: 'assistant',
+        messageId: 'shared', assistantText: 'updated'});
+    assert.equal(index.getEntries().length, 2);
+    assert.equal(assistant.assistantText, 'updated');
+    assert.equal(index.getEntries()[0].assistantText, undefined);
 });
