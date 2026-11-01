@@ -531,7 +531,7 @@ test('outline panel opens just after the sidebar or trigger and shrinks to avail
     }).visible, false);
 });
 
-test('outline display normalizes only the first entry and preserves native levels', () => {
+test('outline display preserves every entry’s native level', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
     const context = {
@@ -549,7 +549,7 @@ test('outline display normalizes only the first entry and preserves native level
 
     assert.deepEqual(ui.list.children.map(item =>
         item.children[0].style.paddingInlineStart
-    ), ['6px', '14px', '46px']);
+    ), ['30px', '14px', '46px']);
     assert.deepEqual(entries.map(entry => entry.level), [4, 2, 6]);
 });
 
@@ -1356,6 +1356,7 @@ test('project header row binding inserts first and survives header replacement',
             rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
         });
         header.tagName = 'HEADER';
+        header.className = 'relative group flex end-[var(--app-shell-trailing-sidebar-width,0px)]';
         header.querySelector = selector =>
             selector === '[data-app-shell-main-titlebar="true"]'
                 ? titlebar
@@ -1451,6 +1452,7 @@ test('normal chat binds to the semantic main titlebar independently of native bu
         rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
     });
     header.tagName = 'HEADER';
+    header.className = 'relative group flex end-[var(--app-shell-trailing-sidebar-width,0px)]';
     header.querySelector = selector =>
         selector === '[data-app-shell-main-titlebar="true"]'
             ? titlebar
@@ -1491,6 +1493,52 @@ test('normal chat binds to the semantic main titlebar independently of native bu
     assert.equal(moreButton.getAttribute('aria-expanded'), 'false');
     assert.equal(moreButton.getAttribute('aria-haspopup'), 'menu');
     assert.equal(ui.outlineToggle.hidden, false);
+});
+
+test('header toolbar finder still excludes sidebar, quick chat and dialog ancestors', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const makeHeader = ({
+        ancestorTag = 'DIV',
+        ancestorClassName = '',
+        ancestorRole = null,
+        ancestorTestId = null,
+        ancestorAriaModal = null
+    } = {}) => {
+        const header = makeTestElement({
+            rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
+        });
+        header.tagName = 'HEADER';
+        const toolbar = makeTestParent();
+        toolbar.tagName = 'DIV';
+        toolbar.className = 'Toolbar-test flex';
+        toolbar.style.display = 'flex';
+        toolbar.rect = {left: 300, right: 900, top: 8, bottom: 48, width: 600, height: 40};
+        header.appendChild(toolbar);
+        configureOutlineSearch(header, {named: [toolbar], flex: [toolbar]});
+
+        const ancestor = makeTestParent();
+        ancestor.tagName = ancestorTag;
+        ancestor.className = ancestorClassName;
+        if (ancestorRole) ancestor.setAttribute('role', ancestorRole);
+        if (ancestorTestId) ancestor.setAttribute('data-testid', ancestorTestId);
+        if (ancestorAriaModal) ancestor.setAttribute('aria-modal', ancestorAriaModal);
+        ancestor.appendChild(header);
+        return {header, toolbar};
+    };
+
+    for (const options of [
+        {ancestorTag: 'ASIDE'},
+        {ancestorClassName: 'app-shell-sidebar'},
+        {ancestorTestId: 'quick-chat-panel'},
+        {ancestorTag: 'DIALOG'},
+        {ancestorRole: 'complementary'},
+        {ancestorRole: 'dialog'},
+        {ancestorAriaModal: 'true'}
+    ]) {
+        const {header} = makeHeader(options);
+        runtime.setHeader(header);
+        assert.equal(runtime.findHeaderToolbar(), null, JSON.stringify(options));
+    }
 });
 
 test('invalid named toolbar matches leave the legacy flex fallback available', () => {

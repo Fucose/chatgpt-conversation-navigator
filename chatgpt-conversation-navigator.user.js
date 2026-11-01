@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.1
+// @version      0.5.2
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -4083,11 +4083,14 @@
             for (let ancestor = header; ancestor; ancestor = ancestor.parentElement) {
                 const tagName = String(ancestor.tagName || '').toUpperCase();
                 const role = ancestor.getAttribute?.('role');
+                // Arbitrary-value utilities may contain marker words in CSS variables.
+                const classMarkers = getElementClassName(ancestor)
+                    .split(/\s+/)
+                    .filter(className => className &&
+                        !className.includes('[') && !className.includes(']'));
                 const marker = [
                     ancestor.id,
-                    typeof ancestor.className === 'string'
-                        ? ancestor.className
-                        : ancestor.className?.baseVal,
+                    ...classMarkers,
                     ancestor.getAttribute?.('data-testid'),
                     ancestor.getAttribute?.('aria-label')
                 ].filter(Boolean).join(' ');
@@ -8805,14 +8808,13 @@
             return;
         }
 
-        for (const [index, entry] of entries.entries()) {
+        for (const entry of entries) {
             const item = document.createElement('li');
             item.className = 'yw-reply-outline-item';
             const button = document.createElement('button');
             button.type = 'button';
             button.className = 'yw-reply-outline-target';
-            const displayLevel = index === 0 ? 1 : entry.level;
-            button.style.paddingInlineStart = `${6 + (displayLevel - 1) * 8}px`;
+            button.style.paddingInlineStart = `${6 + (entry.level - 1) * 8}px`;
             button.textContent = entry.text;
             button.addEventListener('click', event => {
                 event.preventDefault();
@@ -9777,7 +9779,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.1)');
+        console.info('[Conversation Navigator] Started (0.5.2)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();
