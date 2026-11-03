@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.2
+// @version      0.5.3
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -982,38 +982,99 @@
                 : null;
         }
 
-        function getObjectExportMappings(parsed, start, end) {
+        function getObjectPropertyRanges(parsed, start, end) {
             const {tokens, pairs} = parsed;
             if (tokens[start]?.value !== '{' || pairs.get(start) !== end - 1) return [];
-            const mappings = [];
+            const properties = [];
             for (const [propertyStart, propertyEnd] of splitTokenRange(tokens, pairs, start + 1, end - 1)) {
-                let colon = propertyStart;
-                while (colon < propertyEnd && tokens[colon].value !== ':') colon += 1;
-                if (colon === propertyEnd) continue;
                 const keyToken = tokens[propertyStart];
                 const key = keyToken?.type === 'identifier' || keyToken?.type === 'string'
                     ? keyToken.value
                     : null;
-                if (!key) continue;
+                const colon = propertyStart + 1;
+                if (!key || tokens[colon]?.value !== ':') continue;
+                properties.push({key, start: colon + 1, end: propertyEnd});
+            }
+            return properties;
+        }
+
+        function getArrowFunctionBody(tokens, pairs, start, end) {
+            let arrow = start;
+            if (tokens[arrow]?.value === 'async') arrow += 1;
+            if (tokens[arrow]?.type === 'identifier' && tokens[arrow + 1]?.value === '=>') {
+                arrow += 1;
+            } else if (tokens[arrow]?.value === '(' && pairs.get(arrow) !== undefined) {
+                arrow = pairs.get(arrow) + 1;
+            }
+            if (tokens[arrow]?.value !== '=>' || arrow + 1 >= end) return null;
+            return {start: arrow + 1, end};
+        }
+
+        function getGetterExportMappings(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            const mappings = [];
+            for (const property of getObjectPropertyRanges(parsed, start, end)) {
+                const body = getArrowFunctionBody(tokens, pairs, property.start, property.end);
+                if (!body) {
+                    if (property.end - property.start === 1 && tokens[property.start]?.type === 'identifier') {
+                        mappings.push([property.key, tokens[property.start].value]);
+                    }
+                    continue;
+                }
 
                 let local = null;
-                let arrow = colon + 1;
-                while (arrow < propertyEnd && tokens[arrow].value !== '=>') arrow += 1;
-                if (arrow < propertyEnd) {
-                    const body = arrow + 1;
-                    if (tokens[body]?.type === 'identifier') local = tokens[body].value;
-                    if (tokens[body]?.value === '{') {
-                        for (let index = body + 1; index < (pairs.get(body) ?? body); index += 1) {
-                            if (tokens[index].value === 'return' && tokens[index + 1]?.type === 'identifier') {
-                                local = tokens[index + 1].value;
-                                break;
-                            }
+                if (body.end - body.start === 1 && tokens[body.start]?.type === 'identifier') {
+                    local = tokens[body.start].value;
+                } else if (
+                    tokens[body.start]?.value === '{' &&
+                    pairs.get(body.start) === body.end - 1
+                ) {
+                    const bodyClose = pairs.get(body.start);
+                    for (let index = body.start + 1; index < bodyClose;) {
+                        if (tokens[index].value === 'return' && tokens[index + 1]?.type === 'identifier') {
+                            const afterReturn = tokens[index + 2]?.value === ';' ? index + 3 : index + 2;
+                            if (afterReturn === bodyClose) local = tokens[index + 1].value;
+                            break;
                         }
+                        const paired = pairs.get(index);
+                        index = paired > index ? paired + 1 : index + 1;
                     }
-                } else if (propertyEnd - colon === 2 && tokens[colon + 1]?.type === 'identifier') {
-                    local = tokens[colon + 1].value;
                 }
-                if (local) mappings.push([key, local]);
+                if (local) mappings.push([property.key, local]);
+            }
+            return mappings;
+        }
+
+        function getInlineFunction(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            let index = start;
+            if (tokens[index]?.value === 'async') index += 1;
+            if (tokens[index]?.value !== 'function') return null;
+            index += 1;
+            if (tokens[index]?.type === 'identifier') index += 1;
+            const paramsOpen = index;
+            const paramsClose = pairs.get(paramsOpen);
+            if (tokens[paramsOpen]?.value !== '(' || paramsClose === undefined) return null;
+            const bodyOpen = paramsClose + 1;
+            const bodyClose = pairs.get(bodyOpen);
+            if (tokens[bodyOpen]?.value !== '{' || bodyClose !== end - 1) return null;
+            return {
+                params: getFunctionParameters(tokens, pairs, paramsOpen, paramsClose),
+                start: bodyOpen + 1,
+                end: bodyClose,
+            };
+        }
+
+        function getValueExportMappings(parsed, start, end) {
+            const {tokens} = parsed;
+            const mappings = [];
+            for (const property of getObjectPropertyRanges(parsed, start, end)) {
+                if (property.end - property.start === 1 && tokens[property.start]?.type === 'identifier') {
+                    mappings.push({key: property.key, local: tokens[property.start].value});
+                    continue;
+                }
+                const fn = getInlineFunction(parsed, property.start, property.end);
+                if (fn) mappings.push({key: property.key, fn});
             }
             return mappings;
         }
@@ -1026,6 +1087,17 @@
             const exportsName = parameters[1];
             const imports = new Map();
             const exports = new Map();
+            const functionExports = new Map();
+
+            function setLocalExport(key, local) {
+                functionExports.delete(key);
+                exports.set(key, local);
+            }
+
+            function setFunctionExport(key, fn) {
+                exports.delete(key);
+                functionExports.set(key, fn);
+            }
 
             if (requireName) {
                 for (let index = 0; index < tokens.length; index += 1) {
@@ -1052,7 +1124,7 @@
                         tokens[member.end]?.value === '=' &&
                         tokens[member.end + 1]?.type === 'identifier'
                     ) {
-                        exports.set(member.property, tokens[member.end + 1].value);
+                        setLocalExport(member.property, tokens[member.end + 1].value);
                     }
                 }
             }
@@ -1062,9 +1134,17 @@
                     if (call.object !== requireName || call.property !== 'd' || call.args.length < 2) continue;
                     const firstArg = call.args[0];
                     if (firstArg[1] - firstArg[0] !== 1 || tokens[firstArg[0]]?.value !== exportsName) continue;
-                    for (const [start, end] of call.args.slice(1)) {
-                        for (const [key, local] of getObjectExportMappings(parsed, start, end)) {
-                            exports.set(key, local);
+                    const getterRange = call.args[1];
+                    if (getterRange) {
+                        for (const [key, local] of getGetterExportMappings(parsed, ...getterRange)) {
+                            setLocalExport(key, local);
+                        }
+                    }
+                    const valueRange = call.args[2];
+                    if (valueRange) {
+                        for (const mapping of getValueExportMappings(parsed, ...valueRange)) {
+                            if (mapping.fn) setFunctionExport(mapping.key, mapping.fn);
+                            else setLocalExport(mapping.key, mapping.local);
                         }
                     }
                 }
@@ -1076,6 +1156,7 @@
                 parsed,
                 imports,
                 exports,
+                functionExports,
                 functions: getFactoryFunctions(parsed),
                 anchorsPresent: tokens.some(token => token.type === 'string' && token.value === 'chatgpt-conversation-page') &&
                     tokens.some(token => token.type === 'string' && token.value.includes('/conversations/{conversation_id}/messages')),
@@ -1087,13 +1168,22 @@
             return functions.length === 1 ? functions[0] : null;
         }
 
+        function getFactoryExportNames(factory) {
+            return new Set([...factory.exports.keys(), ...factory.functionExports.keys()]);
+        }
+
+        function getFunctionForExport(factory, exportName) {
+            return factory.functionExports.get(exportName) ||
+                getFunctionForLocal(factory, factory.exports.get(exportName));
+        }
+
         function getLoaderCandidates(factory) {
             if (!factory.anchorsPresent) return [];
             const candidates = [];
             const {tokens, pairs} = factory.parsed;
 
-            for (const [exportName, local] of factory.exports) {
-                const fn = getFunctionForLocal(factory, local);
+            for (const exportName of getFactoryExportNames(factory)) {
+                const fn = getFunctionForExport(factory, exportName);
                 if (!fn || fn.params.length < 3) continue;
                 const hasPageKey = tokens.slice(fn.start, fn.end).some(token =>
                     token.type === 'string' && token.value === 'chatgpt-conversation-page'
@@ -1157,8 +1247,8 @@
             const graphs = [];
             for (const factory of factories) {
                 if (!factory.source.includes(loader.loaderId)) continue;
-                for (const [historyExport, local] of factory.exports) {
-                    const fn = getFunctionForLocal(factory, local);
+                for (const historyExport of getFactoryExportNames(factory)) {
+                    const fn = getFunctionForExport(factory, historyExport);
                     if (!fn) continue;
                     const {tokens, pairs} = factory.parsed;
                     for (const call of getMemberCalls(factory.parsed, fn.start, fn.end)) {
@@ -9779,7 +9869,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.2)');
+        console.info('[Conversation Navigator] Started (0.5.3)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();

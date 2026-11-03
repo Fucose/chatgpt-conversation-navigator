@@ -90,6 +90,7 @@ function makeFixture({
     invalidStateSelector = false,
     decoys = false,
     realShape = false,
+    inlineExportTables = false,
     alternateGraph = null,
     routeId = 'chat-1'
 } = {}) {
@@ -153,12 +154,16 @@ function makeFixture({
     requireModule.m = moduleMap;
     requireModule.c = moduleCache;
     requireModule.__fixtureValues = values;
-    requireModule.d = (exportsObject, definitions) => {
+    requireModule.d = (exportsObject, definitions, values) => {
         for (const key of Object.keys(definitions)) {
             if (Object.prototype.hasOwnProperty.call(exportsObject, key)) continue;
             Object.defineProperty(exportsObject, key, {
                 enumerable: true, get: definitions[key]
             });
+        }
+        for (const key of Object.keys(values || {})) {
+            if (Object.prototype.hasOwnProperty.call(exportsObject, key)) continue;
+            exportsObject[key] = values[key];
         }
     };
 
@@ -213,6 +218,29 @@ function makeFixture({
             '}',
             exportStatement(l.loaderFunction, graphNames.exports.loader, exportStyle, l),
             suffix
+        ].join('\n');
+    }
+
+    function makeInlineLoaderBody(graphNames) {
+        const l = graphNames.locals;
+        const paginationRef = member(l.paginationDep, graphNames.exports.pagination, referenceStyle);
+        const accountRef = member(l.paginationDep, graphNames.exports.account, referenceStyle);
+        const scopeArg = l.loaderScopeArg, cidArg = l.loaderCidArg, flushArg = l.loaderFlushArg;
+        return [
+            'const ' + l.paginationDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(graphNames.ids.pagination) + ');',
+            l.factoryRequireArg + '.d(' + l.factoryExportsArg + ', {}, {' + JSON.stringify(graphNames.exports.loader) + ': async function(' + scopeArg + ', ' + cidArg + ', ' + flushArg + ') {',
+            '    ' + scopeArg + '.get(' + accountRef + ');',
+            '    let page = ' + scopeArg + '.get(' + paginationRef + ', ' + cidArg + ');',
+            '    if (!page || page.complete || page.isLoading || !page.cursor || !page.oldestMessageId) return null;',
+            '    const queryKey = ["chatgpt-conversation-page", ' + cidArg + '];',
+            '    const endpoint = "/conversations/{conversation_id}/messages";',
+            '    ' + l.factoryRequireArg + '.__fixtureValues.loadCalls++;',
+            '    const result = await ' + l.factoryRequireArg + '.__fixtureValues.safeGet(endpoint, {queryKey: queryKey, cursor: page.cursor});',
+            '    const nestedArrow = () => result;',
+            '    const nestedBlock = () => { return result; };',
+            '    ' + flushArg + '(() => result);',
+            '    return result;',
+            '}});'
         ].join('\n');
     }
 
@@ -274,9 +302,46 @@ function makeFixture({
         ].join('\n');
     }
 
+    function makeInlineComponentBody(graphNames) {
+        const l = graphNames.locals;
+        const e = graphNames.exports;
+        const ids = graphNames.ids;
+        const scopeRef = member(l.scopeDep, e.scope, referenceStyle);
+        const stateRef = member(l.stateDep, e.state, referenceStyle);
+        const paginationRef = member(l.paginationDep, e.pagination, referenceStyle);
+        const loaderRef = member(l.loaderDep, e.loader, referenceStyle);
+        const flushRef = member(l.reactDep, e.react, referenceStyle);
+        const useScopeRef = member(l.hooksDep, e.hookScope, referenceStyle);
+        const useValueRef = member(l.hooksDep, e.hookValue, referenceStyle);
+        return [
+            'const ' + l.scopeDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.scope) + ');',
+            'const ' + l.stateDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.state) + ');',
+            'const ' + l.paginationDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.pagination) + ');',
+            'const ' + l.loaderDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.loader) + ');',
+            'const ' + l.reactDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.react) + ');',
+            'const ' + l.hooksDep + ' = ' + l.factoryRequireArg + '(' + JSON.stringify(ids.hooks) + ');',
+            l.factoryRequireArg + '.d(' + l.factoryExportsArg + ', {}, {' + JSON.stringify(e.history) + ': function(props) {',
+            '    const conversation = props.conversationId;',
+            '    const scope = ' + invoke(useScopeRef, callStyle) + '(' + scopeRef + ');',
+            '    const key = ' + invoke(useValueRef, callStyle) + '(' + stateRef + ', conversation);',
+            '    const page = ' + invoke(useValueRef, callStyle) + '(' + paginationRef + ', key ?? conversation);',
+            '    const nestedBlock = () => { return props; };',
+            '    const loadPrevious = () => ' + invoke(loaderRef, callStyle) + '(scope, key, ' + flushRef + ');',
+            '    const observer = new IntersectionObserver(() => loadPrevious());',
+            '    return {scope: scope, key: key, page: page, observer: observer};',
+            '}});'
+        ].join('\n');
+    }
+
     function addGraph(graphNames, suffix = '') {
-        addFactory(graphNames.ids.loader, makeLoaderBody(graphNames, suffix));
-        addFactory(graphNames.ids.history, makeComponentBody(graphNames));
+        addFactory(
+            graphNames.ids.loader,
+            inlineExportTables ? makeInlineLoaderBody(graphNames) : makeLoaderBody(graphNames, suffix)
+        );
+        addFactory(
+            graphNames.ids.history,
+            inlineExportTables ? makeInlineComponentBody(graphNames) : makeComponentBody(graphNames)
+        );
     }
 
     addGraph(names);
@@ -576,6 +641,52 @@ test('discovers renamed graphs through minified comma declarators and loads a pa
     assert.equal(after.entries.length, 2);
     assert.equal(after.pagination.complete, true);
     assert.ok(fixture.scopeReads.some(read => read.selector === fixture.paginationSelector && read.key === fixture.stateKey));
+    adapter.dispose();
+});
+
+test('discovers inline webpack export values without mistaking nested callbacks for exports', async () => {
+    const names = {
+        ids: {
+            scope: 'scope-runtime-87', state: 'conversation-state-42',
+            pagination: 'page-state-33', loader: 'older-page-61',
+            react: 'sync-runtime-24', hooks: 'hooks-runtime-58', history: 'history-view-19'
+        },
+        exports: {
+            scope: 'scope/token', state: 'state/selector', pagination: 'pages/selector',
+            account: 'account/selector', loader: 'load/older-page', react: 'flush/sync',
+            hookScope: 'use/scope', hookValue: 'use/value', history: 'history/view'
+        }
+    };
+    const fixture = makeFixture({
+        names,
+        inlineExportTables: true,
+        referenceStyle: 'bracket',
+        callStyle: 'babel',
+        exportStyle: 'namespace'
+    });
+    const core = loadCore(fixture);
+    const adapter = await core.createNativeAdapter(adapterOptions(fixture));
+    const before = adapter.readSnapshot();
+    assert.equal(before.chatId, fixture.chatId);
+    assert.equal(before.entries.length, 1);
+    assert.equal(before.pagination.canLoadPrevious, true);
+
+    const after = await adapter.loadPreviousPage();
+    assert.equal(fixture.values.loadCalls, 1);
+    assert.equal(fixture.values.flushCalls, 1);
+    assert.equal(fixture.values.lastRequest.endpoint, '/conversations/{conversation_id}/messages');
+    assert.equal(after.entries.length, 2);
+    assert.equal(after.pagination.complete, true);
+
+    const loaderExport = Object.getOwnPropertyDescriptor(
+        fixture.webpackRequire(names.ids.loader), names.exports.loader
+    );
+    const scopeExport = Object.getOwnPropertyDescriptor(
+        fixture.webpackRequire(names.ids.scope), names.exports.scope
+    );
+    assert.equal(typeof loaderExport.value, 'function');
+    assert.equal(loaderExport.get, undefined);
+    assert.equal(typeof scopeExport.get, 'function');
     adapter.dispose();
 });
 
