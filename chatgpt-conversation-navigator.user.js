@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.3
+// @version      0.5.4
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -16,6 +16,39 @@
 
 (function () {
     'use strict';
+
+    function getNativeCompleteAssistantMessageIds(record) {
+        return record?.assistantTextSource === 'native-complete' &&
+            Array.isArray(record.assistantTextSourceMessageIds)
+                ? record.assistantTextSourceMessageIds.filter(id => typeof id === 'string' && id)
+                : [];
+    }
+
+    function sharesMessageId(left, right) {
+        if (!Array.isArray(left) || !Array.isArray(right) || !left.length || !right.length) {
+            return false;
+        }
+        const rightIds = new Set(right);
+        return left.some(id => rightIds.has(id));
+    }
+
+    function clearAssistantTextSource(record, source = 'dom') {
+        record.assistantTextSource = source;
+        record.assistantTextSourceMessageIds = [];
+        record.assistantTextUnresolvedReferenceMessageIds = [];
+    }
+
+    function copyAssistantTextSource(target, source, fallback = 'dom') {
+        target.assistantTextSource = typeof source?.assistantTextSource === 'string'
+            ? source.assistantTextSource
+            : fallback;
+        target.assistantTextSourceMessageIds = Array.isArray(source?.assistantTextSourceMessageIds)
+            ? [...source.assistantTextSourceMessageIds]
+            : [];
+        target.assistantTextUnresolvedReferenceMessageIds = Array.isArray(source?.assistantTextUnresolvedReferenceMessageIds)
+            ? [...source.assistantTextUnresolvedReferenceMessageIds]
+            : [];
+    }
 
     function createConversationIndex() {
         const entries = [];
@@ -153,6 +186,29 @@
         function mergeEntry(previous, incoming, source) {
             const merged = { ...previous };
             const preserveUserText = Boolean(previous?.preserveCommittedUserText);
+            const completeAssistantMessageIds = getNativeCompleteAssistantMessageIds(previous);
+            const incomingAssistantMessageIds = Array.isArray(incoming?.assistantMessageIds)
+                ? incoming.assistantMessageIds
+                : [];
+            const sameAssistantMessage = sharesMessageId(
+                completeAssistantMessageIds,
+                incomingAssistantMessageIds
+            );
+            const unresolvedCompletedMessage = sharesMessageId(
+                completeAssistantMessageIds,
+                incoming?.assistantTextUnresolvedReferenceMessageIds
+            );
+            const replaceCompletedAssistant = completeAssistantMessageIds.length > 0 &&
+                ['observed', 'snapshot'].includes(source) &&
+                incomingAssistantMessageIds.length > 0 &&
+                !sameAssistantMessage;
+            const preserveCompletedAssistant = completeAssistantMessageIds.length > 0 && (
+                source === 'observed' && !replaceCompletedAssistant ||
+                source === 'snapshot' && (
+                    unresolvedCompletedMessage ||
+                    incoming?.assistantText === '' && !replaceCompletedAssistant
+                )
+            );
 
             for (const [key, value] of Object.entries(incoming || {})) {
                 if (value === undefined || value === null) continue;
@@ -166,6 +222,17 @@
                 if (key === 'userText' && preserveUserText && source === 'snapshot') {
                     continue;
                 }
+                if (
+                    preserveCompletedAssistant &&
+                    [
+                        'assistantText',
+                        'assistantTextSource',
+                        'assistantTextSourceMessageIds',
+                        'assistantTextUnresolvedReferenceMessageIds'
+                    ].includes(key)
+                ) {
+                    continue;
+                }
                 if (key === 'assistantMessageIds') {
                     const previousIds = source === 'snapshot'
                         ? []
@@ -175,6 +242,15 @@
                 }
                 if (value !== '') merged[key] = value;
                 else if (!(key in merged)) merged[key] = value;
+            }
+
+            if (replaceCompletedAssistant) {
+                if (incoming?.assistantText === '') merged.assistantText = '';
+                copyAssistantTextSource(
+                    merged,
+                    incoming,
+                    source === 'observed' ? 'dom' : 'native-plain'
+                );
             }
 
             if (previous?.identity &&
@@ -1243,6 +1319,214 @@
             });
         }
 
+        function getInlineArrowCallback(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            while (
+                end - start >= 2 &&
+                tokens[start]?.value === '(' &&
+                pairs.get(start) === end - 1
+            ) {
+                start += 1;
+                end -= 1;
+            }
+
+            let arrow = start;
+            if (tokens[arrow]?.value === 'async') arrow += 1;
+            let parameter = null;
+            if (tokens[arrow]?.type === 'identifier' && tokens[arrow + 1]?.value === '=>') {
+                parameter = tokens[arrow].value;
+                arrow += 1;
+            } else if (tokens[arrow]?.value === '(' && pairs.get(arrow) !== undefined) {
+                const parameterRanges = splitTokenRange(tokens, pairs, arrow + 1, pairs.get(arrow));
+                if (
+                    parameterRanges.length !== 1 ||
+                    parameterRanges[0][1] - parameterRanges[0][0] !== 1 ||
+                    tokens[parameterRanges[0][0]]?.type !== 'identifier'
+                ) return null;
+                parameter = tokens[parameterRanges[0][0]].value;
+                arrow = pairs.get(arrow) + 1;
+            }
+            if (!parameter || tokens[arrow]?.value !== '=>') return null;
+
+            const bodyOpen = arrow + 1;
+            const bodyClose = pairs.get(bodyOpen);
+            if (tokens[bodyOpen]?.value !== '{' || bodyClose !== end - 1) return null;
+            return {parameter, bodyOpen, start: bodyOpen + 1, end: bodyClose};
+        }
+
+        function getArrowExpressionEnd(tokens, pairs, start, end) {
+            for (let index = start; index < end; index += 1) {
+                const paired = pairs.get(index);
+                if (paired > index) {
+                    index = paired;
+                    continue;
+                }
+                if ([',', ';', ')', ']', '}'].includes(tokens[index]?.value)) return index;
+            }
+            return end;
+        }
+
+        function getNestedFunctionRanges(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            const ranges = [];
+            for (let index = start; index < end; index += 1) {
+                if (tokens[index]?.value === '=>') {
+                    const bodyOpen = index + 1;
+                    const bodyClose = pairs.get(bodyOpen);
+                    const rangeEnd = tokens[bodyOpen]?.value === '{' && bodyClose !== undefined
+                        ? bodyClose + 1
+                        : getArrowExpressionEnd(tokens, pairs, bodyOpen, end);
+                    ranges.push({start: index, end: rangeEnd});
+                    index = Math.max(index, rangeEnd - 1);
+                    continue;
+                }
+
+                if (tokens[index]?.value !== 'function') continue;
+                let paramsOpen = index + 1;
+                if (tokens[paramsOpen]?.value === '*') paramsOpen += 1;
+                if (tokens[paramsOpen]?.type === 'identifier') paramsOpen += 1;
+                while (paramsOpen < end && tokens[paramsOpen]?.value !== '(') paramsOpen += 1;
+                const paramsClose = pairs.get(paramsOpen);
+                const bodyOpen = paramsClose === undefined ? -1 : paramsClose + 1;
+                const bodyClose = pairs.get(bodyOpen);
+                if (
+                    tokens[bodyOpen]?.value !== '{' ||
+                    bodyClose === undefined ||
+                    bodyClose >= end
+                ) continue;
+                ranges.push({start: index, end: bodyClose + 1});
+                index = bodyClose;
+            }
+            return ranges;
+        }
+
+        function isCallbackBodyTopLevel(parsed, callback, position) {
+            const {tokens, pairs} = parsed;
+            for (let index = callback.start; index < position; index += 1) {
+                if (tokens[index]?.value === '{' && pairs.get(index) > position) return false;
+                const paired = pairs.get(index);
+                if (paired > index) index = paired;
+            }
+            return true;
+        }
+
+        function declarationShadowsName(parsed, declarationIndex, end, names) {
+            const {tokens, pairs} = parsed;
+            let bindingStart = declarationIndex + 1;
+            while (bindingStart < end) {
+                const token = tokens[bindingStart];
+                if (token?.type === 'identifier') {
+                    if (names.has(token.value)) return true;
+                    bindingStart += 1;
+                } else if (token?.value === '{' || token?.value === '[') {
+                    const close = pairs.get(bindingStart);
+                    if (close === undefined || close >= end) return true;
+                    for (let index = bindingStart + 1; index < close; index += 1) {
+                        if (tokens[index]?.type === 'identifier' && names.has(tokens[index].value)) return true;
+                    }
+                    bindingStart = close + 1;
+                } else {
+                    return true;
+                }
+
+                while (bindingStart < end) {
+                    const paired = pairs.get(bindingStart);
+                    if (paired > bindingStart) {
+                        bindingStart = paired + 1;
+                        continue;
+                    }
+                    if (tokens[bindingStart]?.value === ',') {
+                        bindingStart += 1;
+                        break;
+                    }
+                    if (tokens[bindingStart]?.value === ';' || tokens[bindingStart]?.value === ')') return false;
+                    bindingStart += 1;
+                }
+            }
+            return false;
+        }
+
+        function hasCallbackShadow(parsed, callback, names, nestedRanges) {
+            const {tokens, pairs} = parsed;
+            const nestedStarts = new Map(nestedRanges.map(range => [range.start, range.end]));
+            for (let index = callback.start; index < callback.end; index += 1) {
+                if (nestedStarts.has(index)) {
+                    if (
+                        tokens[index]?.value === 'function' &&
+                        tokens[index + 1]?.type === 'identifier' &&
+                        names.has(tokens[index + 1].value)
+                    ) return true;
+                    index = nestedStarts.get(index) - 1;
+                    continue;
+                }
+
+                const declaration = tokens[index]?.value;
+                if (
+                    ['const', 'let', 'var'].includes(declaration) &&
+                    (declaration === 'var' || isCallbackBodyTopLevel(parsed, callback, index)) &&
+                    declarationShadowsName(parsed, index, callback.end, names)
+                ) return true;
+                if (
+                    ['function', 'class'].includes(declaration) &&
+                    isCallbackBodyTopLevel(parsed, callback, index) &&
+                    tokens[index + 1]?.type === 'identifier' &&
+                    names.has(tokens[index + 1].value)
+                ) return true;
+
+                const paired = pairs.get(index);
+                if (paired > index && tokens[index]?.value !== '{') index = paired;
+            }
+            return false;
+        }
+
+        function getWrappedImportedMember(factory, range) {
+            const {parsed} = factory;
+            const callback = getInlineArrowCallback(parsed, ...range);
+            if (!callback) return null;
+
+            const nestedRanges = getNestedFunctionRanges(parsed, callback.start, callback.end);
+            const shadowedNames = new Set([callback.parameter]);
+            if (hasCallbackShadow(parsed, callback, shadowedNames, nestedRanges)) return null;
+            const candidates = new Map();
+            for (const call of getMemberCalls(parsed, callback.start, callback.end)) {
+                if (
+                    nestedRanges.some(item => call.start >= item.start && call.start < item.end) ||
+                    !isCallbackBodyTopLevel(parsed, callback, call.start)
+                ) continue;
+                const moduleId = factory.imports.get(call.object);
+                if (
+                    moduleId === undefined ||
+                    call.args.length !== 1 ||
+                    readIdentifierRange(parsed, ...call.args[0]) !== callback.parameter ||
+                    call.object === callback.parameter
+                ) continue;
+
+                if (call.object !== callback.parameter) {
+                    const names = new Set([...shadowedNames, call.object]);
+                    if (hasCallbackShadow(parsed, callback, names, nestedRanges)) continue;
+                }
+
+                const member = {object: call.object, property: call.property, moduleId};
+                candidates.set(JSON.stringify([moduleId, call.property]), member);
+            }
+            return candidates.size === 1 ? candidates.values().next().value : null;
+        }
+
+        function readIdentifierRange(parsed, start, end) {
+            const {tokens, pairs} = parsed;
+            while (
+                end - start >= 2 &&
+                tokens[start]?.value === '(' &&
+                pairs.get(start) === end - 1
+            ) {
+                start += 1;
+                end -= 1;
+            }
+            return end - start === 1 && tokens[start]?.type === 'identifier'
+                ? tokens[start].value
+                : null;
+        }
+
         function findComponentGraphs(factories, loader) {
             const graphs = [];
             for (const factory of factories) {
@@ -1264,10 +1548,16 @@
                         const keyLocal = call.args[1][1] - call.args[1][0] === 1
                             ? tokens[call.args[1][0]]?.value
                             : null;
-                        const flush = readStaticMember(tokens, pairs, ...call.args[2]);
+                        const directFlush = readStaticMember(tokens, pairs, ...call.args[2]);
+                        const flush = directFlush
+                            ? {
+                                ...directFlush,
+                                moduleId: factory.imports.get(directFlush.object),
+                            }
+                            : getWrappedImportedMember(factory, call.args[2]);
                         const scope = scopeLocal && findHookInitializer(factory, fn, scopeLocal);
                         const state = keyLocal && findHookInitializer(factory, fn, keyLocal);
-                        const reactDomId = flush && factory.imports.get(flush.object);
+                        const reactDomId = flush?.moduleId;
                         if (
                             !scope ||
                             !state ||
@@ -1987,6 +2277,67 @@
             return item.messageId;
         }
 
+        function resolveNativeAssistantContent(item) {
+            const content = item.content;
+            const references = Array.isArray(item.contentReferences)
+                ? item.contentReferences
+                : [];
+            const messageId = collectItemMessageId(item);
+            const sourceIds = [];
+            const unresolvedIds = [];
+            const markerPattern = /::chatgpt-content-reference\{([^{}]*)\}/g;
+            const hasReferenceMarker = content.includes('::chatgpt-content-reference');
+            let foundMarker = false;
+            let allResolved = true;
+            let resolvedText = '';
+            let previousIndex = 0;
+
+            for (const match of content.matchAll(markerPattern)) {
+                foundMarker = true;
+                resolvedText += content.slice(previousIndex, match.index);
+                const indexValue = match[1].match(/(?:^|\s)index="(\d+)"(?=\s|$)/)?.[1];
+                const sourceMessageId = match[1].match(/(?:^|\s)source_message_id="([^"]+)"(?=\s|$)/)?.[1];
+                const referenceIndex = indexValue === undefined ? NaN : Number(indexValue);
+                const reference = Number.isSafeInteger(referenceIndex) && referenceIndex >= 0
+                    ? references[referenceIndex]
+                    : null;
+                const fallbackMarkdown = reference?.model_dil_v2?.fallbackMarkdown;
+                const resolves = Boolean(
+                    sourceMessageId &&
+                    (!messageId || messageId === sourceMessageId) &&
+                    reference?.type === 'dil' &&
+                    reference.source_message_id === sourceMessageId &&
+                    reference.source_message_status === 'finished_successfully' &&
+                    typeof fallbackMarkdown === 'string'
+                );
+
+                if (resolves) {
+                    resolvedText += fallbackMarkdown;
+                    sourceIds.push(sourceMessageId);
+                } else {
+                    resolvedText += match[0];
+                    allResolved = false;
+                    const unresolvedId = messageId || sourceMessageId;
+                    if (unresolvedId) unresolvedIds.push(unresolvedId);
+                }
+                previousIndex = match.index + match[0].length;
+            }
+
+            resolvedText += content.slice(previousIndex);
+            if (hasReferenceMarker && !foundMarker) {
+                allResolved = false;
+                if (messageId) unresolvedIds.push(messageId);
+            }
+
+            return {
+                text: resolvedText,
+                hasReference: hasReferenceMarker,
+                complete: hasReferenceMarker && foundMarker && allResolved,
+                sourceIds: uniqueMessageIds(sourceIds),
+                unresolvedIds: uniqueMessageIds(unresolvedIds),
+            };
+        }
+
         function mapNativeEntries(entries, chatId) {
             const mapped = [];
             for (const entry of entries) {
@@ -2009,6 +2360,7 @@
 
                 const userItems = [];
                 const assistantItems = [];
+                const assistantContent = [];
                 for (const item of flattenConversationItems(turn.items)) {
                     if (!isObject(item)) continue;
                     if (item.type === 'user-message') {
@@ -2021,6 +2373,7 @@
                             fail('UNSUPPORTED_TURN_MODEL', 'A native assistant message has an unsupported content shape.');
                         }
                         assistantItems.push(item);
+                        assistantContent.push(resolveNativeAssistantContent(item));
                     }
                 }
 
@@ -2029,9 +2382,14 @@
                 const userMessageIds = userItems
                     .map(collectItemMessageId)
                     .filter(Boolean);
-                const assistantMessageIds = assistantItems
-                    .map(collectItemMessageId)
-                    .filter(Boolean);
+                const assistantMessageIds = uniqueMessageIds([
+                    ...assistantItems.map(collectItemMessageId).filter(Boolean),
+                    ...assistantContent.flatMap(content => content.sourceIds),
+                ]);
+                const assistantTextHasReferences = assistantContent.some(content => content.hasReference);
+                const assistantTextHasOnlyResolvedReferences = assistantContent.every(content =>
+                    !content.hasReference || content.complete
+                );
                 const userMessageId = userMessageIds[0];
                 const messageId = assistantMessageIds[0] || userMessageId || null;
                 const turnKey = entry.turnKey;
@@ -2047,7 +2405,16 @@
                     messageId,
                     assistantMessageIds,
                     userText: userItems.map(item => item.message).join('\n\n'),
-                    assistantText: assistantItems.map(item => item.content).join('\n\n'),
+                    assistantText: assistantContent.map(content => content.text).join('\n\n'),
+                    assistantTextSource: assistantTextHasReferences
+                        ? assistantTextHasOnlyResolvedReferences ? 'native-complete' : 'native-reference'
+                        : 'native-plain',
+                    assistantTextSourceMessageIds: assistantTextHasOnlyResolvedReferences
+                        ? uniqueMessageIds(assistantContent.flatMap(content => content.sourceIds))
+                        : [],
+                    assistantTextUnresolvedReferenceMessageIds: uniqueMessageIds(
+                        assistantContent.flatMap(content => content.unresolvedIds)
+                    ),
                 };
                 if (userMessageId) mappedEntry.userMessageId = userMessageId;
                 if (userMessageIds.length > 1) mappedEntry.userMessageIds = userMessageIds;
@@ -2605,62 +2972,94 @@
         return {left, top};
     }
 
-    function computeReplyOutlinePosition({
+    function computeReplyOutlineTogglePosition({
         windowWidth,
         windowHeight,
-        sidebarRight = null,
-        sidebarVisible = false,
-        toolbarLeft = null,
-        headerBottom,
-        preferredWidth = 300,
-        preferredHeight = 560,
-        viewportInset = 8,
-        sidebarGap = 8,
-        headerGap = 8
+        toolbarLeft,
+        toolbarTop,
+        toolbarWidth = 32,
+        toggleWidth = 32,
+        toggleHeight = 32,
+        buttonGap = 32,
+        viewportInset = 8
     }) {
         const width = Number(windowWidth);
         const height = Number(windowHeight);
-        const sideRight = sidebarRight === null ? NaN : Number(sidebarRight);
-        const triggerLeft = toolbarLeft === null ? NaN : Number(toolbarLeft);
-        const bottom = Number(headerBottom);
+        const left = Number(toolbarLeft);
+        const top = Number(toolbarTop);
+        const barWidth = Number(toolbarWidth);
+        const controlWidth = Number(toggleWidth);
+        const controlHeight = Number(toggleHeight);
+        const gap = Number(buttonGap);
         const inset = Number(viewportInset);
-        const sideGap = Number(sidebarGap);
-        const topGap = Number(headerGap);
         if (
-            ![width, height, bottom, inset, sideGap, topGap]
-                .every(Number.isFinite) ||
-            width <= 0 || height <= 0 || bottom < 0 || inset < 0 ||
-            sideGap < 0 || topGap < 0
+            ![width, height, left, top, barWidth, controlWidth,
+                controlHeight, gap, inset].every(Number.isFinite) ||
+            width <= 0 || height <= 0 || barWidth <= 0 ||
+            controlWidth <= 0 || controlHeight <= 0 ||
+            gap < 0 || inset < 0
         ) {
             return null;
         }
-        const requestedLeft = sidebarVisible && Number.isFinite(sideRight)
-            ? sideRight + sideGap
-            : Number.isFinite(triggerLeft) ? triggerLeft : inset;
-        const left = Math.max(inset, Math.min(width - inset, requestedLeft));
+        const requestedLeft = left + (barWidth - controlWidth) / 2;
+        const requestedTop = top - gap - controlHeight;
+        return {
+            left: Math.max(
+                inset,
+                Math.min(width - inset - controlWidth, requestedLeft)
+            ),
+            top: Math.max(
+                inset,
+                Math.min(height - inset - controlHeight, requestedTop)
+            ),
+            visible: width > controlWidth + inset * 2 &&
+                height > controlHeight + inset * 2
+        };
+    }
+
+    function computeReplyOutlinePosition({
+        windowWidth,
+        windowHeight,
+        toolbarLeft,
+        toolbarWidth = 32,
+        preferredWidth = 300,
+        preferredHeight = 560,
+        viewportInset = 8,
+        toolbarGap = 12
+    }) {
+        const width = Number(windowWidth);
+        const height = Number(windowHeight);
+        const triggerLeft = Number(toolbarLeft);
+        const triggerWidth = Number(toolbarWidth);
+        const inset = Number(viewportInset);
+        const gap = Number(toolbarGap);
+        if (
+            ![width, height, triggerLeft, triggerWidth, inset, gap]
+                .every(Number.isFinite) ||
+            width <= 0 || height <= 0 || triggerWidth <= 0 ||
+            inset < 0 || gap < 0
+        ) {
+            return null;
+        }
+        const left = Math.max(
+            inset,
+            Math.min(width - inset, triggerLeft + triggerWidth + gap)
+        );
         const availableWidth = Math.max(0, width - inset - left);
         const panelWidth = Math.max(0, Math.min(
             Number(preferredWidth),
             width - inset * 2,
             availableWidth
         ));
-        const requestedTop = bottom + topGap;
-        const top = Math.max(
-            inset,
-            Math.min(height - inset, requestedTop)
-        );
-        const availableHeight = height - requestedTop - inset;
-        const maxHeight = Math.max(
-            0,
-            Math.min(Number(preferredHeight), availableHeight)
-        );
+        const maxHeight = Math.max(0, Math.min(
+            Number(preferredHeight),
+            height - inset * 2
+        ));
         return {
             left,
-            top,
             width: panelWidth,
             maxHeight,
-            visible: panelWidth > 0 && maxHeight > 0 &&
-                requestedTop <= height - inset
+            visible: panelWidth > 0 && maxHeight > 0
         };
     }
 
@@ -2669,26 +3068,29 @@
         windowHeight,
         anchorLeft,
         anchorRight,
-        anchorBottom,
+        anchorTop,
+        anchorHeight,
         tooltipWidth,
         tooltipHeight,
         viewportInset = 8,
-        anchorGap = 8
+        anchorGap = 16
     }) {
         const width = Number(windowWidth);
         const height = Number(windowHeight);
         const leftEdge = Number(anchorLeft);
         const rightEdge = Number(anchorRight);
-        const bottom = Number(anchorBottom);
+        const topEdge = Number(anchorTop);
+        const anchorSize = Number(anchorHeight);
         const pillWidth = Number(tooltipWidth);
         const pillHeight = Number(tooltipHeight);
         const inset = Number(viewportInset);
         const gap = Number(anchorGap);
         if (
-            ![width, height, leftEdge, rightEdge, bottom, pillWidth,
-                pillHeight, inset, gap].every(Number.isFinite) ||
+            ![width, height, leftEdge, rightEdge, topEdge, anchorSize,
+                pillWidth, pillHeight, inset, gap].every(Number.isFinite) ||
             width <= 0 || height <= 0 || rightEdge < leftEdge ||
-            pillWidth <= 0 || pillHeight <= 0 || inset < 0 || gap < 0
+            anchorSize <= 0 || pillWidth <= 0 || pillHeight <= 0 ||
+            inset < 0 || gap < 0
         ) {
             return null;
         }
@@ -2696,54 +3098,80 @@
         const clampedHeight = Math.min(pillHeight, height - inset * 2);
         const left = Math.max(
             inset,
-            Math.min(width - clampedWidth - inset, leftEdge)
+            Math.min(width - clampedWidth - inset, rightEdge + gap)
         );
         const top = Math.max(
             inset,
-            Math.min(height - clampedHeight - inset, bottom + gap)
+            Math.min(
+                height - clampedHeight - inset,
+                topEdge + (anchorSize - clampedHeight) / 2
+            )
         );
         return {left, top, width: clampedWidth, height: clampedHeight};
     }
 
-    function getElementClassName(element) {
-        return typeof element?.className === 'string'
-            ? element.className
-            : element?.className?.baseVal || '';
-    }
-
-    function isNamedReplyHeaderToolbar(element) {
-        return /(?:^|\s)Toolbar-[^\s]+/.test(getElementClassName(element)) ||
-            element?.getAttribute?.('role') === 'toolbar';
-    }
-
-    function updateReplyOutlineHeaderHost(toolbar, toggle, visible) {
-        const previousHost = toggle.parentElement;
-        if (previousHost && previousHost !== toolbar) {
-            previousHost.classList?.remove('yw-reply-outline-header-host');
-        }
-        toolbar?.classList?.toggle(
-            'yw-reply-outline-header-host',
-            Boolean(visible && isNamedReplyHeaderToolbar(toolbar))
-        );
-    }
-
-    function bindReplyOutlineToggle(toggle, toolbar, visible = true) {
-        if (!toggle) return false;
-        if (!toolbar?.isConnected || typeof toolbar.insertBefore !== 'function') {
-            updateReplyOutlineHeaderHost(null, toggle, false);
-            toggle.remove();
-            toggle.hidden = true;
-            return false;
-        }
-        updateReplyOutlineHeaderHost(toolbar, toggle, visible);
+    function computeReplyContentShift({
+        contentRight,
+        rightBoundary,
+        contentGap = 8,
+        preferredShift = 154
+    }) {
+        const right = Number(contentRight);
+        const boundary = Number(rightBoundary);
+        const gap = Number(contentGap);
+        const shift = Number(preferredShift);
         if (
-            toggle.parentElement !== toolbar ||
-            toolbar.firstElementChild !== toggle
+            ![right, boundary, gap, shift]
+                .every(Number.isFinite) ||
+            gap < 0 || shift <= 0
         ) {
-            toolbar.insertBefore(toggle, toolbar.firstElementChild);
+            return 0;
         }
-        toggle.hidden = !visible;
-        return true;
+        const available = Math.max(0, boundary - gap - right);
+        return available >= shift ? Math.floor(shift) : 0;
+    }
+
+    function computeReplyOutlineTop({
+        windowHeight,
+        panelHeight,
+        toggleTop = null,
+        viewportInset = 8
+    }) {
+        const height = Number(windowHeight);
+        const panel = Number(panelHeight);
+        const inset = Number(viewportInset);
+        const buttonTop = toggleTop === null ? NaN : Number(toggleTop);
+        if (
+            ![height, panel, inset].every(Number.isFinite) ||
+            height <= 0 || panel <= 0 || inset < 0
+        ) {
+            return null;
+        }
+        const maxTop = Math.max(inset, height - inset - panel);
+        const centeredTop = Math.max(
+            inset,
+            Math.min(maxTop, (height - panel) / 2)
+        );
+        if (!Number.isFinite(buttonTop) || centeredTop <= buttonTop) {
+            return centeredTop;
+        }
+        return Math.max(inset, Math.min(maxTop, buttonTop));
+    }
+
+    function composeThreadContentX(baseValue, shift) {
+        const base = typeof baseValue === 'string' ? baseValue.trim() : '';
+        const pixels = Number(shift);
+        if (!Number.isFinite(pixels) || pixels <= 0) return base;
+        if (!base || base === 'initial') return `${pixels}px`;
+        const pixelMatch = base.match(/^([-+]?(?:\d+\.?\d*|\.\d+))px$/);
+        if (pixelMatch) {
+            const combined = Number(pixelMatch[1]) + pixels;
+            const normalized = Number.isInteger(combined)
+                ? String(combined)
+                : combined.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+            return `${normalized}px`;
+        }
+        return `calc(${base} + ${pixels}px)`;
     }
 
     const core = {
@@ -2761,9 +3189,12 @@
         computeBottomOverlayInset,
         clipReplyScrollViewportGeometry,
         computeReplyToolbarPosition,
+        computeReplyOutlineTogglePosition,
         computeReplyOutlinePosition,
         computeReplyOutlineTooltipPosition,
-        bindReplyOutlineToggle,
+        computeReplyOutlineTop,
+        computeReplyContentShift,
+        composeThreadContentX,
         NativeAdapterError
     };
     if (typeof module === 'object' && module?.exports &&
@@ -2781,9 +3212,15 @@
         'yw-chatgpt-conversation-navigator:reply-outline-pinned';
     const REPLY_OUTLINE_OPEN_STORAGE_KEY =
         'yw-chatgpt-conversation-navigator:reply-outline-open';
+    const REPLY_NAV_CONTROL_SIZE = 32;
     const REPLY_NAV_TOOLBAR_HEIGHT = 202;
     const REPLY_NAV_TOOLBAR_GAP = 12;
     const REPLY_NAV_VIEWPORT_INSET = 8;
+    const REPLY_OUTLINE_BUTTON_GAP = REPLY_NAV_CONTROL_SIZE;
+    const REPLY_OUTLINE_CONTENT_GAP = 8;
+    const REPLY_OUTLINE_CONTENT_SHIFT = 154;
+    const REPLY_OUTLINE_CONTENT_SHIFT_DURATION_MS = 100;
+    const REPLY_NAV_TOOLTIP_GAP = 16;
     /*
      * Reply navigation icon path notices.
      * Lucide paths (ISC License):
@@ -2901,8 +3338,8 @@
     let replyLayoutResizeObserver = null;
     let replyLayoutObservedNodes = new Set();
     let replyLayoutObservedSidebar = null;
-    let replyOutlineHeaderToolbar = null;
-    let replyOutlineHeaderLookupAttempted = false;
+    let replyOutlineContentShiftState = null;
+    let replyOutlineContentShiftFrame = null;
     let assistantReplyNavigationCursor = null;
 
     let turns = [];
@@ -3240,6 +3677,7 @@
                 padding: 0;
                 margin: 0;
                 box-sizing: border-box;
+                z-index: 1;
                 pointer-events: auto;
             }
 
@@ -3259,6 +3697,7 @@
                 box-sizing: border-box;
                 border: 1px solid transparent;
                 border-radius: 7px;
+                position: relative;
                 background: transparent;
                 color: var(--text-secondary, var(--color-text-secondary, #8F8F8F));
                 cursor: pointer;
@@ -3269,16 +3708,52 @@
             #${REPLY_NAV_ID} .yw-reply-nav-button:hover,
             #${REPLY_NAV_ID} .yw-reply-nav-button[aria-expanded="true"] {
                 border-color: transparent;
-                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                background: #EFEFEF;
                 color: var(--text-primary, var(--color-text-primary, #555));
             }
 
             #${REPLY_NAV_ID} .yw-reply-nav-button:focus-visible {
                 border-color: transparent;
-                background: var(--background-modifier-hover, rgba(127, 127, 127, 0.12));
+                background: #EFEFEF;
                 color: var(--text-primary, var(--color-text-primary, #555));
                 outline: 2px solid currentColor;
                 outline-offset: 2px;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button::after {
+                content: attr(aria-label);
+                position: absolute;
+                z-index: 2;
+                left: calc(100% + ${REPLY_NAV_TOOLTIP_GAP}px);
+                top: 50%;
+                width: max-content;
+                max-width: calc(100vw - 80px);
+                padding-block: var(--tooltip-padding-block, 5px);
+                padding-inline: var(--tooltip-padding-inline, 12px);
+                box-sizing: border-box;
+                border: 1px solid var(--tooltip-border-color, color-mix(in oklab, #FFFFFF 5%, transparent));
+                border-radius: var(--tooltip-border-radius, 16px);
+                background: var(--tooltip-background-color, #0D0D0D);
+                color: var(--tooltip-text-color, #FFFFFF);
+                font-size: var(--tooltip-font-size, 14px);
+                font-weight: var(--tooltip-font-weight, 600);
+                letter-spacing: var(--tooltip-letter-spacing, -0.15px);
+                line-height: var(--tooltip-line-height, 18px);
+                white-space: nowrap;
+                box-shadow: var(--tooltip-box-shadow, 0 8px 18px #0F172A33);
+                opacity: 0;
+                visibility: hidden;
+                transform: translate(4px, -50%);
+                transition: opacity 100ms ease, transform 100ms ease,
+                    visibility 100ms ease;
+                pointer-events: none;
+            }
+
+            #${REPLY_NAV_ID} .yw-reply-nav-button:hover::after,
+            #${REPLY_NAV_ID} .yw-reply-nav-button:focus-visible::after {
+                opacity: 1;
+                visibility: visible;
+                transform: translate(0, -50%);
             }
 
             #${REPLY_NAV_ID} .yw-reply-nav-button:disabled {
@@ -3311,14 +3786,15 @@
             #${REPLY_NAV_ID}-outline-toggle {
                 appearance: none;
                 -webkit-appearance: none;
+                position: fixed;
+                z-index: 2;
                 pointer-events: auto;
                 display: grid !important;
-                flex: 0 0 36px;
                 place-items: center;
-                width: 36px;
-                min-width: 36px;
-                height: 36px;
-                min-height: 36px;
+                width: ${REPLY_NAV_CONTROL_SIZE}px;
+                min-width: ${REPLY_NAV_CONTROL_SIZE}px;
+                height: ${REPLY_NAV_CONTROL_SIZE}px;
+                min-height: ${REPLY_NAV_CONTROL_SIZE}px;
                 padding: 0;
                 box-sizing: border-box;
                 border: 0;
@@ -3327,10 +3803,6 @@
                 color: var(--color-text-primary, #0D0D0D);
                 font: inherit;
                 cursor: pointer;
-            }
-
-            .yw-reply-outline-header-host {
-                justify-content: flex-start;
             }
 
             #${REPLY_NAV_ID}-outline-toggle[aria-expanded="true"] {
@@ -3357,18 +3829,18 @@
             .yw-reply-outline-icon {
                 display: block;
                 flex: 0 0 auto;
-                width: 20px;
-                height: 20px;
+                width: 18px;
+                height: 18px;
                 fill: none;
                 stroke: currentColor;
-                stroke-width: 1.8;
+                stroke-width: 2;
                 stroke-linecap: round;
                 stroke-linejoin: round;
             }
 
             #${REPLY_NAV_ID} .yw-reply-outline-tooltip {
                 position: fixed;
-                z-index: 2147483647;
+                z-index: 4;
                 width: max-content;
                 max-width: calc(100vw - 16px);
                 padding-block: var(--tooltip-padding-block, 5px);
@@ -3400,6 +3872,7 @@
 
             #${REPLY_NAV_ID} .yw-reply-outline {
                 position: fixed;
+                z-index: 3;
                 display: flex;
                 flex-direction: column;
                 overflow: hidden;
@@ -4087,7 +4560,7 @@
         list.className = 'yw-reply-outline-list';
         outline.appendChild(list);
 
-        root.append(toolbar, outline, outlineTooltip);
+        root.append(toolbar, outlineToggle, outline, outlineTooltip);
         document.body.appendChild(root);
         replyNavigationUI = {
             root,
@@ -4103,7 +4576,7 @@
         };
         updateReplyOutlineToggleLabel();
         updateReplyOutlinePinButton();
-        syncReplyOutlineToggleBinding(true);
+        syncReplyOutlineToggleBinding();
     }
 
     function getReplySidebarElement() {
@@ -4134,170 +4607,18 @@
         return {left: rect.left, right: rect.right};
     }
 
-    function findReplyOutlineHeaderToolbar() {
-        const headers = Array.from(
-            document.querySelectorAll('header, [role="banner"]')
-        );
-        const isInteractive = element =>
-            /^(BUTTON|A|INPUT|SELECT|TEXTAREA|SUMMARY)$/i.test(element.tagName || '') ||
-            /^(button|link|menuitem|menuitemcheckbox|menuitemradio|checkbox|radio|switch|tab|option|combobox|textbox|slider|spinbutton)$/i
-                .test(element.getAttribute?.('role') || '');
-        const isVisible = (element, boundary = null, rejectInteractive = false) => {
-            if (!element?.isConnected) return false;
-            let reachedBoundary = false;
-            for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
-                if (
-                    ancestor.hidden || ancestor.inert ||
-                    ancestor.hasAttribute?.('inert') ||
-                    ancestor.getAttribute?.('aria-hidden') === 'true' ||
-                    (rejectInteractive && isInteractive(ancestor))
-                ) {
-                    return false;
-                }
-                const style = window.getComputedStyle(ancestor);
-                if (
-                    style.display === 'none' || style.visibility === 'hidden' ||
-                    Number(style.opacity) === 0
-                ) {
-                    return false;
-                }
-                if (ancestor === boundary) {
-                    reachedBoundary = true;
-                    break;
-                }
-            }
-            return boundary ? reachedBoundary : true;
-        };
-        const visibleHeaders = headers.filter(header => {
-            if (!isVisible(header)) return false;
-            for (let ancestor = header; ancestor; ancestor = ancestor.parentElement) {
-                const tagName = String(ancestor.tagName || '').toUpperCase();
-                const role = ancestor.getAttribute?.('role');
-                // Arbitrary-value utilities may contain marker words in CSS variables.
-                const classMarkers = getElementClassName(ancestor)
-                    .split(/\s+/)
-                    .filter(className => className &&
-                        !className.includes('[') && !className.includes(']'));
-                const marker = [
-                    ancestor.id,
-                    ...classMarkers,
-                    ancestor.getAttribute?.('data-testid'),
-                    ancestor.getAttribute?.('aria-label')
-                ].filter(Boolean).join(' ');
-                if (
-                    tagName === 'ASIDE' || tagName === 'DIALOG' ||
-                    role === 'complementary' || role === 'dialog' ||
-                    ancestor.getAttribute?.('aria-modal') === 'true' ||
-                    /sidebar|quick[-_ ]?chat/i.test(marker)
-                ) {
-                    return false;
-                }
-            }
-            const rect = header.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && rect.top <= 160 &&
-                rect.bottom >= 0 && rect.height <= 240;
-        });
-        const isToolbarContainer = (element, header, headerRect) => {
-            if (!element || element === header) return false;
-            const role = element.getAttribute?.('role');
-            if (
-                (element.tagName !== 'DIV' && role !== 'toolbar') ||
-                isInteractive(element) || !isVisible(element, header, true)
-            ) {
-                return false;
-            }
-            const style = window.getComputedStyle(element);
-            if (!['flex', 'inline-flex'].includes(style.display) && role !== 'toolbar') {
-                return false;
-            }
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && rect.height <= 140 &&
-                rect.right > 0 && rect.left < window.innerWidth &&
-                rect.top >= headerRect.top - 12 &&
-                rect.top <= headerRect.bottom + 12 &&
-                rect.bottom <= headerRect.bottom + 36;
-        };
-        const namedToolbarCandidates = root => [
-            ...Array.from(root.querySelectorAll('[class*="Toolbar-"]')),
-            ...Array.from(root.querySelectorAll('[role="toolbar"]'))
-        ];
-        const rankCandidates = (candidates, header, headerRect) => {
-            const valid = [...new Set(candidates)].filter(element =>
-                isToolbarContainer(element, header, headerRect)
-            );
-            valid.sort((left, right) => {
-                const leftRect = left.getBoundingClientRect();
-                const rightRect = right.getBoundingClientRect();
-                const score = (element, rect) =>
-                    (isNamedReplyHeaderToolbar(element) ? 1000 : 0) +
-                    (element.querySelector?.('button, [role="button"]') ? 100 : 0) -
-                    Math.abs(rect.top - headerRect.top) - rect.height;
-                return score(right, rightRect) - score(left, leftRect);
-            });
-            return valid;
-        };
-
-        let fallbackMainTitlebar = null;
-        for (const header of visibleHeaders) {
-            const rect = header.getBoundingClientRect();
-            const titlebar = header.querySelector(
-                '[data-app-shell-main-titlebar="true"]'
-            );
-            if (!isToolbarContainer(titlebar, header, rect)) continue;
-            const projectRows = rankCandidates(
-                namedToolbarCandidates(titlebar), header, rect
-            );
-            if (projectRows.length) return projectRows[0];
-            fallbackMainTitlebar ||= titlebar;
-        }
-        if (fallbackMainTitlebar) return fallbackMainTitlebar;
-
-        for (const header of visibleHeaders) {
-            const rect = header.getBoundingClientRect();
-            const named = rankCandidates(
-                namedToolbarCandidates(header), header, rect
-            );
-            if (named.length) return named[0];
-            const flex = rankCandidates(
-                Array.from(header.querySelectorAll('div.flex, div[class*="flex"]')),
-                header,
-                rect
-            );
-            if (flex.length) return flex[0];
-        }
-        return null;
-    }
-
-    function syncReplyOutlineToggleBinding(rescan = false) {
+    function syncReplyOutlineToggleBinding() {
         const ui = replyNavigationUI;
         if (!ui?.outlineToggle) return;
         const toggle = ui.outlineToggle;
-        const shouldScan = rescan ||
-            (!replyOutlineHeaderLookupAttempted && !replyOutlineHeaderToolbar);
-        const previousToolbar = replyOutlineHeaderToolbar;
-        const toolbar = shouldScan
-            ? findReplyOutlineHeaderToolbar()
-            : previousToolbar?.isConnected ? previousToolbar : null;
-        if (shouldScan) replyOutlineHeaderLookupAttempted = true;
-        replyOutlineHeaderToolbar = toolbar;
-        if (!toolbar) {
-            hideReplyOutlineTooltip();
-            bindReplyOutlineToggle(toggle, null, false);
-            return;
-        }
-
-        if (toolbar !== previousToolbar) hideReplyOutlineTooltip();
-        const hasReply = Boolean(
-            replyNavigationContext?.reply?.isConnected && !ui.root.hidden
+        const hasReply = Boolean(replyNavigationContext?.reply?.isConnected);
+        const toolbarAvailable = Boolean(
+            hasReply && !ui.root.hidden && !ui.toolbar.hidden
         );
         const keepOpenWithoutReply = Boolean(
-            replyOutlineOpen && !ui.root.hidden
+            !hasReply && replyOutlineOpen && !ui.root.hidden
         );
-        bindReplyOutlineToggle(
-            toggle,
-            toolbar,
-            hasReply || keepOpenWithoutReply
-        );
+        toggle.hidden = !(toolbarAvailable || keepOpenWithoutReply);
         if (toggle.hidden || !toggle.isConnected) hideReplyOutlineTooltip();
         const expanded = String(Boolean(
             replyOutlineOpen && !ui.root.hidden && !ui.outline.hidden
@@ -4323,35 +4644,6 @@
         );
     }
 
-    function isReplyOutlineHeaderMutation(mutation) {
-        const target = asElement(mutation.target);
-        if (target?.closest('header, [role="banner"]')) return true;
-        const toolbar = replyOutlineHeaderToolbar;
-        if (target && toolbar &&
-            (target === toolbar || target.contains?.(toolbar) ||
-                toolbar.contains?.(target))) {
-            return true;
-        }
-        if (mutation.type !== 'childList') return false;
-        const changedNodes = [
-            ...Array.from(mutation.addedNodes),
-            ...Array.from(mutation.removedNodes)
-        ];
-        return changedNodes.some(node => {
-            if (!(node instanceof Element)) return false;
-            return node.matches('header, [role="banner"]') ||
-                Boolean(node.querySelector('header, [role="banner"]')) ||
-                (toolbar && (node === toolbar || node.contains(toolbar)));
-        });
-    }
-
-    function replyOutlineHeaderMayHaveChanged(mutations) {
-        if (replyOutlineHeaderToolbar && !replyOutlineHeaderToolbar.isConnected) {
-            return true;
-        }
-        return mutations.some(isReplyOutlineHeaderMutation);
-    }
-
     function isReplySidebarMutation(mutation) {
         const target = asElement(mutation.target);
         if (target?.closest('aside.app-shell-left-panel')) return true;
@@ -4367,13 +4659,20 @@
 
     function isOwnNavigationMutation(mutation) {
         const target = mutation.target;
+        const shiftState = replyOutlineContentShiftState;
+        const ownContentShift = Boolean(
+            mutation.attributeName === 'style' &&
+            shiftState?.element === target &&
+            readReplyThreadContentX(target) === shiftState.appliedValue
+        );
         return Boolean(
             rail?.contains(target) ||
             preview?.contains(target) ||
             replyTopButton === target ||
             replyTopButton?.contains(target) ||
             isReplyOutlineToggleMutation(mutation) ||
-            replyNavigationUI?.root?.contains(target)
+            replyNavigationUI?.root?.contains(target) ||
+            ownContentShift
         );
     }
 
@@ -5565,21 +5864,47 @@
         return result;
     }
 
-    function getAssistantUnitMessageId(assistantUnit) {
-        const firstId = getFirstMessageId(
-            assistantUnit.getAttribute('data-chatgpt-search-message-ids')
-        );
-        if (firstId && !isFallbackSearchKey(firstId)) return firstId;
-
-        const selected = assistantUnit.querySelector(
+    function getAssistantUnitMessageIds(assistantUnit) {
+        if (!assistantUnit) return [];
+        const searchIds = getMessageIds(
+            assistantUnit.getAttribute?.('data-chatgpt-search-message-ids')
+        ).filter(id => !isFallbackSearchKey(id));
+        const selectionIds = [];
+        if (assistantUnit.matches?.('[data-chatgpt-selection-message-id]')) {
+            selectionIds.push(
+                assistantUnit.getAttribute('data-chatgpt-selection-message-id')
+            );
+        }
+        for (const message of assistantUnit.querySelectorAll?.(
             '[data-chatgpt-selection-message-id]'
-        );
-        const selectedId = selected?.getAttribute(
-            'data-chatgpt-selection-message-id'
-        ) || '';
-        if (selectedId && !isFallbackSearchKey(selectedId)) return selectedId;
+        ) || []) {
+            selectionIds.push(message.getAttribute('data-chatgpt-selection-message-id'));
+        }
+        return uniqueMessageIds(searchIds, selectionIds.filter(id =>
+            id && !isFallbackSearchKey(id)
+        ));
+    }
 
-        return '';
+    function getAssistantUnitMessageId(assistantUnit) {
+        return getAssistantUnitMessageIds(assistantUnit)[0] || '';
+    }
+
+    function findAssistantMessageTarget(assistantUnit, messageId) {
+        if (!getAssistantUnitMessageIds(assistantUnit).includes(messageId)) return null;
+        if (
+            assistantUnit.matches?.('[data-chatgpt-selection-message-id]') &&
+            assistantUnit.getAttribute('data-chatgpt-selection-message-id') === messageId
+        ) {
+            return assistantUnit;
+        }
+        for (const candidate of assistantUnit.querySelectorAll?.(
+            '[data-chatgpt-selection-message-id]'
+        ) || []) {
+            if (candidate.getAttribute('data-chatgpt-selection-message-id') === messageId) {
+                return candidate;
+            }
+        }
+        return assistantUnit;
     }
 
     function getAssistantIdentityCandidates(assistantUnit) {
@@ -5776,7 +6101,20 @@
         return liveText || turn?.userText || '';
     }
 
+    function getNativeAssistantPreviewText(text) {
+        const readableText = String(text || '')
+            .replace(/image_group[\s\S]*?/gu, '')
+            .replace(/cite[^]*/gu, '')
+            .replace(/url([^]*)https?:\/\/[^]*/gu, '$1')
+            .replace(/url[^]*/gu, '');
+        return shorten(readableText, 2200);
+    }
+
     function getAssistantText(turn) {
+        if (turn?.assistantTextSource === 'native-complete' &&
+            typeof turn.assistantText === 'string') {
+            return getNativeAssistantPreviewText(turn.assistantText);
+        }
         const pairedAssistantUnit = turn?.kind === 'user'
             ? getPairedAssistantUnits(turn)[0]
             : null;
@@ -5846,18 +6184,7 @@
             ? getPairedAssistantUnits(turn)
             : [turn?.assistantUnit || turn?.root].filter(Boolean);
         for (const unit of assistantUnits) {
-            if (unit.matches?.('[data-chatgpt-selection-message-id]')) {
-                assistantIds.push(
-                    unit.getAttribute('data-chatgpt-selection-message-id')
-                );
-            }
-            for (const message of unit.querySelectorAll?.(
-                '[data-chatgpt-selection-message-id]'
-            ) || []) {
-                assistantIds.push(
-                    message.getAttribute('data-chatgpt-selection-message-id')
-                );
-            }
+            assistantIds.push(...getAssistantUnitMessageIds(unit));
         }
         const cleanAssistantIds = uniqueMessageIds(assistantIds);
         const userMessageId = userIds[0] || '';
@@ -5893,6 +6220,9 @@
             ...toIndexIdentity(turn),
             userText: turn.userText || getUserText(turn),
             assistantText: turn.assistantText || getAssistantText(turn),
+            assistantTextSource: turn.assistantTextSource,
+            assistantTextSourceMessageIds: turn.assistantTextSourceMessageIds,
+            assistantTextUnresolvedReferenceMessageIds: turn.assistantTextUnresolvedReferenceMessageIds,
             userTextSnapshot: turn.userTextSnapshot,
             domUserTextBaseline: turn.domUserTextBaseline,
             preserveCommittedUserText: turn.preserveCommittedUserText
@@ -5950,6 +6280,12 @@
         if (!Array.isArray(entry.userMessageIds)) entry.userMessageIds = [];
         entry.messageId ||= '';
         if (!Array.isArray(entry.assistantMessageIds)) entry.assistantMessageIds = [];
+        if (!Array.isArray(entry.assistantTextSourceMessageIds)) {
+            entry.assistantTextSourceMessageIds = [];
+        }
+        if (!Array.isArray(entry.assistantTextUnresolvedReferenceMessageIds)) {
+            entry.assistantTextUnresolvedReferenceMessageIds = [];
+        }
         entry.root ||= null;
         entry.userBubble ||= null;
         entry.assistantUnit ||= null;
@@ -6040,6 +6376,8 @@
         const previousBranch = store.index.getBranchKey();
         const bodyAndDOM = new Set([
             'userText', 'assistantText', 'userTextSnapshot',
+            'assistantTextSource', 'assistantTextSourceMessageIds',
+            'assistantTextUnresolvedReferenceMessageIds',
             'domUserTextBaseline', 'preserveCommittedUserText',
             'root', 'userBubble', 'assistantUnit'
         ]);
@@ -6230,7 +6568,19 @@
         const liveRecord = Boolean(record.root?.isConnected);
         const fullUserText = getFullUserText(observed);
         const userText = shorten(fullUserText, 1000);
-        const assistantText = getAssistantText(observed);
+        const ids = getTurnMessageIds(observed);
+        const observedMessageIds = ids.assistantMessageIds;
+        const completeAssistantMessageIds = getNativeCompleteAssistantMessageIds(record);
+        const assistantMessageReplaced = completeAssistantMessageIds.length > 0 &&
+            observedMessageIds.length > 0 &&
+            !sharesMessageId(completeAssistantMessageIds, observedMessageIds);
+        if (assistantMessageReplaced) {
+            record.assistantText = '';
+            clearAssistantTextSource(record, 'dom');
+        }
+        const assistantText = completeAssistantMessageIds.length > 0 && !assistantMessageReplaced
+            ? record.assistantText
+            : getAssistantText(observed);
         const conflictsWithCommittedEdit = record.preserveCommittedUserText &&
             fullUserText !== record.userTextSnapshot;
         if (
@@ -6251,6 +6601,9 @@
             (liveObservation || (!liveRecord && !record.assistantText))
         ) {
             record.assistantText = assistantText;
+            if (record.assistantTextSource !== 'native-complete') {
+                clearAssistantTextSource(record, 'dom');
+            }
         }
 
         if (!includeNodeReferences || !observed.root?.isConnected) return;
@@ -6272,13 +6625,14 @@
         if (wrapperKey && !isFallbackSearchKey(wrapperKey)) {
             record.turnKey = wrapperKey;
         }
-        const ids = getTurnMessageIds(observed);
         if (ids.userMessageId) record.userMessageId = ids.userMessageId;
         if (ids.userMessageIds.length) {
             record.userMessageIds = uniqueMessageIds(record.userMessageIds, ids.userMessageIds);
         }
         if (ids.messageId) record.messageId = ids.messageId;
-        if (ids.assistantMessageIds.length) {
+        if (assistantMessageReplaced) {
+            record.assistantMessageIds = uniqueMessageIds(ids.assistantMessageIds);
+        } else if (ids.assistantMessageIds.length) {
             record.assistantMessageIds = uniqueMessageIds(record.assistantMessageIds, ids.assistantMessageIds);
         }
     }
@@ -6578,6 +6932,7 @@
         if (keepPivot && keepRecord) {
             keepRecord.preserveCommittedUserText = true;
             keepRecord.assistantText = '';
+            clearAssistantTextSource(keepRecord, 'dom');
             keepRecord.assistantUnit = null;
         }
 
@@ -6893,8 +7248,36 @@
         ) {
             target.domUserTextBaseline = source.domUserTextBaseline;
         }
-        if (!target.assistantText && source.assistantText) {
+        const targetCompleteIds = getNativeCompleteAssistantMessageIds(target);
+        const sourceCompleteIds = getNativeCompleteAssistantMessageIds(source);
+        const sourceAssistantIds = Array.isArray(source.assistantMessageIds)
+            ? source.assistantMessageIds
+            : [];
+        const replacesCompletedMessage = targetCompleteIds.length > 0 &&
+            sourceAssistantIds.length > 0 &&
+            !sharesMessageId(targetCompleteIds, sourceAssistantIds);
+        const unresolvedCompletedMessage = sharesMessageId(
+            targetCompleteIds,
+            source.assistantTextUnresolvedReferenceMessageIds
+        );
+        const preserveCompletedText = targetCompleteIds.length > 0 && (
+            unresolvedCompletedMessage ||
+            !replacesCompletedMessage &&
+                !sourceCompleteIds.length &&
+                source.assistantTextSource !== 'native-plain'
+        );
+
+        if (sourceCompleteIds.length > 0 && !preserveCompletedText) {
+            target.assistantText = source.assistantText || '';
+            copyAssistantTextSource(target, source);
+        } else if (targetCompleteIds.length > 0) {
+            if (!preserveCompletedText && (replacesCompletedMessage || source.assistantText)) {
+                target.assistantText = source.assistantText || '';
+                copyAssistantTextSource(target, source);
+            }
+        } else if (source.assistantText && !target.assistantText) {
             target.assistantText = source.assistantText;
+            copyAssistantTextSource(target, source);
         }
         target.userMessageId = target.userMessageId || source.userMessageId || '';
         target.userMessageIds = uniqueMessageIds(target.userMessageIds, source.userMessageIds);
@@ -7239,7 +7622,9 @@
             ? getAssistantText(contentTurn)
             : getUserText(contentTurn);
         const text = liveText || (isAssistant
-            ? turn.assistantText || ''
+            ? turn.assistantTextSource === 'native-complete'
+                ? ''
+                : turn.assistantText || ''
             : turn.userText || '');
         const label = shorten(text.replace(/\n/g, ' '), 42);
         const description = isAssistant
@@ -7719,6 +8104,10 @@
             );
             if (ids.includes(messageId)) return element;
         }
+        for (const unit of document.querySelectorAll(ASSISTANT_UNIT_SELECTOR)) {
+            const target = findAssistantMessageTarget(unit, messageId);
+            if (target) return target;
+        }
         return null;
     }
 
@@ -7792,22 +8181,8 @@
             ? getPairedAssistantUnits(mounted)
             : [mounted.assistantUnit || mounted.root].filter(Boolean);
         for (const unit of assistantUnits) {
-            if (
-                unit.matches?.('[data-chatgpt-selection-message-id]') &&
-                unit.getAttribute('data-chatgpt-selection-message-id') === messageId
-            ) {
-                return unit;
-            }
-            for (const candidate of unit.querySelectorAll?.(
-                '[data-chatgpt-selection-message-id]'
-            ) || []) {
-                if (
-                    candidate.getAttribute('data-chatgpt-selection-message-id') ===
-                    messageId
-                ) {
-                    return candidate;
-                }
-            }
+            const target = findAssistantMessageTarget(unit, messageId);
+            if (target) return target;
         }
         return null;
     }
@@ -8440,17 +8815,15 @@
             });
         }
 
-        const header = replyOutlineHeaderToolbar?.closest(
-            'header, [role="banner"]'
-        );
         const main = context?.reply?.closest('main, [role="main"]');
         const nextNodes = new Set(
             [
                 sidebar,
-                replyOutlineHeaderToolbar,
-                header,
                 main,
-                context?.scrollContext?.container
+                context?.scrollContext?.container,
+                document.getElementById(RAIL_ID),
+                getReplyThreadContentLayout(context),
+                replyNavigationUI?.outline
             ].filter(node =>
                 node instanceof Element && node.isConnected
             )
@@ -8916,36 +9289,296 @@
         }
     }
 
+    function getReplyThreadContentLayout(context = replyNavigationContext) {
+        const rectIsVisible = element => {
+            const rect = element?.getBoundingClientRect?.();
+            return rect?.width > 0 && rect?.height > 0;
+        };
+        const candidates = Array.from(
+            document.querySelectorAll?.(
+                '[class*="thread-scroll-layout"]'
+            ) || []
+        ).filter(element =>
+            String(element.className || '')
+                .split(/\s+/)
+                .includes('group/thread-scroll-layout') &&
+            rectIsVisible(element)
+        );
+        const active = context?.reply?.isConnected
+            ? candidates.find(element => element.contains?.(context.reply))
+            : null;
+        return active || candidates[0] || null;
+    }
+
+    function readReplyThreadContentX(element) {
+        return element?.style?.getPropertyValue?.('--thread-content-x') || '';
+    }
+
+    function hasNonzeroThreadContentX(value) {
+        const normalized = String(value || '').trim();
+        if (!normalized || normalized === 'initial') return false;
+        const pixelMatch = normalized.match(
+            /^([-+]?(?:\d+\.?\d*|\.\d+))px$/
+        );
+        return !pixelMatch || Math.abs(Number(pixelMatch[1])) > 0.01;
+    }
+
+    function cancelReplyOutlineContentShiftAnimation() {
+        if (
+            replyOutlineContentShiftFrame !== null &&
+            typeof cancelAnimationFrame === 'function'
+        ) {
+            cancelAnimationFrame(replyOutlineContentShiftFrame);
+        }
+        replyOutlineContentShiftFrame = null;
+    }
+
+    function writeReplyOutlineContentShift(state, pixels) {
+        if (!state?.element?.isConnected) return;
+        const normalized = Number(pixels) > 0
+            ? Math.round(Number(pixels))
+            : 0;
+        const desired = composeThreadContentX(
+            state.baseValue,
+            normalized
+        );
+        const current = readReplyThreadContentX(state.element);
+        if (current !== desired) {
+            if (desired) {
+                state.element.style.setProperty(
+                    '--thread-content-x',
+                    desired
+                );
+            } else {
+                state.element.style.removeProperty('--thread-content-x');
+            }
+        }
+        state.appliedPixels = normalized;
+        state.appliedValue = desired;
+    }
+
+    function animateReplyOutlineContentShift(state, targetPixels) {
+        cancelReplyOutlineContentShiftAnimation();
+        const target = Math.max(0, Math.round(Number(targetPixels) || 0));
+        state.targetPixels = target;
+        const startPixels = state.appliedPixels;
+        if (startPixels === target) {
+            writeReplyOutlineContentShift(state, target);
+            if (target === 0) replyOutlineContentShiftState = null;
+            return;
+        }
+        const reduceMotion = Boolean(
+            window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+        );
+        if (
+            reduceMotion ||
+            typeof requestAnimationFrame !== 'function' ||
+            typeof performance === 'undefined' ||
+            typeof performance.now !== 'function'
+        ) {
+            writeReplyOutlineContentShift(state, target);
+            if (target === 0) replyOutlineContentShiftState = null;
+            return;
+        }
+
+        const startedAt = performance.now();
+        const duration = REPLY_OUTLINE_CONTENT_SHIFT_DURATION_MS;
+        const step = now => {
+            replyOutlineContentShiftFrame = null;
+            if (
+                state !== replyOutlineContentShiftState ||
+                !state.element?.isConnected
+            ) {
+                return;
+            }
+            const progress = Math.max(
+                0,
+                Math.min(1, (now - startedAt) / duration)
+            );
+            const eased = 1 - Math.pow(1 - progress, 3);
+            const pixels = startPixels + (target - startPixels) * eased;
+            if (progress < 1) {
+                writeReplyOutlineContentShift(state, pixels);
+                replyOutlineContentShiftFrame = requestAnimationFrame(step);
+                return;
+            }
+            writeReplyOutlineContentShift(state, target);
+            if (target === 0) replyOutlineContentShiftState = null;
+        };
+        replyOutlineContentShiftFrame = requestAnimationFrame(step);
+    }
+
+    function restoreReplyOutlineContentShift({animate = false} = {}) {
+        const state = replyOutlineContentShiftState;
+        if (!state?.element?.isConnected) {
+            cancelReplyOutlineContentShiftAnimation();
+            replyOutlineContentShiftState = null;
+            return;
+        }
+        const current = readReplyThreadContentX(state.element);
+        if (current !== state.appliedValue) {
+            // ChatGPT changed the native layout value; preserve that newer state.
+            cancelReplyOutlineContentShiftAnimation();
+            replyOutlineContentShiftState = null;
+            return;
+        }
+        if (animate && state.appliedPixels > 0) {
+            if (
+                replyOutlineContentShiftFrame !== null &&
+                state.targetPixels === 0
+            ) {
+                return;
+            }
+            animateReplyOutlineContentShift(state, 0);
+            return;
+        }
+        cancelReplyOutlineContentShiftAnimation();
+        if (state.baseValue) {
+            state.element.style.setProperty(
+                '--thread-content-x',
+                state.baseValue
+            );
+        } else {
+            state.element.style.removeProperty('--thread-content-x');
+        }
+        replyOutlineContentShiftState = null;
+    }
+
+    function applyReplyOutlineContentShift(
+        element,
+        shift,
+        chatIdentity = currentChatIdentity,
+        animate = false
+    ) {
+        if (!element?.style) {
+            restoreReplyOutlineContentShift({animate});
+            return;
+        }
+        let state = replyOutlineContentShiftState;
+        const previousPixels = state?.chatIdentity === chatIdentity
+            ? state.appliedPixels
+            : 0;
+        if (
+            state?.element !== element ||
+            state.chatIdentity !== chatIdentity
+        ) {
+            restoreReplyOutlineContentShift();
+            state = {
+                element,
+                chatIdentity,
+                baseValue: readReplyThreadContentX(element),
+                appliedPixels: previousPixels,
+                appliedValue: readReplyThreadContentX(element),
+                targetPixels: 0
+            };
+            replyOutlineContentShiftState = state;
+        } else {
+            const current = readReplyThreadContentX(element);
+            if (current !== state.appliedValue) {
+                state.baseValue = current;
+                state.appliedPixels = 0;
+                state.appliedValue = current;
+            }
+        }
+
+        const pixels = Number(shift) > 0 ? Math.floor(Number(shift)) : 0;
+        if (
+            animate &&
+            replyOutlineContentShiftFrame !== null &&
+            state.targetPixels === pixels
+        ) {
+            return;
+        }
+        if (animate) {
+            animateReplyOutlineContentShift(state, pixels);
+            return;
+        }
+        cancelReplyOutlineContentShiftAnimation();
+        writeReplyOutlineContentShift(state, pixels);
+    }
+
     function positionReplyOutline() {
         const ui = replyNavigationUI;
-        if (!ui || !replyOutlineOpen || ui.root.hidden) return;
-        const sidebar = getReplySidebarGeometry();
-        const header = replyOutlineHeaderToolbar?.closest(
-            'header, [role="banner"]'
-        );
-        const headerRect = header?.getBoundingClientRect();
-        const toolbarRect = replyOutlineHeaderToolbar?.getBoundingClientRect();
-        const toggleRect = ui.outlineToggle.getBoundingClientRect();
-        const headerBottom = headerRect?.height > 0
-            ? headerRect.bottom
-            : toolbarRect?.bottom;
-        if (!Number.isFinite(Number(headerBottom))) return;
+        if (!ui || !replyOutlineOpen || ui.root.hidden) {
+            restoreReplyOutlineContentShift();
+            return;
+        }
+        const toolbarRect = ui.toolbar.getBoundingClientRect();
+        if (
+            ui.toolbar.hidden || toolbarRect.width <= 0 ||
+            toolbarRect.height <= 0
+        ) {
+            restoreReplyOutlineContentShift();
+            return;
+        }
         const position = computeReplyOutlinePosition({
             windowWidth: window.innerWidth,
             windowHeight: window.innerHeight,
-            sidebarRight: sidebar?.right,
-            sidebarVisible: Boolean(sidebar),
-            toolbarLeft: Number.isFinite(toggleRect?.left)
-                ? toggleRect.left
-                : REPLY_NAV_VIEWPORT_INSET,
-            headerBottom
+            toolbarLeft: toolbarRect.left,
+            toolbarWidth: toolbarRect.width,
+            viewportInset: REPLY_NAV_VIEWPORT_INSET,
+            toolbarGap: REPLY_NAV_TOOLBAR_GAP
         });
-        if (!position) return;
+        if (!position) {
+            restoreReplyOutlineContentShift();
+            return;
+        }
         ui.outline.style.left = `${position.left}px`;
-        ui.outline.style.top = `${position.top}px`;
         ui.outline.style.width = `${position.width}px`;
         ui.outline.style.maxHeight = `${position.maxHeight}px`;
         ui.outline.hidden = !position.visible;
+        if (position.visible) {
+            const outlineRect = ui.outline.getBoundingClientRect();
+            const toggleRect = ui.outlineToggle.getBoundingClientRect();
+            const top = computeReplyOutlineTop({
+                windowHeight: window.innerHeight,
+                panelHeight: outlineRect.height,
+                toggleTop: toggleRect.height > 0 ? toggleRect.top : null,
+                viewportInset: REPLY_NAV_VIEWPORT_INSET
+            });
+            if (Number.isFinite(top)) {
+                ui.outline.style.top = `${top}px`;
+            }
+        }
+
+        const context = replyNavigationContext;
+        const contentLayout = getReplyThreadContentLayout(context);
+        let shift = 0;
+        if (
+            position.visible && contentLayout &&
+            context?.reply?.isConnected && context.rect &&
+            Number.isFinite(Number(context.rect.left)) &&
+            Number.isFinite(Number(context.rect.right))
+        ) {
+            const state = replyOutlineContentShiftState?.element === contentLayout &&
+                replyOutlineContentShiftState.chatIdentity === currentChatIdentity
+                ? replyOutlineContentShiftState
+                : null;
+            const baseValue = state
+                ? state.baseValue
+                : readReplyThreadContentX(contentLayout);
+            if (!hasNonzeroThreadContentX(baseValue)) {
+                const appliedPixels = state?.appliedPixels || 0;
+                const railRect = document.getElementById(RAIL_ID)
+                    ?.getBoundingClientRect();
+                const rightBoundary = railRect?.width > 0
+                    ? railRect.left
+                    : window.innerWidth - REPLY_NAV_VIEWPORT_INSET;
+                shift = computeReplyContentShift({
+                    contentRight: Number(context.rect.right) - appliedPixels,
+                    rightBoundary,
+                    contentGap: REPLY_OUTLINE_CONTENT_GAP,
+                    preferredShift: REPLY_OUTLINE_CONTENT_SHIFT
+                });
+            }
+        }
+        applyReplyOutlineContentShift(
+            contentLayout,
+            shift,
+            currentChatIdentity,
+            true
+        );
+
         const expanded = String(Boolean(
             position.visible && replyOutlineOpen && !ui.outline.hidden
         ));
@@ -8978,7 +9611,8 @@
             windowHeight: window.innerHeight,
             anchorLeft: anchor.left,
             anchorRight: anchor.right,
-            anchorBottom: anchor.bottom,
+            anchorTop: anchor.top,
+            anchorHeight: anchor.height,
             tooltipWidth: rect.width,
             tooltipHeight: rect.height
         });
@@ -9016,6 +9650,7 @@
             ui.root.hidden = true;
         }
         if (replyOutlineOpen) positionReplyOutline();
+        else restoreReplyOutlineContentShift({animate: true});
         ui.outlineToggle.setAttribute(
             'aria-expanded',
             String(Boolean(replyOutlineOpen && !ui.root.hidden && !ui.outline.hidden))
@@ -9039,6 +9674,16 @@
         }
     }
 
+    function canHoldReplyNavigationLayout() {
+        const ui = replyNavigationUI;
+        return Boolean(
+            ui && replyOutlineOpen &&
+            !ui.root.hidden && !ui.toolbar.hidden && !ui.outline.hidden &&
+            ui.toolbar.style.left && ui.toolbar.style.top &&
+            ui.outline.style.left && ui.outline.style.top
+        );
+    }
+
     function clearReplyNavigation({preserveOutlineOpen = false} = {}) {
         if (replyNavigationRAF !== null) {
             cancelAnimationFrame(replyNavigationRAF);
@@ -9049,35 +9694,42 @@
         replyNavigationContext = null;
         if (!preserveOutlineOpen) replyOutlineOpen = false;
         updateReplyOutlineToggleLabel();
-        const keepOutlineVisible = Boolean(
-            preserveOutlineOpen && replyOutlineOpen
-        );
-        if (keepOutlineVisible) syncReplyNavigationLayoutObservers(null);
-        else disconnectReplyNavigationLayoutObservers();
-        if (replyNavigationUI) {
-            replyNavigationUI.root.hidden = !keepOutlineVisible;
-            replyNavigationUI.outline.hidden = !keepOutlineVisible;
-            replyNavigationUI.toolbar.hidden = true;
+        const holdLayout = preserveOutlineOpen &&
+            canHoldReplyNavigationLayout();
+        if (holdLayout) {
+            replyNavigationUI.outlineToggle.hidden = false;
             replyNavigationUI.outlineToggle.setAttribute(
                 'aria-expanded',
-                String(keepOutlineVisible)
+                'true'
+            );
+            if (replyTopButton) {
+                replyTopButton.hidden = true;
+                delete replyTopButton.dataset.identity;
+                delete replyTopButton.dataset.messageId;
+            }
+            syncReplyOutlineToggleBinding();
+            return;
+        }
+        restoreReplyOutlineContentShift();
+        disconnectReplyNavigationLayoutObservers();
+        if (replyNavigationUI) {
+            replyNavigationUI.root.hidden = true;
+            replyNavigationUI.outline.hidden = true;
+            replyNavigationUI.toolbar.hidden = true;
+            replyNavigationUI.outlineToggle.hidden = true;
+            replyNavigationUI.outlineToggle.setAttribute(
+                'aria-expanded',
+                'false'
             );
             replyNavigationUI.toolbar.style.removeProperty('left');
             replyNavigationUI.toolbar.style.removeProperty('top');
-            if (!keepOutlineVisible) {
-                replyNavigationUI.outline.style.removeProperty('left');
-                replyNavigationUI.outline.style.removeProperty('top');
-                replyNavigationUI.outline.style.removeProperty('width');
-                replyNavigationUI.outline.style.removeProperty('max-height');
-            }
+            replyNavigationUI.outlineToggle.style.removeProperty('left');
+            replyNavigationUI.outlineToggle.style.removeProperty('top');
+            replyNavigationUI.outline.style.removeProperty('left');
+            replyNavigationUI.outline.style.removeProperty('top');
+            replyNavigationUI.outline.style.removeProperty('width');
+            replyNavigationUI.outline.style.removeProperty('max-height');
             replyNavigationUI.list.replaceChildren();
-            if (keepOutlineVisible) {
-                const status = document.createElement('li');
-                status.className = 'yw-reply-outline-empty';
-                status.setAttribute('role', 'status');
-                status.textContent = '正在定位当前回复…';
-                replyNavigationUI.list.appendChild(status);
-            }
             replyNavigationUI.outlineEntries = [];
             replyNavigationUI.outlineChatIdentity = null;
             replyNavigationUI.outlineIdentity = null;
@@ -9089,7 +9741,6 @@
             delete replyTopButton.dataset.messageId;
         }
         syncReplyOutlineToggleBinding();
-        if (replyOutlineOpen && replyNavigationUI) positionReplyOutline();
     }
 
     function resetReplyNavigationForConversationChange() {
@@ -9142,6 +9793,31 @@
         ui.replyButtons.get('next').disabled = !boundary.next;
     }
 
+    function positionReplyOutlineToggle(toolbarPosition) {
+        const ui = replyNavigationUI;
+        if (!ui?.outlineToggle) return;
+        const position = toolbarPosition
+            ? computeReplyOutlineTogglePosition({
+                windowWidth: window.innerWidth,
+                windowHeight: window.innerHeight,
+                toolbarLeft: toolbarPosition.left,
+                toolbarTop: toolbarPosition.top,
+                toolbarWidth: REPLY_NAV_CONTROL_SIZE,
+                toggleWidth: REPLY_NAV_CONTROL_SIZE,
+                toggleHeight: REPLY_NAV_CONTROL_SIZE,
+                buttonGap: REPLY_OUTLINE_BUTTON_GAP,
+                viewportInset: REPLY_NAV_VIEWPORT_INSET
+            })
+            : null;
+        if (!position?.visible) {
+            ui.outlineToggle.hidden = true;
+            hideReplyOutlineTooltip();
+            return;
+        }
+        ui.outlineToggle.style.left = `${position.left}px`;
+        ui.outlineToggle.style.top = `${position.top}px`;
+    }
+
     function updateReplyNavigationControls(context, headings) {
         const ui = replyNavigationUI;
         if (!ui) return;
@@ -9155,7 +9831,6 @@
 
         syncReplyNavigationLayoutObservers(context);
         ui.root.hidden = false;
-        syncReplyOutlineToggleBinding();
         updateAssistantReplyNavigationButtons(context);
 
         const sidebar = getReplySidebarGeometry();
@@ -9177,9 +9852,12 @@
             ui.toolbar.style.left = `${position.left}px`;
             ui.toolbar.style.top = `${position.top}px`;
         }
+        positionReplyOutlineToggle(position);
+        syncReplyOutlineToggleBinding();
 
         ui.outline.hidden = !replyOutlineOpen;
         if (replyOutlineOpen) positionReplyOutline();
+        else restoreReplyOutlineContentShift({animate: true});
     }
 
     function isCurrentReplyNavigationContext(context) {
@@ -9739,19 +10417,6 @@
             const previousChatIdentity = currentChatIdentity;
             handleRouteChange();
             const routeChanged = previousChatIdentity !== currentChatIdentity;
-            const hasExternalMutation = mutations.some(mutation =>
-                !isOwnNavigationMutation(mutation)
-            );
-            if (
-                hasExternalMutation &&
-                replyOutlineHeaderMayHaveChanged(mutations)
-            ) {
-                const previousToolbar = replyOutlineHeaderToolbar;
-                syncReplyOutlineToggleBinding(true);
-                if (replyOutlineHeaderToolbar !== previousToolbar) {
-                    scheduleReplyNavigationUpdate();
-                }
-            }
             if (mutations.some(isReplySidebarMutation)) {
                 scheduleReplyNavigationUpdate();
             }
@@ -9869,7 +10534,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.3)');
+        console.info('[Conversation Navigator] Started (0.5.4)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();
@@ -9897,7 +10562,6 @@
 
         window.addEventListener('resize', () => {
             updateRailDensity();
-            syncReplyOutlineToggleBinding(true);
             scheduleActiveUpdate();
             invalidateThreadLayout();
         });

@@ -80,11 +80,16 @@ function loadStoreRuntime() {
             snapshotChanges: applyNativeSnapshotWithChanges,
             observe(observed) { mergeObservedTurnRecords(observed, true, true, true); },
             render: buildRenderedTurns,
+            previewText(turn) { return getAssistantText(turn); },
             refresh: updateObservedTurnContent,
             rememberEdit(turn) { rememberUserEditCandidate(turn, null); },
             candidate(identity) { return userEditCandidates.get(identity); },
             resolve: resolveRememberedIdentity,
-            transfer: transferChatTurnIdentities
+            transfer: transferChatTurnIdentities,
+            targetMessageId(identity) {
+                const entry = getTurnRecordStore(currentChatIdentity).byIdentity.get(identity);
+                return getEntryTargetMessageId(entry, {replyTop: true});
+            }
         };
     ` + source.slice(end), context, {filename});
 
@@ -107,12 +112,33 @@ function loadStoreRuntime() {
             root, userBubble, pairedAssistantUnits};
     }
 
-    return {runtime: context.storeTest, userTurn};
+    function assistantTurn(identity, messageId, assistantText) {
+        const unit = new Element({
+            'data-chatgpt-search-unit-key': `assistant-${messageId}`,
+            'data-chatgpt-search-message-ids': messageId
+        }, assistantText);
+        return {
+            identity, kind: 'assistant', stableIdentity: true,
+            root: unit, assistantUnit: unit, assistantText
+        };
+    }
+
+    return {runtime: context.storeTest, userTurn, assistantTurn};
 }
 
 function native(identity, turnKey, userId, userText, assistantIds = []) {
     return {identity, turnKey, kind: 'user', userMessageId: userId,
         messageId: userId, assistantMessageIds: assistantIds, userText};
+}
+
+function completedAssistant(entry, messageId, assistantText) {
+    return {
+        ...entry,
+        assistantText,
+        assistantTextSource: 'native-complete',
+        assistantTextSourceMessageIds: [messageId],
+        assistantTextUnresolvedReferenceMessageIds: []
+    };
 }
 
 test('DOM observation and a rekeyed native snapshot share one record and migrate aliases', () => {
@@ -146,6 +172,33 @@ test('DOM observation and a rekeyed native snapshot share one record and migrate
     assert.equal(record.root, observed.root);
     assert.equal(record.userText, 'native question');
     assert.equal(record.assistantText, 'native answer');
+});
+
+test('assistant-only DOM units retain search message IDs after virtualization', () => {
+    const {runtime, assistantTurn} = loadStoreRuntime();
+    runtime.setCurrent('conversation:chat');
+    const messageId = 'assistant-dil-message-42';
+    const observed = assistantTurn(
+        `assistant:${messageId}`,
+        messageId,
+        'Complete DIL response.\nTask paused'
+    );
+    runtime.observe([observed]);
+
+    const store = runtime.store('conversation:chat');
+    const record = store.byIdentity.get(`assistant:${messageId}`);
+    const entries = store.index.getEntries();
+    assert.equal(record.messageId, messageId);
+    assert.deepEqual(Array.from(record.assistantMessageIds), [messageId]);
+    assert.equal(runtime.targetMessageId(record.identity), messageId);
+
+    observed.root.isConnected = false;
+    runtime.observe([]);
+    assert.equal(store.index.getEntries(), entries);
+    assert.equal(store.index.getEntries()[0], record);
+    assert.equal(record.messageId, messageId);
+    assert.deepEqual(Array.from(record.assistantMessageIds), [messageId]);
+    assert.equal(runtime.targetMessageId(record.identity), messageId);
 });
 
 test('virtualized observations preserve native branch order, hidden records and native aliases', () => {
@@ -293,7 +346,11 @@ test('native snapshots distinguish body changes from branch and positioning chan
     runtime.setCurrent('conversation:chat');
     const snapshot = {chatId: 'chat', branchKey: 'branch', entries: [
         native('user:A', 'A', 'question-A', 'A'),
-        native('user:B', 'B', 'question-B', 'B', ['answer-B'])
+        completedAssistant(
+            native('user:B', 'B', 'question-B', 'B', ['answer-B']),
+            'answer-B',
+            'Complete answer B'
+        )
     ]};
     assert.equal(runtime.snapshotChanges(snapshot).structureChanged, true);
     const store = runtime.store('conversation:chat');
@@ -302,13 +359,25 @@ test('native snapshots distinguish body changes from branch and positioning chan
     const unchanged = runtime.snapshotChanges({...snapshot, pagination: {complete: true}});
     assert.equal(unchanged.structureChanged, false);
     assert.deepEqual(Array.from(unchanged.changedIdentities), []);
+
+    const provenanceOnly = runtime.snapshotChanges({...snapshot, entries: [
+        snapshot.entries[0],
+        {
+            ...snapshot.entries[1],
+            assistantTextSourceMessageIds: ['answer-B', 'answer-B-alias'],
+            assistantTextUnresolvedReferenceMessageIds: ['answer-B-pending']
+        }
+    ]});
+    assert.equal(provenanceOnly.structureChanged, false);
+    assert.deepEqual(Array.from(provenanceOnly.changedIdentities), []);
+
     const updated = {...snapshot, entries: [snapshot.entries[0],
-        {...snapshot.entries[1], userText: 'B updated'}]};
+        {...snapshot.entries[1], assistantText: 'Updated complete answer B'}]};
     const textChange = runtime.snapshotChanges(updated);
     assert.equal(textChange.structureChanged, false);
     assert.deepEqual(Array.from(textChange.changedIdentities), ['user:B']);
     assert.equal(store.byIdentity.get('user:B'), record);
-    assert.equal(record.userText, 'B updated');
+    assert.equal(record.assistantText, 'Updated complete answer B');
 
     const metadata = {...updated, entries: [updated.entries[0],
         {...updated.entries[1], assistantMessageIds: ['new-answer']}]};
@@ -317,6 +386,176 @@ test('native snapshots distinguish body changes from branch and positioning chan
         {...metadata.entries[1], extraPositioningData: 'changed'}]};
     assert.equal(runtime.snapshotChanges(extraMetadata).structureChanged, true);
     assert.equal(runtime.snapshotChanges({...extraMetadata, branchKey: 'new-branch'}).structureChanged, true);
+});
+
+test('same-message unresolved snapshots and transient DOM text keep a complete native body', () => {
+    const {runtime, userTurn} = loadStoreRuntime();
+    runtime.setCurrent('conversation:chat');
+    const messageId = 'answer-dil-42';
+    const completeBody = 'Complete unmounted response.\nTask paused';
+    const initial = {
+        chatId: 'chat', branchKey: 'branch', entries: [
+            completedAssistant(
+                native('user:round-1', 'round-1', 'question-1', 'Question', [messageId]),
+                messageId,
+                completeBody
+            )
+        ]
+    };
+    assert.equal(runtime.snapshot(initial), true);
+    const store = runtime.store('conversation:chat');
+    const record = store.byIdentity.get('user:round-1');
+    const entries = store.index.getEntries();
+
+    const unresolved = {
+        ...initial,
+        entries: [{
+            ...native('user:round-1', 'round-1', 'question-1', 'Question', [messageId]),
+            assistantText: `::chatgpt-content-reference{index="4" source_message_id="${messageId}"}`,
+            assistantTextUnresolvedReferenceMessageIds: [messageId]
+        }]
+    };
+    assert.equal(runtime.snapshot(unresolved), true);
+    assert.equal(record.assistantText, completeBody);
+    assert.equal(record.assistantTextSource, 'native-complete');
+
+    const observed = userTurn(
+        'user:round-1', 'round-1', 'question-1', 'Question', messageId, 'Task paused'
+    );
+    runtime.observe([observed]);
+    assert.equal(record.assistantText, completeBody);
+    const renderedStatus = observed.pairedAssistantUnits[0].children[0];
+    renderedStatus.innerText = renderedStatus.textContent = '';
+    observed.pairedAssistantUnits[0].innerText =
+        observed.pairedAssistantUnits[0].textContent = '';
+    assert.equal(runtime.refresh(observed), record);
+    assert.equal(record.assistantText, completeBody);
+    assert.equal(record.assistantTextSource, 'native-complete');
+    assert.equal(store.index.getEntries(), entries);
+    assert.equal(store.index.getEntries()[0], record);
+});
+
+test('native-complete display sanitizes DIL controls and caps text without changing stored content', () => {
+    const {runtime} = loadStoreRuntime();
+    runtime.setCurrent('conversation:chat');
+    const messageId = 'answer-dil-display-42';
+    const imageGroup = 'image_group{"query":["materials graph neural networks"],"aspect_ratio":"16:9","layout":"carousel","num_per_query":1}';
+    const cite = 'citeturn576258search1';
+    const url = 'urlNature Communications 原始论文及补充信息https://doi.org/10.1038/s41467-026-79505-6';
+    const readableBody = 'The complete answer explains materials graph neural networks.';
+    const pauseSuffix = 'Task paused. Let me know if you need a shorter summary.';
+    const rawBody = [
+        readableBody,
+        imageGroup,
+        cite,
+        url,
+        pauseSuffix,
+        'Additional readable discussion of the results. '.repeat(100)
+    ].join('\n');
+    const snapshot = {
+        chatId: 'chat', branchKey: 'branch', entries: [
+            completedAssistant(
+                native('user:round-1', 'round-1', 'question-1', 'Question', [messageId]),
+                messageId,
+                rawBody
+            )
+        ]
+    };
+    assert.equal(runtime.snapshot(snapshot), true);
+    const record = runtime.store('conversation:chat').byIdentity.get('user:round-1');
+    const preview = runtime.previewText(record);
+
+    assert.ok(rawBody.length > 4400);
+    assert.ok(preview.length <= 2201);
+    assert.ok(preview.includes(readableBody));
+    assert.ok(preview.includes('Nature Communications 原始论文及补充信息'));
+    assert.ok(preview.includes(pauseSuffix));
+    assert.equal(preview.includes('image_group'), false);
+    assert.equal(preview.includes('materials graph neural networks"'), false);
+    assert.equal(preview.includes('turn576258search1'), false);
+    assert.equal(preview.includes('https://doi.org/'), false);
+    assert.equal(record.assistantText, rawBody);
+});
+
+test('a DOM replacement with a new assistant ID updates the target and drops the old ID', () => {
+    const {runtime, userTurn} = loadStoreRuntime();
+    runtime.setCurrent('conversation:chat');
+    const oldMessageId = 'answer-old-id';
+    const newMessageId = 'answer-new-id';
+    const completeBody = 'Complete original response.';
+    runtime.snapshot({
+        chatId: 'chat', branchKey: 'branch', entries: [
+            completedAssistant(
+                native('user:round-1', 'round-1', 'question-1', 'Question', [oldMessageId]),
+                oldMessageId,
+                completeBody
+            )
+        ]
+    });
+    const store = runtime.store('conversation:chat');
+    const record = store.byIdentity.get('user:round-1');
+
+    runtime.observe([userTurn(
+        'user:round-1', 'round-1', 'question-1', 'Question',
+        newMessageId, 'New streamed response.'
+    )]);
+
+    assert.equal(record.assistantText, 'New streamed response.');
+    assert.notEqual(record.assistantTextSource, 'native-complete');
+    assert.deepEqual(Array.from(record.assistantMessageIds), [newMessageId]);
+    assert.equal(record.assistantMessageIds.includes(oldMessageId), false);
+    assert.equal(runtime.targetMessageId(record.identity), newMessageId);
+});
+
+test('a newer assistant message or plain native content can replace a complete body', () => {
+    for (const update of [
+        {
+            messageId: 'answer-new-id',
+            assistantText: 'Complete response for the new assistant ID.',
+            assistantTextSource: 'native-complete',
+            assistantTextSourceMessageIds: ['answer-new-id'],
+            assistantTextUnresolvedReferenceMessageIds: []
+        },
+        {
+            messageId: 'answer-original-id',
+            assistantText: 'Plain native assistant content.',
+            assistantTextSource: 'native-plain',
+            assistantTextSourceMessageIds: [],
+            assistantTextUnresolvedReferenceMessageIds: []
+        }
+    ]) {
+        const {runtime} = loadStoreRuntime();
+        runtime.setCurrent('conversation:chat');
+        const originalId = 'answer-original-id';
+        const original = {
+            chatId: 'chat', branchKey: 'branch', entries: [
+                completedAssistant(
+                    native('user:round-1', 'round-1', 'question-1', 'Question', [originalId]),
+                    originalId,
+                    'Original complete response.'
+                )
+            ]
+        };
+        runtime.snapshot(original);
+        const nextEntry = {
+            ...native('user:round-1', 'round-1', 'question-1', 'Question', [update.messageId]),
+            assistantText: update.assistantText,
+            assistantTextSource: update.assistantTextSource,
+            assistantTextSourceMessageIds: update.assistantTextSourceMessageIds,
+            assistantTextUnresolvedReferenceMessageIds:
+                update.assistantTextUnresolvedReferenceMessageIds
+        };
+
+        assert.equal(runtime.snapshot({...original, entries: [nextEntry]}), true);
+        const record = runtime.store('conversation:chat').byIdentity.get('user:round-1');
+        assert.equal(record.assistantText, update.assistantText);
+        assert.equal(record.assistantTextSource, update.assistantTextSource);
+        assert.deepEqual(
+            Array.from(record.assistantTextSourceMessageIds),
+            update.assistantTextSourceMessageIds
+        );
+        assert.deepEqual(Array.from(record.assistantMessageIds), [update.messageId]);
+    }
 });
 
 test('promotion carries an edited branch suppression into an existing native store', () => {

@@ -9,9 +9,12 @@ const {
     computeBottomOverlayInset,
     clipReplyScrollViewportGeometry,
     computeReplyToolbarPosition,
+    computeReplyOutlineTogglePosition,
     computeReplyOutlinePosition,
     computeReplyOutlineTooltipPosition,
-    bindReplyOutlineToggle
+    computeReplyOutlineTop,
+    computeReplyContentShift,
+    composeThreadContentX
 } = require('./chatgpt-conversation-navigator.user.js');
 
 const REPLY_OUTLINE_PINNED_STORAGE_KEY =
@@ -468,17 +471,14 @@ test('left toolbar follows the sidebar edge and stays centered in the window', (
     }), null, 'toolbar hides when it would consume the 48px content gutter');
 });
 
-test('outline panel opens just after the sidebar or trigger and shrinks to available width', () => {
+test('outline panel opens after the control rail and shrinks to available width', () => {
     assert.deepEqual(computeReplyOutlinePosition({
         windowWidth: 1200,
         windowHeight: 800,
-        sidebarRight: 260,
-        sidebarVisible: true,
-        toolbarLeft: 12,
-        headerBottom: 64
+        toolbarLeft: 260,
+        toolbarWidth: 32
     }), {
-        left: 268,
-        top: 72,
+        left: 304,
         width: 300,
         maxHeight: 560,
         visible: true
@@ -486,49 +486,162 @@ test('outline panel opens just after the sidebar or trigger and shrinks to avail
     assert.deepEqual(computeReplyOutlinePosition({
         windowWidth: 300,
         windowHeight: 180,
-        sidebarRight: 64,
-        sidebarVisible: true,
-        toolbarLeft: 12,
-        headerBottom: 130
+        toolbarLeft: 64,
+        toolbarWidth: 32
     }), {
-        left: 72,
-        top: 138,
-        width: 220,
-        maxHeight: 34,
+        left: 108,
+        width: 184,
+        maxHeight: 164,
         visible: true
     });
     assert.equal(computeReplyOutlinePosition({
         windowWidth: 600,
         windowHeight: 800,
-        sidebarRight: 260,
-        sidebarVisible: true,
-        headerBottom: 64
-    }).width, 300, 'panel uses its preferred width when it fits');
+        toolbarLeft: 260,
+        toolbarWidth: 32
+    }).width, 288, 'panel uses the space after the control rail');
     assert.equal(computeReplyOutlinePosition({
         windowWidth: 480,
         windowHeight: 800,
-        sidebarRight: 260,
-        sidebarVisible: true,
-        headerBottom: 64
-    }).width, 204, 'panel shrinks to the space after the sidebar');
+        toolbarLeft: 260,
+        toolbarWidth: 32
+    }).width, 168, 'panel shrinks to the space after the control rail');
     assert.equal(computeReplyOutlinePosition({
         windowWidth: 1200,
         windowHeight: 800,
         toolbarLeft: 24,
-        headerBottom: 64
-    }).left, 24, 'collapsed sidebar uses the trigger left edge');
+        toolbarWidth: 32
+    }).left, 68, 'collapsed sidebar uses the control rail right edge');
     assert.equal(computeReplyOutlinePosition({
         windowWidth: 1200,
         windowHeight: 800,
-        headerBottom: 64
-    }).left, 8, 'missing trigger geometry falls back to the viewport inset');
+        toolbarWidth: 32
+    }), null, 'missing control rail geometry leaves the panel hidden');
     assert.equal(computeReplyOutlinePosition({
         windowWidth: 600,
         windowHeight: 500,
-        sidebarRight: 200,
-        sidebarVisible: true,
-        headerBottom: 497
-    }).visible, false);
+        toolbarLeft: 200,
+        toolbarWidth: 32
+    }).visible, true);
+});
+
+test('standalone outline toggle is centered one button above the control rail', () => {
+    assert.deepEqual(computeReplyOutlineTogglePosition({
+        windowWidth: 1200,
+        windowHeight: 800,
+        toolbarLeft: 292,
+        toolbarTop: 299,
+        toolbarWidth: 32,
+        toggleWidth: 32,
+        toggleHeight: 32,
+        buttonGap: 32
+    }), {
+        left: 292,
+        top: 235,
+        visible: true
+    });
+    assert.deepEqual(computeReplyOutlineTogglePosition({
+        windowWidth: 1200,
+        windowHeight: 800,
+        toolbarLeft: 252,
+        toolbarTop: 20,
+        toolbarWidth: 32,
+        toggleWidth: 32,
+        toggleHeight: 32,
+        buttonGap: 32
+    }), {
+        left: 252,
+        top: 8,
+        visible: true
+    });
+});
+
+test('short outline panel rises to the toggle top instead of falling below it', () => {
+    assert.equal(computeReplyOutlineTop({
+        windowHeight: 800,
+        panelHeight: 145,
+        toggleTop: 264
+    }), 264);
+    assert.equal(computeReplyOutlineTop({
+        windowHeight: 800,
+        panelHeight: 400,
+        toggleTop: 264
+    }), 200);
+});
+
+test('control toolbar hover and capsule tooltip match the outline controls', () => {
+    const source = require('node:fs').readFileSync(
+        require.resolve('./chatgpt-conversation-navigator.user.js'),
+        'utf8'
+    );
+    assert.match(
+        source,
+        /\.yw-reply-nav-button:hover,[\s\S]*?background:\s*#EFEFEF;/
+    );
+    assert.match(
+        source,
+        /\.yw-history-control:hover,[\s\S]*?background:\s*#EFEFEF;/
+    );
+    assert.match(
+        source,
+        /\.yw-reply-nav-button::after\s*\{[\s\S]*?content:\s*attr\(aria-label\);/
+    );
+    assert.match(
+        source,
+        /\.yw-reply-nav-button::after\s*\{[\s\S]*?left:\s*calc\(100% \+ \$\{REPLY_NAV_TOOLTIP_GAP\}px\);/
+    );
+    assert.match(
+        source,
+        /\.yw-reply-nav-button:hover::after,[\s\S]*?visibility:\s*visible;/
+    );
+});
+
+test('outline content shift applies one fixed 154px move when it fits', () => {
+    assert.equal(computeReplyContentShift({
+        contentRight: 1236,
+        rightBoundary: 1400
+    }), 154);
+    assert.equal(computeReplyContentShift({
+        contentRight: 1370,
+        rightBoundary: 1395,
+        contentGap: 8
+    }), 0);
+    assert.equal(computeReplyContentShift({
+        contentRight: 1320,
+        rightBoundary: 1395
+    }), 0);
+    assert.equal(composeThreadContentX('', 154), '154px');
+    assert.equal(composeThreadContentX('154px', 154), '308px');
+    assert.equal(composeThreadContentX('-154px', 154), '0px');
+    assert.equal(composeThreadContentX('calc(100% - 1px)', 8),
+        'calc(calc(100% - 1px) + 8px)');
+});
+
+test('outline content shift animates both into place and back out', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const layout = makeTestElement();
+    layout.className = 'group/thread-scroll-layout';
+
+    runtime.applyContentShift(layout, 154, 'chat-1', true);
+    assert.equal(runtime.pendingAnimations(), 1);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '');
+
+    runtime.advanceAnimation(50);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '135px');
+    assert.equal(runtime.pendingAnimations(), 1);
+
+    runtime.advanceAnimation(50);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '154px');
+    assert.equal(runtime.pendingAnimations(), 0);
+
+    runtime.restoreContentShift({animate: true});
+    assert.equal(runtime.pendingAnimations(), 1);
+    runtime.advanceAnimation(50);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '19px');
+    runtime.advanceAnimation(50);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '');
+    assert.equal(runtime.pendingAnimations(), 0);
+    assert.equal(runtime.contentShiftState(), null);
 });
 
 test('outline display preserves every entry’s native level', () => {
@@ -556,10 +669,8 @@ test('outline display preserves every entry’s native level', () => {
 test('outline tooltip stays static while the accessible toggle label follows open state', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(makeTestElement(), null);
     const context = {reply: {isConnected: true}};
-    runtime.install({ui, headerToolbar, currentReplyContext: context});
+    runtime.install({ui, currentReplyContext: context});
 
     runtime.renderOutline(context, []);
     assert.equal(ui.outlineToggle.getAttribute('aria-label'), '展开大纲');
@@ -799,8 +910,6 @@ test('pinned and saved-open outline reopens on a conversation route change', () 
     ]);
     const runtime = loadReplyNavigationRuntime({localStorage: storage});
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(makeTestElement(), null);
     const oldContext = {
         identity: 'old-reply',
         chatIdentity: 'conversation:old',
@@ -811,7 +920,7 @@ test('pinned and saved-open outline reopens on a conversation route change', () 
         readingY: 300,
         viewport: {top: 0}
     };
-    runtime.install({ui, headerToolbar, currentReplyContext: oldContext});
+    runtime.install({ui, currentReplyContext: oldContext});
     runtime.setCurrentChatIdentity('conversation:old');
     runtime.setPathname('/c/old');
     runtime.stubRouteNativeStartup();
@@ -1088,8 +1197,6 @@ test('outside clicks collapse an unpinned outline and preserve a pinned one', ()
 test('inside clicks keep the outline open and the toggle still opens and closes it', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(makeTestElement(), null);
     const reply = makeTestElement();
     reply.querySelectorAll = () => [];
     reply.matches = () => false;
@@ -1102,7 +1209,7 @@ test('inside clicks keep the outline open and the toggle still opens and closes 
         rect: {top: 300, bottom: 700, left: 300, width: 500},
         viewport: {top: 0}
     };
-    runtime.install({ui, headerToolbar, currentReplyContext: context});
+    runtime.install({ui, currentReplyContext: context});
 
     runtime.click(ui.outlineToggle);
     assert.equal(runtime.state().open, true);
@@ -1118,22 +1225,75 @@ test('inside clicks keep the outline open and the toggle still opens and closes 
     assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'false');
 });
 
-test('body-level outline tooltip aligns left and clamps at viewport edges', () => {
+test('outline panel starts after the control rail and clears a short panel top', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    ui.toolbar.hidden = false;
+    ui.toolbar.rect = {
+        left: 292,
+        right: 324,
+        top: 299,
+        bottom: 501,
+        width: 32,
+        height: 202
+    };
+    ui.outline.rect = {
+        left: 336,
+        right: 636,
+        top: 327.5,
+        bottom: 472.5,
+        width: 300,
+        height: 145
+    };
+    ui.outlineToggle.rect = {
+        left: 292,
+        right: 324,
+        top: 263.5,
+        bottom: 295.5,
+        width: 32,
+        height: 32
+    };
+    const reply = makeTestElement();
+    reply.querySelectorAll = () => [];
+    reply.matches = () => false;
+    const context = {
+        identity: 'reply-1',
+        chatIdentity: 'chat-1',
+        reply,
+        rect: {left: 420, right: 900, top: 100, bottom: 700, width: 480, height: 600},
+        visibleTop: 80,
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    };
+    runtime.install({ui, currentReplyContext: context});
+
+    runtime.setReplyOutlineOpen(true);
+    assert.equal(ui.outline.hidden, false);
+    assert.equal(ui.outline.style.left, '336px');
+    assert.equal(ui.outline.style.width, '300px');
+    assert.equal(ui.outline.style.maxHeight, '560px');
+    assert.equal(ui.outline.style.top, '263.5px');
+});
+
+test('body-level outline tooltip opens to the right of the icon and clamps at viewport edges', () => {
     assert.deepEqual(computeReplyOutlineTooltipPosition({
         windowWidth: 1000,
         windowHeight: 600,
         anchorLeft: 900,
         anchorRight: 980,
-        anchorBottom: 50,
+        anchorTop: 12,
+        anchorHeight: 38,
         tooltipWidth: 130,
         tooltipHeight: 28
-    }), {left: 862, top: 58, width: 130, height: 28});
+    }), {left: 862, top: 17, width: 130, height: 28});
     assert.deepEqual(computeReplyOutlineTooltipPosition({
         windowWidth: 320,
         windowHeight: 180,
         anchorLeft: 0,
         anchorRight: 64,
-        anchorBottom: 170,
+        anchorTop: 170,
+        anchorHeight: 40,
         tooltipWidth: 360,
         tooltipHeight: 40
     }), {left: 8, top: 132, width: 304, height: 40});
@@ -1154,7 +1314,7 @@ test('outline tooltip is anchored to its toggle and hides when focus leaves', ()
     assert.equal(ui.outlineTooltip.hidden, false);
     assert.equal(ui.outlineTooltip.dataset.visible, 'true');
     assert.equal(ui.outlineTooltip.style.left, '1062px');
-    assert.equal(ui.outlineTooltip.style.top, '58px');
+    assert.equal(ui.outlineTooltip.style.top, '17px');
 
     runtime.hideTooltip();
     assert.equal(ui.outlineTooltip.hidden, true);
@@ -1209,8 +1369,6 @@ test('outline tooltip follows hover and keyboard focus without latching mouse fo
 test('outline tooltip is limited to the collapsed state for hover, focus and direct updates', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(makeTestElement(), null);
     const reply = makeTestElement();
     reply.querySelectorAll = () => [];
     reply.matches = () => false;
@@ -1229,7 +1387,7 @@ test('outline tooltip is limited to the collapsed state for hover, focus and dir
     ui.outlineToggle.matches = selector =>
         selector === ':hover' ? hovered :
             selector === ':focus-visible' && keyboardFocused;
-    runtime.install({ui, headerToolbar, currentReplyContext: context});
+    runtime.install({ui, currentReplyContext: context});
 
     const dispatch = type => ui.outlineToggle.dispatchEvent({
         type,
@@ -1281,8 +1439,6 @@ test('outline tooltip is limited to the collapsed state for hover, focus and dir
 test('visible outline tooltip reanchors on the normal reply-layout update', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(ui.outlineToggle, null);
     ui.outlineToggle.rect = {
         left: 1100, right: 1190, top: 12, bottom: 50, width: 90, height: 38
     };
@@ -1304,7 +1460,7 @@ test('visible outline tooltip reanchors on the normal reply-layout update', () =
         readingY: 300,
         viewport: {top: 0}
     };
-    runtime.install({ui, headerToolbar, currentReplyContext: context});
+    runtime.install({ui, currentReplyContext: context});
 
     runtime.showTooltip();
     ui.outlineToggle.rect = {
@@ -1312,302 +1468,178 @@ test('visible outline tooltip reanchors on the normal reply-layout update', () =
     };
     runtime.updateReplyTopButton();
     assert.equal(ui.outlineTooltip.hidden, false);
-    assert.equal(ui.outlineTooltip.style.left, '800px');
-    assert.equal(ui.outlineTooltip.style.top, '146px');
+    assert.equal(ui.outlineTooltip.style.left, '896px');
+    assert.equal(ui.outlineTooltip.style.top, '105px');
 });
 
-test('project header row binding inserts first and survives header replacement', () => {
+test('content shift ignores hidden conversation layouts and does not accumulate', () => {
     const runtime = loadReplyNavigationRuntime();
-    const makeProjectHeader = () => {
-        const modelButton = makeTestElement();
-        modelButton.tagName = 'BUTTON';
-        const shareButton = makeTestElement();
-        shareButton.tagName = 'BUTTON';
-        shareButton.setAttribute('data-testid', 'share-button');
-        const toolbar = makeTestParent();
-        toolbar.tagName = 'DIV';
-        toolbar.className = 'Toolbar-w4tLPD flex';
-        toolbar.querySelector = () => modelButton;
-        toolbar.querySelectorAll = selector =>
-            selector === 'button, [role="button"]'
-                ? [modelButton, shareButton]
-                : [];
-        toolbar.rect = {left: 300, right: 900, top: 8, bottom: 48, width: 600, height: 40};
-        toolbar.style = {display: 'flex'};
-        toolbar.children.push(modelButton, shareButton);
-        modelButton.parentElement = toolbar;
-        shareButton.parentElement = toolbar;
-        const moreButton = makeTestElement();
-        moreButton.tagName = 'BUTTON';
-        moreButton.className = 'Button-QTscM8 Toolbar-TcAqyt no-drag';
-        const titlebar = makeTestParent();
-        titlebar.tagName = 'DIV';
-        titlebar.className = 'group/titlebar flex';
-        titlebar.setAttribute('data-app-shell-main-titlebar', 'true');
-        titlebar.style.display = 'flex';
-        titlebar.rect = {left: 249, right: 1230, top: 0, bottom: 52, width: 981, height: 52};
-        titlebar.appendChild(toolbar);
-        titlebar.appendChild(moreButton);
-        configureOutlineSearch(titlebar, {
-            named: [toolbar, moreButton],
-            buttons: [modelButton, shareButton, moreButton]
-        });
-        const header = makeTestElement({
-            rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
-        });
-        header.tagName = 'HEADER';
-        header.className = 'relative group flex end-[var(--app-shell-trailing-sidebar-width,0px)]';
-        header.querySelector = selector =>
-            selector === '[data-app-shell-main-titlebar="true"]'
-                ? titlebar
-                : null;
-        header.appendChild(titlebar);
-        configureOutlineSearch(header, {
-            named: [toolbar, moreButton],
-            buttons: [modelButton, shareButton, moreButton]
-        });
-        return {header, titlebar, toolbar};
-    };
-    const first = makeProjectHeader();
-    runtime.setHeader(first.header);
-    const toggle = makeTestElement();
-    assert.equal(runtime.findHeaderToolbar(), first.toolbar);
-    assert.equal(bindReplyOutlineToggle(toggle, first.toolbar, true), true);
-    assert.equal(first.toolbar.firstElementChild, toggle);
-    assert.equal(first.toolbar.classList.contains('yw-reply-outline-header-host'), true);
-    const scriptSource = require('node:fs').readFileSync(
-        require.resolve('./chatgpt-conversation-navigator.user.js'),
-        'utf8'
+    const hiddenLayout = makeTestElement({
+        rect: {left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0}
+    });
+    hiddenLayout.className = 'group/thread-scroll-layout';
+    const inactiveLayout = makeTestElement({
+        rect: {left: 240, right: 1040, top: 0, bottom: 800, width: 800, height: 800}
+    });
+    inactiveLayout.className = 'group/thread-scroll-layout';
+    const activeLayout = makeTestElement({
+        rect: {left: 240, right: 1040, top: 0, bottom: 800, width: 800, height: 800}
+    });
+    activeLayout.className = 'group/thread-scroll-layout';
+    const reply = makeTestElement();
+    activeLayout.appendChild(reply);
+    runtime.setContentLayouts([hiddenLayout, inactiveLayout, activeLayout]);
+
+    assert.equal(runtime.findContentLayout({reply}), activeLayout);
+
+    runtime.applyContentShift(activeLayout, 154, 'chat-1');
+    runtime.applyContentShift(activeLayout, 154, 'chat-1');
+    assert.equal(activeLayout.style.getPropertyValue('--thread-content-x'), '154px');
+    assert.equal(hiddenLayout.style.getPropertyValue('--thread-content-x'), '');
+
+    runtime.applyContentShift(activeLayout, 154, 'chat-2');
+    assert.equal(activeLayout.style.getPropertyValue('--thread-content-x'), '154px');
+    assert.equal(runtime.contentShiftState().chatIdentity, 'chat-2');
+
+    runtime.restoreContentShift();
+    assert.equal(activeLayout.style.getPropertyValue('--thread-content-x'), '');
+
+    runtime.applyContentShift(activeLayout, 0, 'chat-3');
+    activeLayout.style.setProperty('--thread-content-x', '-154px');
+    runtime.restoreContentShift();
+    assert.equal(
+        activeLayout.style.getPropertyValue('--thread-content-x'),
+        '-154px'
     );
-    assert.match(
-        scriptSource,
-        /\.yw-reply-outline-header-host\s*\{[^}]*justify-content:\s*flex-start/
-    );
-
-    const replacement = makeProjectHeader();
-    runtime.setHeader(replacement.header);
-    assert.equal(runtime.findHeaderToolbar(), replacement.toolbar);
-    assert.equal(bindReplyOutlineToggle(toggle, replacement.toolbar, true), true);
-    assert.equal(replacement.toolbar.firstElementChild, toggle);
-    assert.equal(first.toolbar.classList.contains('yw-reply-outline-header-host'), false);
-    assert.equal(replacement.toolbar.classList.contains('yw-reply-outline-header-host'), true);
-    assert.equal(first.toolbar.children.includes(toggle), false);
 });
 
-test('normal chat binds to the semantic main titlebar independently of native button styling', () => {
-    const runtime = loadReplyNavigationRuntime();
-    const hiddenHeader = makeTestElement({
-        hidden: true,
-        rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
-    });
-    hiddenHeader.tagName = 'HEADER';
-    const hiddenTitlebar = makeTestParent();
-    hiddenTitlebar.tagName = 'DIV';
-    hiddenTitlebar.setAttribute('data-app-shell-main-titlebar', 'true');
-    hiddenTitlebar.style.display = 'flex';
-    hiddenTitlebar.rect = {left: 249, right: 1230, top: 0, bottom: 52, width: 981, height: 52};
-    hiddenHeader.querySelector = selector =>
-        selector === '[data-app-shell-main-titlebar="true"]'
-            ? hiddenTitlebar
-            : null;
-    hiddenHeader.appendChild(hiddenTitlebar);
-    configureOutlineSearch(hiddenHeader);
-    const titlebar = makeTestParent();
-    titlebar.tagName = 'DIV';
-    titlebar.className = 'group/titlebar pointer-events-none flex';
-    titlebar.setAttribute('data-app-shell-main-titlebar', 'true');
-    titlebar.style.display = 'flex';
-    titlebar.rect = {left: 249, right: 1230, top: 0, bottom: 52, width: 981, height: 52};
-    const actionGroup = makeTestParent();
-    actionGroup.tagName = 'DIV';
-    actionGroup.className = 'ms-auto flex shrink-0 items-center';
-    actionGroup.style.display = 'flex';
-    actionGroup.rect = {left: 1020, right: 1220, top: 4, bottom: 48, width: 200, height: 44};
-    const shareButton = makeTestElement();
-    shareButton.tagName = 'BUTTON';
-    shareButton.setAttribute('aria-label', 'Share');
-    const moreButton = makeTestElement();
-    moreButton.tagName = 'BUTTON';
-    moreButton.className = 'Button-QTscM8 Toolbar-TcAqyt no-drag outline-hidden cursor-interaction';
-    moreButton.setAttribute('aria-label', '更多');
-    for (const [name, value] of [
-        ['data-color', 'primary'],
-        ['data-variant', 'ghost'],
-        ['data-state', 'closed'],
-        ['aria-expanded', 'false'],
-        ['aria-haspopup', 'menu']
-    ]) {
-        moreButton.setAttribute(name, value);
-    }
-    moreButton.id = 'native-more-button';
-    actionGroup.appendChild(shareButton);
-    actionGroup.appendChild(moreButton);
-    titlebar.appendChild(actionGroup);
-    configureOutlineSearch(titlebar, {
-        named: [moreButton],
-        flex: [actionGroup],
-        buttons: [shareButton, moreButton]
-    });
-    const header = makeTestElement({
-        rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
-    });
-    header.tagName = 'HEADER';
-    header.className = 'relative group flex end-[var(--app-shell-trailing-sidebar-width,0px)]';
-    header.querySelector = selector =>
-        selector === '[data-app-shell-main-titlebar="true"]'
-            ? titlebar
-            : null;
-    header.appendChild(titlebar);
-    configureOutlineSearch(header, {
-        named: [moreButton],
-        flex: [titlebar, actionGroup],
-        buttons: [shareButton, moreButton]
-    });
-    runtime.setHeaders([hiddenHeader, header]);
-
-    assert.equal(runtime.findHeaderToolbar(), titlebar);
-    const ui = makeNavigationTestUI();
-    ui.outlineToggle.className = 'yw-reply-outline-toggle';
-    ui.outlineToggle.id = 'outline-toggle-owned-id';
-    ui.outlineToggle.setAttribute('aria-label', '展开大纲');
-    ui.outlineToggle.setAttribute('aria-expanded', 'false');
-    runtime.install({
-        ui,
-        currentReplyContext: {reply: {isConnected: true}}
-    });
-    runtime.syncToggleBinding(true);
-
-    assert.equal(ui.outlineToggle.className, 'yw-reply-outline-toggle');
-    assert.equal(ui.outlineToggle.getAttribute('data-color'), null);
-    assert.equal(ui.outlineToggle.getAttribute('data-variant'), null);
-    assert.equal(ui.outlineToggle.getAttribute('data-state'), null);
-    assert.equal(ui.outlineToggle.getAttribute('aria-haspopup'), null);
-    assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'false');
-    assert.equal(ui.outlineToggle.id, 'outline-toggle-owned-id');
-    assert.equal(titlebar.firstElementChild, ui.outlineToggle);
-    assert.equal(titlebar.classList.contains('yw-reply-outline-header-host'), false);
-    assert.equal(actionGroup.firstElementChild, shareButton);
-    assert.equal(moreButton.parentElement, actionGroup);
-    assert.equal(moreButton.className, 'Button-QTscM8 Toolbar-TcAqyt no-drag outline-hidden cursor-interaction');
-    assert.equal(moreButton.getAttribute('data-state'), 'closed');
-    assert.equal(moreButton.getAttribute('aria-expanded'), 'false');
-    assert.equal(moreButton.getAttribute('aria-haspopup'), 'menu');
-    assert.equal(ui.outlineToggle.hidden, false);
-});
-
-test('header toolbar finder still excludes sidebar, quick chat and dialog ancestors', () => {
-    const runtime = loadReplyNavigationRuntime();
-    const makeHeader = ({
-        ancestorTag = 'DIV',
-        ancestorClassName = '',
-        ancestorRole = null,
-        ancestorTestId = null,
-        ancestorAriaModal = null
-    } = {}) => {
-        const header = makeTestElement({
-            rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
-        });
-        header.tagName = 'HEADER';
-        const toolbar = makeTestParent();
-        toolbar.tagName = 'DIV';
-        toolbar.className = 'Toolbar-test flex';
-        toolbar.style.display = 'flex';
-        toolbar.rect = {left: 300, right: 900, top: 8, bottom: 48, width: 600, height: 40};
-        header.appendChild(toolbar);
-        configureOutlineSearch(header, {named: [toolbar], flex: [toolbar]});
-
-        const ancestor = makeTestParent();
-        ancestor.tagName = ancestorTag;
-        ancestor.className = ancestorClassName;
-        if (ancestorRole) ancestor.setAttribute('role', ancestorRole);
-        if (ancestorTestId) ancestor.setAttribute('data-testid', ancestorTestId);
-        if (ancestorAriaModal) ancestor.setAttribute('aria-modal', ancestorAriaModal);
-        ancestor.appendChild(header);
-        return {header, toolbar};
-    };
-
-    for (const options of [
-        {ancestorTag: 'ASIDE'},
-        {ancestorClassName: 'app-shell-sidebar'},
-        {ancestorTestId: 'quick-chat-panel'},
-        {ancestorTag: 'DIALOG'},
-        {ancestorRole: 'complementary'},
-        {ancestorRole: 'dialog'},
-        {ancestorAriaModal: 'true'}
-    ]) {
-        const {header} = makeHeader(options);
-        runtime.setHeader(header);
-        assert.equal(runtime.findHeaderToolbar(), null, JSON.stringify(options));
-    }
-});
-
-test('invalid named toolbar matches leave the legacy flex fallback available', () => {
-    const runtime = loadReplyNavigationRuntime();
-    const header = makeTestElement({
-        rect: {left: 0, right: 1230, top: 0, bottom: 52, width: 1230, height: 52}
-    });
-    header.tagName = 'HEADER';
-    const moreButton = makeTestElement();
-    moreButton.tagName = 'BUTTON';
-    moreButton.className = 'Button-QTscM8 Toolbar-TcAqyt no-drag';
-    const hiddenToolbar = makeTestParent();
-    hiddenToolbar.tagName = 'DIV';
-    hiddenToolbar.className = 'Toolbar-hidden flex';
-    hiddenToolbar.style.display = 'none';
-    const fallback = makeTestParent();
-    fallback.tagName = 'DIV';
-    fallback.className = 'flex';
-    fallback.style.display = 'flex';
-    fallback.rect = {left: 300, right: 900, top: 8, bottom: 48, width: 600, height: 40};
-    header.appendChild(hiddenToolbar);
-    header.appendChild(fallback);
-    configureOutlineSearch(header, {
-        named: [moreButton, hiddenToolbar],
-        flex: [fallback],
-        buttons: [moreButton]
-    });
-    runtime.setHeader(header);
-
-    assert.equal(runtime.findHeaderToolbar(), fallback);
-});
-
-test('runtime keeps an open outline through a reply gap until the explicit toggle closes it', () => {
+test('pinned outline stays hidden through a reply gap until its button can load', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    const toggle = makeTestElement();
-    headerToolbar.insertBefore(toggle, null);
-    const context = {
-        identity: 'reply-1',
-        reply: {isConnected: true},
-        visibleTop: 200
-    };
-    runtime.install({ui, headerToolbar, outlineOpen: true, currentReplyContext: null});
+    runtime.install({ui, outlineOpen: true, currentReplyContext: null});
 
     runtime.updateReplyTopButton();
-    let state = runtime.state();
+    const state = runtime.state();
     assert.equal(state.open, true);
-    assert.equal(state.rootHidden, false);
-    assert.equal(state.toolbarHidden, true);
-    assert.equal(state.outlineHidden, false);
-    assert.equal(state.toggleHidden, false);
-    assert.equal(state.expanded, 'true');
-    assert.equal(ui.list.children[0].textContent, '正在定位当前回复…');
-
-    runtime.toggleReplyOutline();
-    state = runtime.state();
-    assert.equal(state.open, false);
     assert.equal(state.rootHidden, true);
+    assert.equal(state.toolbarHidden, true);
     assert.equal(state.outlineHidden, true);
     assert.equal(state.toggleHidden, true);
     assert.equal(state.expanded, 'false');
+    assert.equal(ui.list.children.length, 0);
+
+    const reply = makeTestElement();
+    reply.querySelectorAll = () => [];
+    reply.matches = () => false;
+    runtime.setCurrentReplyContext({
+        identity: 'reply-1',
+        chatIdentity: 'chat-1',
+        reply,
+        rect: {left: 420, right: 900, top: 100, bottom: 700, width: 480, height: 600},
+        visibleTop: 80,
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    });
+    runtime.updateReplyTopButton();
+    const readyState = runtime.state();
+    assert.equal(readyState.rootHidden, false);
+    assert.equal(readyState.toolbarHidden, false);
+    assert.equal(readyState.outlineHidden, false);
+    assert.equal(readyState.toggleHidden, false);
+    assert.equal(readyState.expanded, 'true');
+});
+
+test('pushed pinned outline holds its layout through same-chat message gaps', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const ui = makeNavigationTestUI();
+    ui.toolbar.rect = {
+        left: 292,
+        right: 324,
+        top: 299,
+        bottom: 501,
+        width: 32,
+        height: 202
+    };
+    ui.outlineToggle.rect = {
+        left: 292,
+        right: 324,
+        top: 235,
+        bottom: 267,
+        width: 32,
+        height: 32
+    };
+    ui.outline.rect = {
+        left: 336,
+        right: 636,
+        top: 200,
+        bottom: 600,
+        width: 300,
+        height: 400
+    };
+    const layout = makeTestElement({
+        rect: {left: 240, right: 1040, top: 0, bottom: 800, width: 800, height: 800}
+    });
+    layout.className = 'group/thread-scroll-layout';
+    const reply = makeTestElement();
+    layout.appendChild(reply);
+    runtime.setContentLayouts([layout]);
+
+    const makeContext = (target, identity) => ({
+        identity,
+        chatIdentity: 'chat-1',
+        reply: target,
+        rect: {left: 504, right: 900, top: 100, bottom: 700, width: 396, height: 600},
+        visibleTop: 80,
+        visibleBottom: 760,
+        readingY: 300,
+        viewport: {top: 0}
+    });
+    const firstContext = makeContext(reply, 'reply-1');
+    runtime.install({
+        ui,
+        outlineOpen: true,
+        currentReplyContext: firstContext
+    });
+    runtime.updateReplyNavigationControls(firstContext, []);
+    runtime.advanceAnimation(50);
+    runtime.advanceAnimation(50);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '154px');
+
+    runtime.setCurrentReplyContext(null);
+    runtime.updateReplyTopButton();
+    let state = runtime.state();
+    assert.equal(state.rootHidden, false);
+    assert.equal(state.toolbarHidden, false);
+    assert.equal(state.outlineHidden, false);
+    assert.equal(state.toggleHidden, false);
+    assert.equal(state.expanded, 'true');
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '154px');
+    assert.equal(runtime.pendingAnimations(), 0);
+
+    const nextLayout = makeTestElement({
+        rect: {left: 240, right: 1040, top: 0, bottom: 800, width: 800, height: 800}
+    });
+    nextLayout.className = 'group/thread-scroll-layout';
+    const nextReply = makeTestElement();
+    nextLayout.appendChild(nextReply);
+    runtime.setContentLayouts([nextLayout]);
+    const nextContext = makeContext(nextReply, 'reply-2');
+    runtime.setCurrentReplyContext(nextContext);
+    runtime.updateReplyNavigationControls(nextContext, []);
+    state = runtime.state();
+    assert.equal(state.rootHidden, false);
+    assert.equal(state.toolbarHidden, false);
+    assert.equal(state.outlineHidden, false);
+    assert.equal(layout.style.getPropertyValue('--thread-content-x'), '');
+    assert.equal(nextLayout.style.getPropertyValue('--thread-content-x'), '154px');
+    assert.equal(runtime.pendingAnimations(), 0);
+    runtime.restoreContentShift();
 });
 
 test('runtime positions the six-control toolbar from the sidebar edge at window center', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
-    const headerToolbar = makeTestParent();
-    headerToolbar.insertBefore(makeTestElement(), null);
     const context = {
         identity: 'reply-1',
         reply: {isConnected: true},
@@ -1617,7 +1649,6 @@ test('runtime positions the six-control toolbar from the sidebar edge at window 
     };
     runtime.install({
         ui,
-        headerToolbar,
         outlineOpen: false,
         currentReplyContext: context,
         sidebarGeometry: {left: 0, right: 280}
@@ -1627,6 +1658,32 @@ test('runtime positions the six-control toolbar from the sidebar edge at window 
     assert.equal(ui.toolbar.hidden, false);
     assert.equal(ui.toolbar.style.left, '292px');
     assert.equal(ui.toolbar.style.top, '299px');
+    assert.equal(ui.outlineToggle.hidden, false);
+    assert.equal(ui.outlineToggle.style.left, '292px');
+    assert.equal(ui.outlineToggle.style.top, '235px');
+    assert.equal(ui.outlineToggle.parentElement, ui.root);
+    assert.equal(ui.toolbar.children.includes(ui.outlineToggle), false);
+});
+
+test('assistant reply target resolves from a search ID without a selection node', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const messageId = 'assistant-dil-search-id';
+    const assistantUnit = makeTestElement();
+    assistantUnit.setAttribute('data-chatgpt-search-message-ids', messageId);
+    const entry = {
+        identity: `assistant:${messageId}`,
+        kind: 'assistant',
+        messageId,
+        assistantMessageIds: [messageId],
+        assistantUnit,
+        root: assistantUnit
+    };
+    runtime.install({ui: makeNavigationTestUI(), turns: [entry]});
+
+    assert.equal(assistantUnit.getAttribute('data-chatgpt-selection-message-id'), null);
+    const resolved = runtime.resolveEntryTarget(entry, {replyTop: true});
+    assert.equal(resolved.messageId, messageId);
+    assert.equal(resolved.target, assistantUnit);
 });
 
 test('assistant reply navigation skips unanswered entries and advances pending virtual targets', () => {
@@ -1695,12 +1752,14 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
     const closureEnd = source.lastIndexOf('\n})();');
     assert.notEqual(closureEnd, -1, 'userscript IIFE end marker exists');
     const testState = {
-        header: null,
-        headers: [],
         currentReplyContext: null,
         sidebarGeometry: null,
+        contentLayouts: [],
         jumpCalls: [],
-        activeSearch: null
+        activeSearch: null,
+        now: 0,
+        nextFrameId: 1,
+        rafQueue: new Map()
     };
     const documentListeners = new Map();
     const windowListeners = new Map();
@@ -1733,12 +1792,13 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             }
             return event;
         },
-        querySelector() { return testState.header; },
+        querySelector() { return null; },
         querySelectorAll(selector) {
-            return selector === 'header, [role="banner"]'
-                ? testState.headers
+            return selector === '[class*="thread-scroll-layout"]'
+                ? testState.contentLayouts
                 : [];
         },
+        getElementById() { return null; },
         createElement() { return makeTestElement(); },
         createElementNS() { return makeTestElement(); }
     };
@@ -1777,7 +1837,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
         const testState = globalThis.__replyTestState;
         const renderReplyOutlineForTest = renderReplyOutline;
         globalThis.__replyNavigationTest = {
-            install({ui, headerToolbar = null, outlineOpen,
+            install({ui, outlineOpen,
                 currentReplyContext = null, turns: testTurns = [],
                 sidebarGeometry = null}) {
                 initializeReplyOutlinePreferences();
@@ -1788,8 +1848,6 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
                 };
                 replyNavigationUI = ui;
                 replyTopButton = {hidden: false, dataset: {}};
-                replyOutlineHeaderToolbar = headerToolbar;
-                replyOutlineHeaderLookupAttempted = true;
                 if (typeof outlineOpen === 'boolean') replyOutlineOpen = outlineOpen;
                 replyNavigationContext = currentReplyContext;
                 turns = testTurns;
@@ -1824,16 +1882,46 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
                 bindReplyOutlineToggleTooltipEvents(ui.outlineToggle);
                 updateReplyOutlinePinButton();
             },
-            setHeader(header) {
-                testState.header = header;
-                testState.headers = header ? [header] : [];
-            },
-            setHeaders(headers) {
-                testState.headers = headers;
-                testState.header = headers[0] || null;
-            },
-            findHeaderToolbar: findReplyOutlineHeaderToolbar,
             syncToggleBinding: syncReplyOutlineToggleBinding,
+            setContentLayouts(layouts) {
+                testState.contentLayouts = layouts;
+            },
+            findContentLayout(context) {
+                return getReplyThreadContentLayout(context);
+            },
+            applyContentShift(
+                layout,
+                shift,
+                chatIdentity = 'chat-1',
+                animate = false
+            ) {
+                applyReplyOutlineContentShift(
+                    layout,
+                    shift,
+                    chatIdentity,
+                    animate
+                );
+            },
+            restoreContentShift: restoreReplyOutlineContentShift,
+            advanceAnimation(ms) {
+                testState.now += Number(ms) || 0;
+                const callbacks = Array.from(testState.rafQueue.values());
+                testState.rafQueue.clear();
+                for (const callback of callbacks) callback(testState.now);
+            },
+            pendingAnimations() {
+                return testState.rafQueue.size;
+            },
+            contentShiftState() {
+                if (!replyOutlineContentShiftState) return null;
+                return {
+                    element: replyOutlineContentShiftState.element,
+                    chatIdentity: replyOutlineContentShiftState.chatIdentity,
+                    baseValue: replyOutlineContentShiftState.baseValue,
+                    appliedPixels: replyOutlineContentShiftState.appliedPixels,
+                    appliedValue: replyOutlineContentShiftState.appliedValue
+                };
+            },
             setJumpToIdentity(fn) {
                 jumpToIdentity = (...args) => {
                     testState.jumpCalls.push(args);
@@ -1894,6 +1982,13 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
             },
             jumpCalls() { return testState.jumpCalls; },
             navigateAssistantReply,
+            resolveEntryTarget(entry, options = {replyTop: true}) {
+                const messageId = getEntryTargetMessageId(entry, options);
+                return {
+                    messageId,
+                    target: findMountedMessageForEntry(entry, messageId)
+                };
+            },
             updateAssistantReplyNavigationButtons,
             updateReplyTopButton,
             updateReplyNavigationControls,
@@ -1919,6 +2014,15 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
         document,
         window,
         console,
+        performance: {now: () => testState.now},
+        requestAnimationFrame(callback) {
+            const id = testState.nextFrameId++;
+            testState.rafQueue.set(id, callback);
+            return id;
+        },
+        cancelAnimationFrame(id) {
+            testState.rafQueue.delete(id);
+        },
         // Projection scheduling is exercised with a clock in navigation-updates.test.cjs.
         setTimeout() { return 1; },
         clearTimeout() {}
@@ -1957,7 +2061,8 @@ function makeNavigationTestUI() {
     ]));
     outline.appendChild(outlineHeadingRow);
     outlineHeadingRow.appendChild(outlinePinButton);
-    toolbar.appendChild(outlineToggle);
+    root.appendChild(toolbar);
+    root.appendChild(outlineToggle);
     return {
         root,
         toolbar,
@@ -2040,35 +2145,6 @@ function matchesTestHeadingSelector(element, selector) {
 function matchesTestBoxContainerSelector(element, selector) {
     return selector === '[data-d-component="box"]' &&
         element.getAttribute('data-d-component') === 'box';
-}
-
-function configureOutlineSearch(root, {named = [], flex = [], buttons = []} = {}) {
-    root.querySelectorAll = selector => {
-        if (selector === '[class*="Toolbar-"]') return named;
-        if (selector === '[role="toolbar"]') {
-            return named.filter(element => element.getAttribute('role') === 'toolbar');
-        }
-        if (selector === 'div.flex, div[class*="flex"]') return flex;
-        if (selector === 'button, [role="button"]') return buttons;
-        return [];
-    };
-    root.querySelector = selector =>
-        selector === 'button, [role="button"]' ? buttons[0] || null : null;
-}
-
-function makeTestParent() {
-    const parent = makeTestElement();
-    parent.insertBefore = (element, reference) => {
-        element.remove();
-        const index = reference ? parent.children.indexOf(reference) : parent.children.length;
-        parent.children.splice(index, 0, element);
-        element.parentElement = parent;
-        element.isConnected = true;
-    };
-    Object.defineProperty(parent, 'firstElementChild', {
-        get() { return parent.children[0] || null; }
-    });
-    return parent;
 }
 
 function makeTestElement({

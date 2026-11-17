@@ -91,6 +91,7 @@ function makeFixture({
     decoys = false,
     realShape = false,
     inlineExportTables = false,
+    wrappedFlushCallback = false,
     alternateGraph = null,
     routeId = 'chat-1'
 } = {}) {
@@ -255,6 +256,21 @@ function makeFixture({
         const flushRef = member(l.reactDep, e.react, referenceStyle);
         const useScopeRef = member(l.hooksDep, e.hookScope, referenceStyle);
         const useValueRef = member(l.hooksDep, e.hookValue, referenceStyle);
+        let loaderFlushArgument = flushRef;
+        if (wrappedFlushCallback) {
+            const wrapperBody = wrappedFlushCallback === 'shadow-only'
+                ? 'const ' + l.reactDep + ' = {}; ' + invoke(flushRef, callStyle) + '(e);'
+                : 'const nestedArrow = () => ' + invoke(flushRef, callStyle) + '(e); ' +
+                    'if (false) { const e = () => {}; const ' + l.reactDep + ' = {}; ' +
+                    invoke(flushRef, callStyle) + '(e); } ' +
+                    'const previous = e.fixtureMarker; e.fixtureMarker = true; ' +
+                    invoke(flushRef, callStyle) + '(e); ' +
+                    (wrappedFlushCallback === 'multiple'
+                        ? invoke(useScopeRef, callStyle) + '(e); '
+                        : '') +
+                    'e.fixtureMarker = previous;';
+            loaderFlushArgument = 'e => { ' + wrapperBody + ' }';
+        }
 
         if (realShape) {
             const req = l.factoryRequireArg;
@@ -294,7 +310,7 @@ function makeFixture({
             '    const ' + l.scopeValue + ' = ' + invoke(useScopeRef, callStyle) + '(' + scopeRef + ');',
             '    const ' + l.keyValue + ' = ' + invoke(useValueRef, callStyle) + '(' + stateRef + ', ' + l.conversationValue + ');',
             '    const ' + l.pageValue + ' = ' + invoke(useValueRef, callStyle) + '(' + paginationRef + ', ' + l.keyValue + ' ?? ' + l.conversationValue + ');',
-            '    const ' + l.callbackValue + ' = () => ' + invoke(loaderRef, callStyle) + '(' + l.scopeValue + ', ' + l.keyValue + ', ' + flushRef + ');',
+            '    const ' + l.callbackValue + ' = () => ' + invoke(loaderRef, callStyle) + '(' + l.scopeValue + ', ' + l.keyValue + ', ' + loaderFlushArgument + ');',
             '    const observer = new IntersectionObserver(() => ' + l.callbackValue + '());',
             '    return {scope: ' + l.scopeValue + ', key: ' + l.keyValue + ', page: ' + l.pageValue + ', observer: observer};',
             '}',
@@ -538,6 +554,18 @@ function adapterOptions(fixture, chatId = fixture.chatId) {
     };
 }
 
+function makeWrappedFlushFixture(wrappedFlushCallback) {
+    return makeFixture({
+        names: {
+            ids: {loader: 'older-page-loader-42', react: 'render-batch-module-17'},
+            exports: {loader: 'load-previous-page', react: 'flush-batched-updates'}
+        },
+        referenceStyle: 'bracket',
+        callStyle: 'babel',
+        wrappedFlushCallback
+    });
+}
+
 function installQuietMutationObserver(fixture) {
     fixture.window.MutationObserver = class {
         observe() {}
@@ -644,6 +672,40 @@ test('discovers renamed graphs through minified comma declarators and loads a pa
     adapter.dispose();
 });
 
+test('discovers the renamed React export inside the loader callback wrapper', async () => {
+    const fixture = makeWrappedFlushFixture('valid');
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const before = adapter.readSnapshot();
+    assert.equal(before.entries.length, 1);
+    assert.equal(before.pagination.canLoadPrevious, true);
+
+    const after = await adapter.loadPreviousPage();
+    assert.equal(fixture.values.loadCalls, 1);
+    assert.equal(fixture.values.flushCalls, 1);
+    assert.equal(fixture.values.lastRequest.endpoint, '/conversations/{conversation_id}/messages');
+    assert.equal(after.entries.length, 2);
+    assert.equal(after.pagination.complete, true);
+    adapter.dispose();
+});
+
+test('rejects a shadowed imported flush member inside the wrapper callback', async () => {
+    const fixture = makeWrappedFlushFixture('shadow-only');
+    await assert.rejects(
+        loadCore(fixture).createNativeAdapter(adapterOptions(fixture)),
+        error => error.code === 'NATIVE_MODULE_SOURCE_UNSUPPORTED'
+    );
+    assert.equal(fixture.values.loadCalls, 0);
+});
+
+test('rejects distinct imported callback candidates inside the wrapper callback', async () => {
+    const fixture = makeWrappedFlushFixture('multiple');
+    await assert.rejects(
+        loadCore(fixture).createNativeAdapter(adapterOptions(fixture)),
+        error => error.code === 'NATIVE_MODULE_SOURCE_UNSUPPORTED'
+    );
+    assert.equal(fixture.values.loadCalls, 0);
+});
+
 test('discovers inline webpack export values without mistaking nested callbacks for exports', async () => {
     const names = {
         ids: {
@@ -687,6 +749,95 @@ test('discovers inline webpack export values without mistaking nested callbacks 
     assert.equal(typeof loaderExport.value, 'function');
     assert.equal(loaderExport.get, undefined);
     assert.equal(typeof scopeExport.get, 'function');
+    adapter.dispose();
+});
+
+test('resolves indexed native DIL content while retaining plain text and its suffix', async () => {
+    const fixture = makeFixture();
+    const sourceMessageId = 'assistant-dil-source-42';
+    const assistantItem = fixture.entries[0].turn.items.find(item =>
+        item.type === 'assistant-message'
+    );
+    const marker = `::chatgpt-content-reference{index="1" source_message_id="${sourceMessageId}"}`;
+    const fallbackMarkdown = 'The complete unmounted assistant body.';
+    assistantItem.messageId = sourceMessageId;
+    fixture.entries[0].turn.messageIds = [
+        'message-1', 'plain-assistant-message', sourceMessageId
+    ];
+    assistantItem.content = `Visible prefix ${marker}\nTask paused`;
+    assistantItem.contentReferences = [
+        {
+            type: 'dil', source_message_id: 'decoy-source',
+            source_message_status: 'finished_successfully',
+            model_dil_v2: {fallbackMarkdown: 'Wrong reference body.'}
+        },
+        {
+            type: 'dil', source_message_id: sourceMessageId,
+            source_message_status: 'finished_successfully',
+            model_dil_v2: {fallbackMarkdown},
+            code: 'throw new Error("DIL code must not be evaluated.")'
+        }
+    ];
+    fixture.entries[0].turn.items.splice(1, 0, {
+        type: 'assistant-message', messageId: 'plain-assistant-message',
+        content: 'Plain streamed assistant text.'
+    });
+
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const entry = adapter.readSnapshot().entries[0];
+    assert.ok(entry.assistantText.includes('Plain streamed assistant text.'));
+    assert.ok(entry.assistantText.includes(`${fallbackMarkdown}\nTask paused`));
+    assert.ok(entry.assistantText.includes('Visible prefix'));
+    assert.equal(entry.assistantText.includes('Wrong reference body.'), false);
+    assert.equal(entry.assistantTextSource, 'native-complete');
+    assert.deepEqual(Array.from(entry.assistantTextSourceMessageIds), [sourceMessageId]);
+    assert.deepEqual(Array.from(entry.assistantTextUnresolvedReferenceMessageIds), []);
+    adapter.dispose();
+});
+
+test('leaves invalid or mismatched native DIL references untouched', async () => {
+    const fixture = makeFixture();
+    const assistantItem = fixture.entries[0].turn.items.find(item =>
+        item.type === 'assistant-message'
+    );
+    const markers = [
+        '::chatgpt-content-reference{index="0" source_message_id="wrong-type"}',
+        '::chatgpt-content-reference{index="1" source_message_id="source-mismatch"}',
+        '::chatgpt-content-reference{index="2" source_message_id="wrong-status"}',
+        '::chatgpt-content-reference{index="5" source_message_id="wrong-index"}'
+    ];
+    assistantItem.content = markers.join('\n');
+    delete assistantItem.messageId;
+    assistantItem.contentReferences = [
+        {
+            type: 'citation', source_message_id: 'wrong-type',
+            source_message_status: 'finished_successfully',
+            model_dil_v2: {fallbackMarkdown: 'Must not replace wrong-type marker.'}
+        },
+        {
+            type: 'dil', source_message_id: 'different-source',
+            source_message_status: 'finished_successfully',
+            model_dil_v2: {fallbackMarkdown: 'Must not replace mismatched-source marker.'}
+        },
+        {
+            type: 'dil', source_message_id: 'wrong-status',
+            source_message_status: 'in_progress',
+            model_dil_v2: {fallbackMarkdown: 'Must not replace wrong-status marker.'}
+        }
+    ].map(reference => ({
+        ...reference,
+        code: 'throw new Error("DIL code must not be evaluated.")'
+    }));
+
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const entry = adapter.readSnapshot().entries[0];
+    for (const marker of markers) assert.ok(entry.assistantText.includes(marker));
+    assert.equal(entry.assistantText.includes('Must not replace'), false);
+    assert.equal(entry.assistantTextSource, 'native-reference');
+    assert.deepEqual(Array.from(entry.assistantTextSourceMessageIds), []);
+    assert.deepEqual(Array.from(entry.assistantTextUnresolvedReferenceMessageIds), [
+        'wrong-type', 'source-mismatch', 'wrong-status', 'wrong-index'
+    ]);
     adapter.dispose();
 });
 
