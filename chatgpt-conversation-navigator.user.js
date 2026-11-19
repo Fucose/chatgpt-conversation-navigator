@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.4
+// @version      0.5.5
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -3131,33 +3131,6 @@
         return available >= shift ? Math.floor(shift) : 0;
     }
 
-    function computeReplyOutlineTop({
-        windowHeight,
-        panelHeight,
-        toggleTop = null,
-        viewportInset = 8
-    }) {
-        const height = Number(windowHeight);
-        const panel = Number(panelHeight);
-        const inset = Number(viewportInset);
-        const buttonTop = toggleTop === null ? NaN : Number(toggleTop);
-        if (
-            ![height, panel, inset].every(Number.isFinite) ||
-            height <= 0 || panel <= 0 || inset < 0
-        ) {
-            return null;
-        }
-        const maxTop = Math.max(inset, height - inset - panel);
-        const centeredTop = Math.max(
-            inset,
-            Math.min(maxTop, (height - panel) / 2)
-        );
-        if (!Number.isFinite(buttonTop) || centeredTop <= buttonTop) {
-            return centeredTop;
-        }
-        return Math.max(inset, Math.min(maxTop, buttonTop));
-    }
-
     function composeThreadContentX(baseValue, shift) {
         const base = typeof baseValue === 'string' ? baseValue.trim() : '';
         const pixels = Number(shift);
@@ -3192,7 +3165,6 @@
         computeReplyOutlineTogglePosition,
         computeReplyOutlinePosition,
         computeReplyOutlineTooltipPosition,
-        computeReplyOutlineTop,
         computeReplyContentShift,
         composeThreadContentX,
         NativeAdapterError
@@ -9525,20 +9497,20 @@
         }
         ui.outline.style.left = `${position.left}px`;
         ui.outline.style.width = `${position.width}px`;
-        ui.outline.style.maxHeight = `${position.maxHeight}px`;
         ui.outline.hidden = !position.visible;
         if (position.visible) {
-            const outlineRect = ui.outline.getBoundingClientRect();
-            const toggleRect = ui.outlineToggle.getBoundingClientRect();
-            const top = computeReplyOutlineTop({
-                windowHeight: window.innerHeight,
-                panelHeight: outlineRect.height,
-                toggleTop: toggleRect.height > 0 ? toggleRect.top : null,
-                viewportInset: REPLY_NAV_VIEWPORT_INSET
-            });
-            if (Number.isFinite(top)) {
-                ui.outline.style.top = `${top}px`;
-            }
+            const listOffsetTop = ui.list.getBoundingClientRect().top -
+                ui.outline.getBoundingClientRect().top;
+            const top = Math.max(
+                REPLY_NAV_VIEWPORT_INSET,
+                ui.outlineToggle.getBoundingClientRect().top - listOffsetTop
+            );
+            const maxHeight = Math.min(
+                position.maxHeight,
+                window.innerHeight - top - REPLY_NAV_VIEWPORT_INSET
+            );
+            ui.outline.style.top = `${top}px`;
+            ui.outline.style.maxHeight = `${maxHeight}px`;
         }
 
         const context = replyNavigationContext;
@@ -10534,7 +10506,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.4)');
+        console.info('[Conversation Navigator] Started (0.5.5)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();

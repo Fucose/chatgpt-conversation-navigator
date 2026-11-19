@@ -12,7 +12,6 @@ const {
     computeReplyOutlineTogglePosition,
     computeReplyOutlinePosition,
     computeReplyOutlineTooltipPosition,
-    computeReplyOutlineTop,
     computeReplyContentShift,
     composeThreadContentX
 } = require('./chatgpt-conversation-navigator.user.js');
@@ -554,19 +553,6 @@ test('standalone outline toggle is centered one button above the control rail', 
         top: 8,
         visible: true
     });
-});
-
-test('short outline panel rises to the toggle top instead of falling below it', () => {
-    assert.equal(computeReplyOutlineTop({
-        windowHeight: 800,
-        panelHeight: 145,
-        toggleTop: 264
-    }), 264);
-    assert.equal(computeReplyOutlineTop({
-        windowHeight: 800,
-        panelHeight: 400,
-        toggleTop: 264
-    }), 200);
 });
 
 test('control toolbar hover and capsule tooltip match the outline controls', () => {
@@ -1225,31 +1211,32 @@ test('inside clicks keep the outline open and the toggle still opens and closes 
     assert.equal(ui.outlineToggle.getAttribute('aria-expanded'), 'false');
 });
 
-test('outline panel starts after the control rail and clears a short panel top', () => {
-    const runtime = loadReplyNavigationRuntime();
+test('outline opens with the list aligned to the toggle and room to scroll below', () => {
+    const runtime = loadReplyNavigationRuntime({windowHeight: 600});
     const ui = makeNavigationTestUI();
     ui.toolbar.hidden = false;
     ui.toolbar.rect = {
         left: 292,
         right: 324,
-        top: 299,
-        bottom: 501,
+        top: 199,
+        bottom: 401,
         width: 32,
         height: 202
     };
     ui.outline.rect = {
         left: 336,
         right: 636,
-        top: 327.5,
-        bottom: 472.5,
+        top: 227.5,
+        bottom: 372.5,
         width: 300,
         height: 145
     };
+    ui.list.rect = {...ui.outline.rect, top: 274.5, height: 98};
     ui.outlineToggle.rect = {
         left: 292,
         right: 324,
-        top: 263.5,
-        bottom: 295.5,
+        top: 135,
+        bottom: 167,
         width: 32,
         height: 32
     };
@@ -1272,8 +1259,8 @@ test('outline panel starts after the control rail and clears a short panel top',
     assert.equal(ui.outline.hidden, false);
     assert.equal(ui.outline.style.left, '336px');
     assert.equal(ui.outline.style.width, '300px');
-    assert.equal(ui.outline.style.maxHeight, '560px');
-    assert.equal(ui.outline.style.top, '263.5px');
+    assert.equal(ui.outline.style.maxHeight, '504px');
+    assert.equal(ui.outline.style.top, '88px');
 });
 
 test('body-level outline tooltip opens to the right of the icon and clamps at viewport edges', () => {
@@ -1569,14 +1556,18 @@ test('pushed pinned outline holds its layout through same-chat message gaps', ()
         width: 32,
         height: 32
     };
-    ui.outline.rect = {
-        left: 336,
-        right: 636,
-        top: 200,
-        bottom: 600,
-        width: 300,
-        height: 400
+    const setOutlineHeight = height => {
+        ui.outline.rect = {
+            left: 336,
+            right: 636,
+            top: 200,
+            bottom: 200 + height,
+            width: 300,
+            height
+        };
+        ui.list.rect = {...ui.outline.rect, top: 247, height: height - 47};
     };
+    setOutlineHeight(145);
     const layout = makeTestElement({
         rect: {left: 240, right: 1040, top: 0, bottom: 800, width: 800, height: 800}
     });
@@ -1602,6 +1593,7 @@ test('pushed pinned outline holds its layout through same-chat message gaps', ()
         currentReplyContext: firstContext
     });
     runtime.updateReplyNavigationControls(firstContext, []);
+    assert.equal(ui.outline.style.top, '188px');
     runtime.advanceAnimation(50);
     runtime.advanceAnimation(50);
     assert.equal(layout.style.getPropertyValue('--thread-content-x'), '154px');
@@ -1612,6 +1604,7 @@ test('pushed pinned outline holds its layout through same-chat message gaps', ()
     assert.equal(state.rootHidden, false);
     assert.equal(state.toolbarHidden, false);
     assert.equal(state.outlineHidden, false);
+    assert.equal(ui.outline.style.top, '188px');
     assert.equal(state.toggleHidden, false);
     assert.equal(state.expanded, 'true');
     assert.equal(layout.style.getPropertyValue('--thread-content-x'), '154px');
@@ -1625,12 +1618,15 @@ test('pushed pinned outline holds its layout through same-chat message gaps', ()
     nextLayout.appendChild(nextReply);
     runtime.setContentLayouts([nextLayout]);
     const nextContext = makeContext(nextReply, 'reply-2');
+    setOutlineHeight(560);
     runtime.setCurrentReplyContext(nextContext);
     runtime.updateReplyNavigationControls(nextContext, []);
     state = runtime.state();
     assert.equal(state.rootHidden, false);
     assert.equal(state.toolbarHidden, false);
     assert.equal(state.outlineHidden, false);
+    assert.equal(ui.outline.style.top, '188px');
+    assert.equal(ui.outline.style.maxHeight, '560px');
     assert.equal(layout.style.getPropertyValue('--thread-content-x'), '');
     assert.equal(nextLayout.style.getPropertyValue('--thread-content-x'), '154px');
     assert.equal(runtime.pendingAnimations(), 0);
@@ -1744,7 +1740,7 @@ test('assistant reply navigation skips unanswered entries and advances pending v
     assert.equal(calls.length, callCountAtBoundary);
 });
 
-function loadReplyNavigationRuntime({localStorage} = {}) {
+function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
     const fs = require('node:fs');
     const vm = require('node:vm');
     const filename = require.resolve('./chatgpt-conversation-navigator.user.js');
@@ -1804,7 +1800,7 @@ function loadReplyNavigationRuntime({localStorage} = {}) {
     };
     const window = {
         innerWidth: 1200,
-        innerHeight: 800,
+        innerHeight: windowHeight,
         location: {pathname: '/'},
         addEventListener(type, listener) {
             const listeners = windowListeners.get(type) || [];
