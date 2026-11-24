@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Navigator
 // @namespace    https://github.com/Fucose
-// @version      0.5.5
+// @version      0.5.6
 // @description  ChatGPT 对话导航：悬停预览、加载完整历史、回复大纲与章节跳转。
 // @author       Fucose
 // @homepageURL  https://gist.github.com/Fucose/fc9f1963666d75e7f93a5edceae137c7
@@ -2088,8 +2088,22 @@
                     continue;
                 }
 
-                const ref = getCurrentRef(fiber);
-                if (ref) candidates.push({fiber, props, ref});
+                const turnListApi = props.turnListApi;
+                if (
+                    isObject(turnListApi) &&
+                    typeof turnListApi.scrollToKey === 'function' &&
+                    typeof turnListApi.getRowElement === 'function'
+                ) {
+                    if (!candidates.some(candidate =>
+                        candidate.turnListApi === turnListApi &&
+                        candidate.props.entries === props.entries
+                    )) {
+                        candidates.push({fiber, props, turnListApi});
+                    }
+                } else {
+                    const ref = getCurrentRef(fiber);
+                    if (ref) candidates.push({fiber, props, ref});
+                }
             }
 
             if (candidates.length === 0) return null;
@@ -2468,6 +2482,12 @@
                 fail('INVALID_CHAT_ID', 'A conversation identifier is required.');
             }
             let disposed = false;
+            let pendingScroll = null;
+
+            function abortPendingScroll() {
+                pendingScroll?.controller?.abort();
+                pendingScroll = null;
+            }
 
             function assertActive() {
                 if (disposed) fail('LOCATOR_DISPOSED', 'This native message locator has been disposed.');
@@ -2475,6 +2495,7 @@
                     getRouteConversationId(windowObject) !== requestedChatId ||
                     !isCurrent()
                 ) {
+                    abortPendingScroll();
                     fail('STALE_NATIVE_LOCATOR', 'The active ChatGPT conversation changed before navigation.');
                 }
             }
@@ -2484,38 +2505,146 @@
                 return resolveNativeTarget(documentObject, requestedChatId).target;
             }
 
+            function findNativeScrollContainer(element) {
+                for (let ancestor = element?.parentElement;
+                    ancestor && ancestor !== documentObject.body;
+                    ancestor = ancestor.parentElement) {
+                    const style = windowObject?.getComputedStyle?.(ancestor);
+                    if (
+                        style &&
+                        /^(auto|scroll|overlay)$/.test(style.overflowY) &&
+                        ancestor.scrollHeight > ancestor.clientHeight
+                    ) {
+                        return ancestor;
+                    }
+                }
+                return documentObject.scrollingElement || documentObject.documentElement;
+            }
+
+            function findMountedTurnListRow(entries, turnListApi) {
+                for (const entry of entries) {
+                    const row = turnListApi.getRowElement(entry?.turnKey);
+                    if (row?.isConnected) return row;
+                }
+                return null;
+            }
+
+            function waitForNativeTimer(timer, timeoutMs) {
+                if (typeof timer !== 'function') return Promise.resolve();
+                return new Promise(resolve => timer(resolve, timeoutMs));
+            }
+
             async function locateMessage(messageId, isRequestCurrent = () => true) {
                 if (typeof messageId !== 'string' || messageId.length === 0) {
                     fail('INVALID_MESSAGE_ID', 'A message identifier is required.');
                 }
+                abortPendingScroll();
                 const target = resolveCurrentTarget();
                 const entries = target.props.entries;
                 if (!Array.isArray(entries)) {
                     fail('UNSUPPORTED_TURN_MODEL', 'The native conversation list has an unsupported shape.');
                 }
-                const hasMessage = entries.some(entry =>
+                const matchingEntries = entries.filter(entry =>
                     Array.isArray(entry?.turn?.messageIds) &&
                     entry.turn.messageIds.includes(messageId)
                 );
-                if (!hasMessage) return false;
+                if (matchingEntries.length === 0) return false;
+                const turnKey = matchingEntries[0].turnKey;
+                if (target.turnListApi && (
+                    matchingEntries.length !== 1 ||
+                    typeof turnKey !== 'string' || turnKey.length === 0
+                )) return false;
 
                 assertActive();
                 if (!isRequestCurrent()) return false;
-                try {
-                    await target.ref.scrollToMessage(messageId);
-                } catch (_error) {
-                    fail('NATIVE_SCROLL_FAILED', 'ChatGPT could not scroll to the requested message.');
+                const Controller = windowObject?.AbortController || globalThis.AbortController;
+                const request = {
+                    controller: target.turnListApi && typeof Controller === 'function'
+                        ? new Controller()
+                        : null
+                };
+                pendingScroll = request;
+
+                const setTimer = windowObject?.setTimeout || globalThis.setTimeout;
+                let scrollContainer = target.turnListApi
+                    ? findNativeScrollContainer(findMountedTurnListRow(entries, target.turnListApi))
+                    : null;
+
+                function requestIsCurrent() {
+                    assertActive();
+                    if (pendingScroll !== request || !isRequestCurrent()) {
+                        request.controller?.abort();
+                        return false;
+                    }
+                    return true;
                 }
-                assertActive();
-                if (!isRequestCurrent()) return false;
 
-                const currentTarget = resolveCurrentTarget();
-                const currentEntries = currentTarget.props.entries;
-                if (!Array.isArray(currentEntries)) return false;
-                return currentEntries.some(entry =>
-                    Array.isArray(entry?.turn?.messageIds) &&
-                    entry.turn.messageIds.includes(messageId)
-                ) && Boolean(isRequestCurrent());
+                try {
+                    try {
+                        if (target.turnListApi) {
+                            const escape = windowObject?.CSS?.escape || globalThis.CSS?.escape;
+                            const escapedMessageId = typeof escape === 'function'
+                                ? escape(messageId)
+                                : messageId.replace(/[\0-\x1f\x7f"\\]/g, character =>
+                                    `\\${character.charCodeAt(0).toString(16)} `
+                                );
+                            await target.turnListApi.scrollToKey(turnKey, row => {
+                                if (!requestIsCurrent()) return row;
+                                return row.querySelector(
+                                    `[data-chatgpt-search-message-ids~="${escapedMessageId}"]`
+                                ) ?? row;
+                            }, {
+                                align: 'top',
+                                signal: request.controller?.signal
+                            });
+                            await waitForNativeTimer(setTimer, 120);
+                            if (!requestIsCurrent()) return false;
+                            const row = target.turnListApi.getRowElement(turnKey);
+                            const mountedTarget = row?.querySelector?.(
+                                `[data-chatgpt-search-message-ids~="${escapedMessageId}"]`
+                            );
+                            if (!row?.isConnected || !mountedTarget?.isConnected) {
+                                scrollContainer ||= findNativeScrollContainer(row);
+                                const geometry = target.turnListApi.getEntryGeometry?.(turnKey);
+                                if (
+                                    scrollContainer &&
+                                    Number.isFinite(geometry?.startPx) &&
+                                    geometry.startPx >= 0
+                                ) {
+                                    scrollContainer.scrollTop = Math.max(
+                                        0,
+                                        Math.min(
+                                            scrollContainer.scrollHeight - scrollContainer.clientHeight,
+                                            geometry.startPx
+                                        )
+                                    );
+                                    await waitForNativeTimer(setTimer, 80);
+                                    if (!requestIsCurrent()) return false;
+                                }
+                            }
+                        } else {
+                            await target.ref.scrollToMessage(messageId);
+                        }
+                    } catch (_error) {
+                        if (!requestIsCurrent()) return false;
+                        fail('NATIVE_SCROLL_FAILED', 'ChatGPT could not scroll to the requested message.');
+                    }
+                    if (!requestIsCurrent()) return false;
+
+                    const currentTarget = resolveCurrentTarget();
+                    const currentEntries = currentTarget.props.entries;
+                    if (!Array.isArray(currentEntries)) return false;
+                    const currentMatches = currentEntries.filter(entry =>
+                        Array.isArray(entry?.turn?.messageIds) &&
+                        entry.turn.messageIds.includes(messageId)
+                    );
+                    return (target.turnListApi
+                        ? currentTarget.turnListApi === target.turnListApi &&
+                            currentMatches.length === 1 && currentMatches[0].turnKey === turnKey
+                        : currentMatches.length > 0) && requestIsCurrent();
+                } finally {
+                    if (pendingScroll === request) pendingScroll = null;
+                }
             }
 
             resolveCurrentTarget();
@@ -2523,6 +2652,7 @@
                 locateMessage,
                 dispose() {
                     disposed = true;
+                    abortPendingScroll();
                 }
             };
         }
@@ -3279,9 +3409,13 @@
     const ASSISTANT_UNIT_SELECTOR =
         '[data-content-search-unit-key$=":assistant"], ' +
         '[data-chatgpt-search-unit-key*="assistant"]';
+    const USER_UNIT_ID_SELECTOR =
+        '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids], ' +
+        '[data-content-search-unit-key$=":user"][data-chatgpt-search-message-ids]';
     const USER_MESSAGE_ID_SELECTOR =
         '[data-user-message-bubble="true"][data-chatgpt-search-message-ids], ' +
-        '[data-user-message-bubble="true"][data-message-id]';
+        '[data-user-message-bubble="true"][data-message-id], ' +
+        USER_UNIT_ID_SELECTOR;
     const MESSAGE_ELEMENT_SELECTOR =
         '[data-chatgpt-selection-message-id], ' + USER_MESSAGE_ID_SELECTOR;
     const TURN_NODE_SELECTOR =
@@ -5647,6 +5781,33 @@
         return getMessageIds(value)[0] || '';
     }
 
+    function getUserMessageBubble(element) {
+        if (element?.matches?.('[data-user-message-bubble="true"]')) return element;
+        if (!element?.matches?.(USER_UNIT_ID_SELECTOR)) return null;
+
+        const bubbles = element.querySelectorAll('[data-user-message-bubble="true"]');
+        if (bubbles.length !== 1) return null;
+        const bubble = bubbles[0];
+        for (let ancestor = bubble.parentElement; ancestor && ancestor !== element;
+            ancestor = ancestor.parentElement) {
+            if (ancestor.matches(ASSISTANT_UNIT_SELECTOR)) return null;
+        }
+        return bubble;
+    }
+
+    function getUserMessageIds(bubble) {
+        const directIds = getMessageIds(
+            bubble?.getAttribute('data-chatgpt-search-message-ids') ||
+            bubble?.getAttribute('data-message-id')
+        );
+        if (directIds.length) return directIds;
+
+        const unit = bubble?.closest?.(USER_UNIT_ID_SELECTOR);
+        return unit && getUserMessageBubble(unit) === bubble
+            ? getMessageIds(unit.getAttribute('data-chatgpt-search-message-ids'))
+            : [];
+    }
+
     function collectMessageEvidenceIds(...sources) {
         const ids = new Set();
         for (const source of sources) {
@@ -5694,10 +5855,7 @@
             return `user:${turnKey}`;
         }
 
-        const messageId = getFirstMessageId(
-            bubble.getAttribute('data-chatgpt-search-message-ids') ||
-            bubble.getAttribute('data-message-id')
-        );
+        const messageId = getUserMessageIds(bubble)[0] || '';
         if (messageId && !isFallbackSearchKey(messageId)) {
             return `user:${messageId}`;
         }
@@ -6147,10 +6305,7 @@
     }
 
     function getTurnMessageIds(turn) {
-        const userIds = getMessageIds(
-            turn?.userBubble?.getAttribute('data-chatgpt-search-message-ids') ||
-            turn?.userBubble?.getAttribute('data-message-id')
-        );
+        const userIds = getUserMessageIds(turn?.userBubble);
         const assistantIds = [];
         const assistantUnits = turn?.kind === 'user'
             ? getPairedAssistantUnits(turn)
@@ -6653,9 +6808,7 @@
         const bubble = element.closest('[data-user-message-bubble="true"]');
         const rawIdentities = [
             getTurnWrapperKey(wrapper),
-            getFirstMessageId(
-                bubble?.getAttribute('data-chatgpt-search-message-ids')
-            )
+            getUserMessageIds(bubble)[0]
         ].filter(value => value && !isFallbackSearchKey(value));
 
         let record = null;
@@ -7723,8 +7876,15 @@
         );
         if (!requiredExtension) return maxScrollTop;
 
-        const originalValue = container.style.getPropertyValue('padding-bottom');
-        const originalPriority = container.style.getPropertyPriority('padding-bottom');
+        const currentValue = container.style.getPropertyValue('padding-bottom');
+        const currentPriority = container.style.getPropertyPriority('padding-bottom');
+        const ownsCurrentPadding = extendedScrollRange?.container === container &&
+            currentValue === extendedScrollRange.appliedValue &&
+            currentPriority === 'important';
+        if (extendedScrollRange && !ownsCurrentPadding) clearExtendedScrollRange();
+
+        const originalValue = extendedScrollRange ? extendedScrollRange.originalValue : currentValue;
+        const originalPriority = extendedScrollRange ? extendedScrollRange.originalPriority : currentPriority;
         const computedPadding = parseFloat(
             window.getComputedStyle(container).paddingBottom
         ) || 0;
@@ -8069,12 +8229,8 @@
         for (const element of document.querySelectorAll(
             USER_MESSAGE_ID_SELECTOR
         )) {
-            const ids = getMessageIds(
-                element.getAttribute('data-chatgpt-search-message-ids') ||
-                element.getAttribute('data-message-id') ||
-                ''
-            );
-            if (ids.includes(messageId)) return element;
+            const bubble = getUserMessageBubble(element);
+            if (getUserMessageIds(bubble).includes(messageId)) return bubble;
         }
         for (const unit of document.querySelectorAll(ASSISTANT_UNIT_SELECTOR)) {
             const target = findAssistantMessageTarget(unit, messageId);
@@ -8220,10 +8376,31 @@
     }
 
     function correctForegroundTarget(search) {
+        if (!isCurrentJumpSearch(search)) {
+            clearForegroundSearch(search);
+            return null;
+        }
         const target = resolveSearchTarget(search);
-        if (!target?.isConnected || !isCurrentJumpSearch(search)) return null;
+        if (!target?.isConnected) {
+            if (search.nativeScrollOwned && search.nativeAlignmentComplete) {
+                clearForegroundSearch(search);
+                return null;
+            }
+            if (search.target && !search.nativeLocatePromise) {
+                recoverForegroundTarget(search);
+            }
+            return null;
+        }
 
         const context = createScrollContext(target);
+        search.target = target;
+        search.scrollContext = context;
+        if (search.nativeScrollOwned) {
+            search.lastGeometry =
+                target.getBoundingClientRect().top - context.viewportTop;
+            return target;
+        }
+
         const headerInset = getFixedHeaderInset(target, context);
         const targetTop = context.getTop() +
             target.getBoundingClientRect().top - context.viewportTop -
@@ -8231,8 +8408,6 @@
         extendScrollRangeTo(context, Math.max(0, targetTop));
         context.setTop(Math.max(0, targetTop));
 
-        search.target = target;
-        search.scrollContext = context;
         search.headerInset = headerInset;
         search.lastGeometry =
             target.getBoundingClientRect().top - context.viewportTop;
@@ -8316,6 +8491,91 @@
         return null;
     }
 
+    async function locateNativeSearchTarget(search) {
+        if (search.nativeLocatePromise) return search.nativeLocatePromise;
+        const locator = nativeLocator;
+        const locatorEpoch = nativeLocatorEpoch;
+        const isCurrent = () => isCurrentJumpSearch(search) &&
+            locator === nativeLocator && locatorEpoch === nativeLocatorEpoch &&
+            (search.settleDeadline == null || Date.now() < search.settleDeadline);
+        const operation = (async () => {
+            if (!isCurrent()) return {target: null, reason: 'CANCELLED'};
+            if (!locator) {
+                return {target: null, reason: nativeLocatorError
+                    ? getDiagnosticCode(nativeLocatorError, 'NATIVE_LOCATOR_UNAVAILABLE')
+                    : 'locator-unavailable', native: false};
+            }
+            try {
+                const located = await locator.locateMessage(search.messageId, isCurrent);
+                if (!isCurrent()) return {target: null, reason: 'CANCELLED'};
+                if (!located) return {
+                    target: null,
+                    reason: 'message-not-in-native-entries',
+                    native: false
+                };
+                const timeoutMs = search.settleDeadline == null ? 1200 :
+                    Math.min(1200, Math.max(0, search.settleDeadline - Date.now()));
+                const target = await waitForMountedMessage(search, search.messageId, timeoutMs);
+                return {
+                    target: isCurrent() ? target : null,
+                    reason: 'native-target-not-mounted',
+                    native: Boolean(target)
+                };
+            } catch (error) {
+                return {
+                    target: null,
+                    reason: getDiagnosticCode(error, 'NATIVE_LOCATOR_FAILED'),
+                    native: false
+                };
+            }
+        })();
+        search.nativeLocatePromise = operation;
+        try {
+            return await operation;
+        } finally {
+            if (search.nativeLocatePromise === operation) search.nativeLocatePromise = null;
+        }
+    }
+
+    function recoverForegroundTarget(search) {
+        if (search.recoveryPromise) return search.recoveryPromise;
+        if (!isCurrentJumpSearch(search) || !search.messageId ||
+            Date.now() >= search.settleDeadline) {
+            clearForegroundSearch(search);
+            return null;
+        }
+        const recoveryAttempt = (search.recoveryAttempts || 0) + 1;
+        if (recoveryAttempt > 2) {
+            clearForegroundSearch(search);
+            return null;
+        }
+        search.recoveryAttempts = recoveryAttempt;
+        const wasSettled = search.settled;
+        search.settled = false;
+        const operation = (async () => {
+            try {
+                const nativeResult = await locateNativeSearchTarget(search);
+                if (!isCurrentJumpSearch(search) || !nativeResult.target?.isConnected ||
+                    Date.now() >= search.settleDeadline) {
+                    clearForegroundSearch(search);
+                    return;
+                }
+                search.nativeScrollOwned = nativeResult.native;
+                search.target = nativeResult.target;
+                search.scrollContext = createScrollContext(nativeResult.target);
+                installCoordinatorObservers(search, nativeResult.target);
+                search.settled = wasSettled;
+                if (search.recoveryPromise === operation) search.recoveryPromise = null;
+            } catch (_error) {
+                clearForegroundSearch(search);
+            } finally {
+                if (search.recoveryPromise === operation) search.recoveryPromise = null;
+            }
+        })();
+        search.recoveryPromise = operation;
+        return operation;
+    }
+
     function getDOMSearchEstimate(search) {
         const targetIndex = turns.findIndex(turn => turn.identity === search.identity);
         if (targetIndex < 0) return null;
@@ -8396,8 +8656,9 @@
     }
 
     async function waitForForegroundSettle(search) {
-        const deadline = Date.now() + 15000;
+        const deadline = search.settleDeadline ??= Date.now() + 15000;
         let previousGeometry = null;
+        let previousScrollHeight = null;
         let stableFrames = 0;
         while (Date.now() < deadline && isCurrentJumpSearch(search)) {
             const target = correctForegroundTarget(search);
@@ -8408,19 +8669,42 @@
             installCoordinatorObservers(search, target);
             await waitForAnimationFrame();
             if (!isCurrentJumpSearch(search)) return false;
+            if (!target.isConnected || resolveSearchTarget(search) !== target) {
+                previousGeometry = null;
+                stableFrames = 0;
+                continue;
+            }
             const context = search.scrollContext;
             const geometry =
                 target.getBoundingClientRect().top - context.viewportTop;
+            const scrollHeight = context.container.scrollHeight;
             if (
                 previousGeometry !== null &&
-                Math.abs(geometry - previousGeometry) <= 0.75
+                Math.abs(geometry - previousGeometry) <= 0.75 &&
+                previousScrollHeight === scrollHeight
             ) {
                 stableFrames += 1;
             } else {
                 stableFrames = 0;
             }
             previousGeometry = geometry;
+            previousScrollHeight = scrollHeight;
             if (stableFrames >= 3) {
+                if (search.nativeScrollOwned && !search.nativeAlignmentComplete) {
+                    const headerInset = getFixedHeaderInset(target, context);
+                    const desiredTop = context.getTop() +
+                        target.getBoundingClientRect().top -
+                        context.viewportTop -
+                        headerInset;
+                    if (Math.abs(desiredTop - context.getTop()) > 0.75) {
+                        context.setTop(Math.max(0, desiredTop));
+                    }
+                    search.nativeAlignmentComplete = true;
+                    previousGeometry = null;
+                    previousScrollHeight = null;
+                    stableFrames = 0;
+                    continue;
+                }
                 const index = turns.findIndex(turn =>
                     turn.identity === search.identity
                 );
@@ -8461,38 +8745,19 @@
                 return;
             }
 
-            if (!target && search.messageId) {
-                let fallbackReason = 'locator-unavailable';
-                const locator = nativeLocator;
-                const locatorEpoch = nativeLocatorEpoch;
-                if (locator) {
-                    try {
-                        const located = await locator.locateMessage(
-                            search.messageId,
-                            () => isCurrentJumpSearch(search)
-                        );
-                        if (!isCurrentJumpSearch(search)) {
-                            clearForegroundSearch(search);
-                            return;
-                        }
-                        fallbackReason = located
-                            ? 'native-target-not-mounted'
-                            : 'message-not-in-native-entries';
-                        if (located) {
-                            target = await waitForMountedMessage(search, search.messageId);
-                        }
-                    } catch (error) {
-                        fallbackReason = getDiagnosticCode(error, 'NATIVE_LOCATOR_FAILED');
-                    }
-                    if (locator !== nativeLocator || locatorEpoch !== nativeLocatorEpoch) {
-                        target = null;
-                    }
-                } else if (nativeLocatorError) {
-                    fallbackReason = getDiagnosticCode(nativeLocatorError, 'NATIVE_LOCATOR_UNAVAILABLE');
+            if (search.messageId && (!target || nativeLocator)) {
+                const mountedTarget = target;
+                if (nativeLocator) search.nativeScrollOwned = true;
+                const nativeResult = await locateNativeSearchTarget(search);
+                if (!isCurrentJumpSearch(search)) {
+                    clearForegroundSearch(search);
+                    return;
                 }
+                search.nativeScrollOwned = Boolean(nativeResult.native && nativeResult.target);
+                target = nativeResult.target || mountedTarget;
 
                 if (!target && isCurrentJumpSearch(search)) {
-                    console.info(`[Conversation Navigator] Jump using bounded DOM search (${fallbackReason})`);
+                    console.info(`[Conversation Navigator] Jump using bounded DOM search (${nativeResult.reason})`);
                     const fallback = await runDOMSearchFallback(search);
                     if (!isCurrentJumpSearch(search)) {
                         clearForegroundSearch(search);
@@ -8555,17 +8820,18 @@
         }
 
         const candidates = [];
-        for (const element of document.querySelectorAll(MESSAGE_ELEMENT_SELECTOR)) {
-            if (!element.isConnected) continue;
-            const ids = element.hasAttribute('data-chatgpt-selection-message-id')
+        for (const candidate of document.querySelectorAll(MESSAGE_ELEMENT_SELECTOR)) {
+            if (!candidate.isConnected) continue;
+            const isSelectionMessage = candidate.hasAttribute('data-chatgpt-selection-message-id');
+            const element = isSelectionMessage ? candidate : getUserMessageBubble(candidate);
+            if (!element?.isConnected) continue;
+            const ids = isSelectionMessage
                 ? [element.getAttribute('data-chatgpt-selection-message-id')]
-                : getMessageIds(
-                    element.getAttribute('data-chatgpt-search-message-ids') ||
-                    element.getAttribute('data-message-id') ||
-                    ''
-                );
+                : getUserMessageIds(element);
             const messageId = ids.find(Boolean);
-            if (!messageId) continue;
+            if (!messageId || candidates.some(existing =>
+                existing.element === element && existing.messageId === messageId
+            )) continue;
             const rect = element.getBoundingClientRect();
             const context = createScrollContext(element);
             const viewportHeight = context.isDocumentScroll
@@ -10506,7 +10772,7 @@
      ******************************************************************/
 
     function init() {
-        console.info('[Conversation Navigator] Started (0.5.5)');
+        console.info('[Conversation Navigator] Started (0.5.6)');
         initializeReplyOutlinePreferences();
         currentChatIdentity = getChatIdentity();
         ensureUI();

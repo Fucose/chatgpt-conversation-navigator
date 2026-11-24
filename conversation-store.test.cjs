@@ -24,15 +24,15 @@ function loadStoreRuntime() {
         getAttribute(name) { return this.attributes[name] ?? null; }
         matches(selector) {
             return selector.split(',').some(part => {
-                const item = part.trim();
-                if (item === '[data-turn-key]') return Boolean(this.getAttribute('data-turn-key'));
-                if (item === '[data-content-search-turn-key]') return Boolean(this.getAttribute('data-content-search-turn-key'));
-                if (item === '[data-user-message-bubble="true"]') return this.getAttribute('data-user-message-bubble') === 'true';
-                if (item === '[data-chatgpt-selection-message-id]') return Boolean(this.getAttribute('data-chatgpt-selection-message-id'));
-                if (item === '[data-markdown-text-style="assistant-message"]') return this.getAttribute('data-markdown-text-style') === 'assistant-message';
-                if (item.includes('data-content-search-unit-key')) return (this.getAttribute('data-content-search-unit-key') || '').endsWith(':assistant');
-                if (item.includes('data-chatgpt-search-unit-key')) return (this.getAttribute('data-chatgpt-search-unit-key') || '').includes('assistant');
-                return false;
+                const checks = Array.from(part.trim().matchAll(/\[([\w-]+)(?:([*$]?=)"([^"]*)")?\]/g));
+                return checks.length > 0 && checks.every(([, name, operator, expected]) => {
+                    const value = this.getAttribute(name);
+                    if (!operator) return value !== null;
+                    if (value === null) return false;
+                    if (operator === '$=') return value.endsWith(expected);
+                    if (operator === '*=') return value.includes(expected);
+                    return value === expected;
+                });
             });
         }
         closest(selector) {
@@ -80,6 +80,8 @@ function loadStoreRuntime() {
             snapshotChanges: applyNativeSnapshotWithChanges,
             observe(observed) { mergeObservedTurnRecords(observed, true, true, true); },
             render: buildRenderedTurns,
+            messageIds: getTurnMessageIds,
+            userIdentity: getUserStableIdentity,
             previewText(turn) { return getAssistantText(turn); },
             refresh: updateObservedTurnContent,
             rememberEdit(turn) { rememberUserEditCandidate(turn, null); },
@@ -123,7 +125,7 @@ function loadStoreRuntime() {
         };
     }
 
-    return {runtime: context.storeTest, userTurn, assistantTurn};
+    return {runtime: context.storeTest, userTurn, assistantTurn, Element};
 }
 
 function native(identity, turnKey, userId, userText, assistantIds = []) {
@@ -172,6 +174,72 @@ test('DOM observation and a rekeyed native snapshot share one record and migrate
     assert.equal(record.root, observed.root);
     assert.equal(record.userText, 'native question');
     assert.equal(record.assistantText, 'native answer');
+});
+
+test('nested user units retain wrapper message IDs in stable identities and stored observations', () => {
+    const {runtime, Element} = loadStoreRuntime();
+    runtime.setCurrent('conversation:chat');
+    const root = new Element({'data-content-search-turn-key': 'fallback-turn-5'});
+    const outerUnit = root.append(new Element({
+        'data-chatgpt-search-unit-key': 'fallback-turn-5:0:user',
+        'data-chatgpt-search-message-ids': 'question-5'
+    }));
+    const innerUnit = outerUnit.append(new Element({
+        'data-content-search-unit-key': 'fallback-turn-5:0:user'
+    }));
+    const userBubble = innerUnit.append(new Element({'data-user-message-bubble': 'true'}, 'Question five'));
+    const identity = runtime.userIdentity(userBubble, root);
+    const observed = {identity, kind: 'user', root, userBubble, stableIdentity: true};
+
+    assert.equal(identity, 'user:question-5');
+    assert.deepEqual(Array.from(runtime.messageIds(observed).userMessageIds), ['question-5']);
+    runtime.observe([observed]);
+    const record = runtime.store('conversation:chat').byIdentity.get(identity);
+    assert.equal(record.userMessageId, 'question-5');
+    assert.equal(record.messageId, 'question-5');
+    assert.equal(record.userText, 'Question five');
+    assert.equal(runtime.snapshot({chatId: 'chat', branchKey: 'branch', entries: [
+        native('user:native-turn-5', 'native-turn-5', 'question-5', 'Question five')
+    ]}), true);
+    assert.equal(runtime.store('conversation:chat').byIdentity.get('user:native-turn-5'), record);
+});
+
+test('user wrapper ID lookup rejects assistant ancestors, generic parents, neighboring IDs and multiple bubbles', () => {
+    const {runtime, Element} = loadStoreRuntime();
+    for (const attributes of [
+        {'data-chatgpt-search-unit-key': 'turn:assistant', 'data-chatgpt-search-message-ids': 'assistant-id'},
+        {'data-chatgpt-search-message-ids': 'generic-parent-id'}
+    ]) {
+        const root = new Element(attributes);
+        const userBubble = root.append(new Element({'data-user-message-bubble': 'true'}));
+        assert.deepEqual(Array.from(runtime.messageIds({kind: 'user', root, userBubble}).userMessageIds), []);
+    }
+
+    const root = new Element({'data-turn-key': 'turn-1'});
+    const neighboringUnit = root.append(new Element({
+        'data-chatgpt-search-unit-key': 'turn-1:0:user',
+        'data-chatgpt-search-message-ids': 'neighbor-id'
+    }));
+    neighboringUnit.append(new Element({'data-user-message-bubble': 'true'}));
+    const ownUnit = root.append(new Element({'data-chatgpt-search-unit-key': 'turn-1:1:user'}));
+    const userBubble = ownUnit.append(new Element({'data-user-message-bubble': 'true'}));
+    assert.deepEqual(Array.from(runtime.messageIds({kind: 'user', root, userBubble}).userMessageIds), []);
+
+    const carrier = new Element({
+        'data-content-search-unit-key': 'turn-2:user',
+        'data-chatgpt-search-message-ids': 'ambiguous-id'
+    });
+    const firstBubble = carrier.append(new Element({'data-user-message-bubble': 'true'}));
+    carrier.append(new Element({'data-user-message-bubble': 'true'}));
+    assert.deepEqual(Array.from(runtime.messageIds({userBubble: firstBubble}).userMessageIds), []);
+
+    const outerUser = new Element({
+        'data-chatgpt-search-unit-key': 'turn-3:user',
+        'data-chatgpt-search-message-ids': 'outer-user-id'
+    });
+    const assistant = outerUser.append(new Element({'data-content-search-unit-key': 'turn-3:assistant'}));
+    const nestedBubble = assistant.append(new Element({'data-user-message-bubble': 'true'}));
+    assert.deepEqual(Array.from(runtime.messageIds({userBubble: nestedBubble}).userMessageIds), []);
 });
 
 test('assistant-only DOM units retain search message IDs after virtualization', () => {

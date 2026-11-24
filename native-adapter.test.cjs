@@ -582,6 +582,24 @@ function configurePendingPageLoad(fixture) {
     };
 }
 
+function installTurnListConsumers(fixture) {
+    const historyFiber = fixture.fiber;
+    const {conversationId, entries} = historyFiber.memoizedProps;
+    delete historyFiber.memoizedProps.entries;
+    delete historyFiber.memoizedProps.ref;
+    const turnListApi = {
+        getEntriesInViewport() {}, getRowElement() {}, getEntryGeometry() {},
+        measureTurnBeforePaint() {}, scrollToKey() {}
+    };
+    const consumers = [0, 1].map(() => ({
+        return: historyFiber.return, child: null, sibling: null,
+        memoizedProps: {conversationId, entries, turnListApi}
+    }));
+    historyFiber.sibling = consumers[0];
+    consumers[0].sibling = consumers[1];
+    return {turnListApi, consumers};
+}
+
 function olderEntry(id = 'entry-0', messageId = 'message-0') {
     return {
         id,
@@ -615,6 +633,47 @@ async function assertReadableAdapter(fixture) {
 
 test('discovers the current-style graph through source-linked exports', async () => {
     await assertReadableAdapter(makeFixture());
+});
+
+test('reads and loads native history with duplicated turn-list consumers and a separate AppScope fiber', async () => {
+    const fixture = makeFixture();
+    installTurnListConsumers(fixture);
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    const before = adapter.readSnapshot();
+    assert.equal(before.chatId, fixture.chatId);
+    assert.equal(before.entries.length, 1);
+    assert.equal(before.entries[0].userText, 'hello');
+    assert.equal(before.entries[0].assistantText, 'hi');
+    assert.equal(before.pagination.canLoadPrevious, true);
+
+    const after = await adapter.loadPreviousPage();
+    assert.equal(fixture.values.loadCalls, 1);
+    assert.equal(fixture.values.flushCalls, 1);
+    assert.equal(fixture.values.lastRequest.endpoint, '/conversations/{conversation_id}/messages');
+    assert.equal(after.entries.length, 2);
+    assert.equal(after.entries[0].messageId, 'message-0');
+    assert.equal(after.pagination.complete, true);
+    adapter.dispose();
+});
+
+test('rejects conflicting turn-list consumers after the native adapter connects', async () => {
+    const fixture = makeFixture();
+    const {consumers, turnListApi} = installTurnListConsumers(fixture);
+    const adapter = await loadCore(fixture).createNativeAdapter(adapterOptions(fixture));
+    consumers[1].memoizedProps.entries = fixture.entries.slice();
+    assert.throws(
+        () => adapter.readSnapshot(),
+        error => error.code === 'AMBIGUOUS_ACTIVE_CONVERSATION'
+    );
+    consumers[1].memoizedProps.entries = fixture.entries;
+    consumers[1].memoizedProps.turnListApi = {...turnListApi};
+    assert.throws(
+        () => adapter.readSnapshot(),
+        error => error.code === 'AMBIGUOUS_ACTIVE_CONVERSATION'
+    );
+    consumers[1].memoizedProps.turnListApi = turnListApi;
+    assert.equal(adapter.readSnapshot().entries.length, 1);
+    adapter.dispose();
 });
 
 test('discovers legacy module IDs without depending on MrG or fixed export letters', async () => {

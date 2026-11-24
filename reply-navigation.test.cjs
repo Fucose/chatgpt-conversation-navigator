@@ -275,6 +275,60 @@ test('heading jumps beyond the current scroll limit extend range and still progr
     );
 });
 
+test('repeated scroll-range extensions restore the first original padding and priority', () => {
+    for (const priority of ['', 'important']) {
+        const runtime = loadReplyNavigationRuntime();
+        const context = makeScrollRangeTestContext('10px', priority);
+        runtime.extendScrollRange(context, 190);
+        assert.equal(context.container.style.getPropertyValue('padding-bottom'), '102px');
+        runtime.extendScrollRange(context, 240);
+        assert.equal(context.container.style.getPropertyValue('padding-bottom'), '152px');
+        runtime.clearScrollRange();
+
+        assert.equal(context.container.style.getPropertyValue('padding-bottom'), '10px');
+        assert.equal(context.container.style.getPropertyPriority('padding-bottom'), priority);
+    }
+});
+
+test('switching scroll-range containers restores each container original padding', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const first = makeScrollRangeTestContext('10px', 'important');
+    const second = makeScrollRangeTestContext('20px', '');
+    runtime.extendScrollRange(first, 190);
+    runtime.extendScrollRange(second, 240);
+
+    assert.equal(first.container.style.getPropertyValue('padding-bottom'), '10px');
+    assert.equal(first.container.style.getPropertyPriority('padding-bottom'), 'important');
+    assert.notEqual(second.container.style.getPropertyValue('padding-bottom'), '20px');
+    runtime.clearScrollRange();
+    assert.equal(second.container.style.getPropertyValue('padding-bottom'), '20px');
+    assert.equal(second.container.style.getPropertyPriority('padding-bottom'), '');
+});
+
+test('scroll-range cleanup preserves padding changed by an outside owner', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const context = makeScrollRangeTestContext('10px', '');
+    runtime.extendScrollRange(context, 190);
+    context.container.style.setProperty('padding-bottom', '77px', 'important');
+    runtime.clearScrollRange();
+    assert.equal(context.container.style.getPropertyValue('padding-bottom'), '77px');
+    assert.equal(context.container.style.getPropertyPriority('padding-bottom'), 'important');
+
+    runtime.extendScrollRange(context, 240);
+    context.container.style.setProperty('padding-bottom', '55px', '');
+    runtime.extendScrollRange(context, 280);
+    runtime.clearScrollRange();
+    assert.equal(context.container.style.getPropertyValue('padding-bottom'), '55px');
+    assert.equal(context.container.style.getPropertyPriority('padding-bottom'), '');
+
+    runtime.extendScrollRange(context, 300);
+    const appliedValue = context.container.style.getPropertyValue('padding-bottom');
+    context.container.style.setProperty('padding-bottom', appliedValue, '');
+    runtime.clearScrollRange();
+    assert.equal(context.container.style.getPropertyValue('padding-bottom'), appliedValue);
+    assert.equal(context.container.style.getPropertyPriority('padding-bottom'), '');
+});
+
 test('reply alignment uses the fixed header and bottom overlay edges', () => {
     const topDelta = computeReplyScrollDelta({
         targetTop: 250,
@@ -1682,6 +1736,332 @@ test('assistant reply target resolves from a search ID without a selection node'
     assert.equal(resolved.target, assistantUnit);
 });
 
+test('user navigation finds an ID-bearing user unit immediately without mounted turn references', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const messageId = 'user-wrapper-message';
+    const unit = makeMessageElement({
+        'data-chatgpt-search-unit-key': 'fallback-turn-5:0:user',
+        'data-chatgpt-search-message-ids': messageId
+    });
+    const innerUnit = unit.appendChild(makeMessageElement({
+        'data-content-search-unit-key': 'fallback-turn-5:0:user'
+    }));
+    const bubble = innerUnit.appendChild(makeMessageElement({'data-user-message-bubble': 'true'}));
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    runtime.install({ui: makeNavigationTestUI(), turns: [entry]});
+    runtime.setMessageElements([unit, innerUnit, bubble]);
+
+    assert.equal(entry.root, undefined);
+    assert.equal(bubble.getAttribute('data-chatgpt-search-message-ids'), null);
+    assert.equal(runtime.resolveEntryTarget(entry, {replyTop: false}).target, bubble);
+    assert.equal(runtime.resolveEntryTarget({
+        ...entry, userMessageId: 'user-wrapper'
+    }, {replyTop: false}).target, null);
+});
+
+test('user navigation retains legacy bubble IDs and keeps neighboring user units separate', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const bubbles = [
+        makeMessageElement({'data-user-message-bubble': 'true', 'data-message-id': 'legacy-message'}),
+        makeMessageElement({'data-user-message-bubble': 'true', 'data-chatgpt-search-message-ids': 'legacy-search-message'})
+    ];
+    const unit = makeMessageElement({
+        'data-content-search-unit-key': 'turn-2:user',
+        'data-chatgpt-search-message-ids': 'wrapper-message'
+    });
+    const wrapperBubble = unit.appendChild(makeMessageElement({'data-user-message-bubble': 'true'}));
+    runtime.install({ui: makeNavigationTestUI()});
+    runtime.setMessageElements([...bubbles, unit, wrapperBubble]);
+
+    for (const [messageId, expected] of [
+        ['legacy-message', bubbles[0]],
+        ['legacy-search-message', bubbles[1]],
+        ['wrapper-message', wrapperBubble]
+    ]) {
+        const entry = {identity: `user:${messageId}`, kind: 'user', userMessageId: messageId};
+        assert.equal(runtime.resolveEntryTarget(entry, {replyTop: false}).target, expected);
+    }
+});
+
+test('reading anchors capture the same inner user bubble that restoration resolves', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const messageId = 'user-anchor-message';
+    const unit = makeMessageElement({
+        'data-chatgpt-search-unit-key': 'fallback-turn-5:0:user',
+        'data-chatgpt-search-message-ids': messageId
+    });
+    const bubble = unit.appendChild(makeMessageElement({'data-user-message-bubble': 'true'}));
+    unit.rect = {top: 100, bottom: 200, left: 300, right: 700, width: 400, height: 100};
+    bubble.rect = {...unit.rect, top: 152, height: 48};
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    runtime.install({ui: makeNavigationTestUI(), turns: [entry]});
+    runtime.setMessageElements([unit, bubble]);
+
+    const anchor = runtime.readingAnchor({scrollHeight: 1600, clientHeight: 800, scrollTop: 0});
+    assert.equal(anchor.identity, entry.identity);
+    assert.equal(anchor.messageId, messageId);
+    assert.equal(anchor.offset, 152);
+    assert.equal(runtime.readingAnchorTarget(anchor), bubble);
+});
+
+test('a settled foreground jump reacquires a recycled message once and resumes alignment', async () => {
+    const runtime = loadReplyNavigationRuntime();
+    runtime.install({ui: makeNavigationTestUI()});
+    const messageId = 'recycled-user-message';
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    const oldTarget = makeMessageElement({'data-user-message-bubble': 'true'});
+    oldTarget.isConnected = false;
+    const unit = makeMessageElement({
+        'data-chatgpt-search-unit-key': 'turn-5:user',
+        'data-chatgpt-search-message-ids': messageId
+    });
+    const replacement = unit.appendChild(makeMessageElement({'data-user-message-bubble': 'true'}));
+    let calls = 0;
+    let finish;
+    const locator = {locateMessage(id, isCurrent) {
+        calls += 1;
+        assert.equal(id, messageId);
+        return new Promise(resolve => {
+            finish = () => {
+                assert.equal(isCurrent(), true);
+                runtime.setMessageElements([unit, replacement]);
+                resolve(true);
+            };
+        });
+    }};
+    const deadline = Date.now() + 15000;
+    const search = runtime.beginForegroundSearch({entry, target: oldTarget, locator, deadline});
+    runtime.correctForeground(search);
+    runtime.correctForeground(search);
+    runtime.correctForeground(search);
+    const recovery = search.recoveryPromise;
+    assert.equal(calls, 1);
+    assert.equal(search.settled, false);
+    finish();
+    for (let frame = 0; frame < 12; frame += 1) {
+        await Promise.resolve();
+        runtime.advanceAnimation(16);
+    }
+    await recovery;
+
+    assert.equal(search.target, replacement);
+    assert.equal(search.settled, true);
+    assert.equal(search.settleDeadline, deadline);
+    assert.equal(runtime.currentForegroundSearch(), search);
+    runtime.correctForeground(search);
+    assert.equal(calls, 1);
+});
+
+test('foreground recovery can reacquire a second recycled node after the first handoff', async () => {
+    const runtime = loadReplyNavigationRuntime();
+    runtime.install({ui: makeNavigationTestUI()});
+    const messageId = 'twice-recycled-message';
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    const oldTarget = makeMessageElement();
+    oldTarget.isConnected = false;
+    const replacements = [0, 1].map(() => {
+        const unit = makeMessageElement({
+            'data-chatgpt-search-unit-key': 'turn-5:user',
+            'data-chatgpt-search-message-ids': messageId
+        });
+        const bubble = unit.appendChild(makeMessageElement({'data-user-message-bubble': 'true'}));
+        return {unit, bubble};
+    });
+    const requests = [];
+    const locator = {locateMessage(id, isCurrent) {
+        assert.equal(id, messageId);
+        return new Promise(resolve => requests.push(() => {
+            assert.equal(isCurrent(), true);
+            const {unit, bubble} = replacements[requests.length - 1];
+            runtime.setMessageElements([unit, bubble]);
+            resolve(true);
+        }));
+    }};
+    const deadline = Date.now() + 15000;
+    const search = runtime.beginForegroundSearch({entry, target: oldTarget, locator, deadline});
+    runtime.correctForeground(search);
+    const firstRecovery = search.recoveryPromise;
+    requests[0]();
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+    assert.equal(search.target, replacements[0].bubble);
+    assert.equal(search.settled, true);
+    assert.equal(runtime.pendingAnimations(), 0);
+
+    replacements[0].bubble.isConnected = false;
+    runtime.setMessageElements([]);
+    runtime.correctForeground(search);
+    runtime.correctForeground(search);
+    assert.equal(requests.length, 2);
+    const secondRecovery = search.recoveryPromise;
+    requests[1]();
+    for (let frame = 0; frame < 12; frame += 1) {
+        await Promise.resolve();
+        runtime.advanceAnimation(16);
+    }
+    await Promise.all([firstRecovery, secondRecovery]);
+
+    assert.equal(search.target, replacements[1].bubble);
+    assert.equal(search.settled, true);
+    assert.equal(search.settleDeadline, deadline);
+    assert.equal(runtime.currentForegroundSearch(), search);
+    assert.equal(requests.length, 2);
+});
+
+test('foreground recovery cannot scroll after a new jump, user input, route change or locator replacement', async () => {
+    for (const cancellation of ['new-jump', 'user-input', 'route-change', 'locator-replacement']) {
+        const runtime = loadReplyNavigationRuntime();
+        runtime.install({ui: makeNavigationTestUI()});
+        const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: 'message-5'};
+        const oldTarget = makeMessageElement();
+        oldTarget.isConnected = false;
+        let finish;
+        let lateScrolls = 0;
+        const locator = {locateMessage(_id, isCurrent) {
+            return new Promise(resolve => {
+                finish = () => {
+                    if (isCurrent()) lateScrolls += 1;
+                    resolve(true);
+                };
+            });
+        }};
+        const search = runtime.beginForegroundSearch({entry, target: oldTarget, locator});
+        runtime.correctForeground(search);
+        const recovery = search.recoveryPromise;
+        let newerSearch;
+        if (cancellation === 'new-jump') {
+            newerSearch = runtime.beginForegroundSearch({entry, target: oldTarget, locator});
+        } else if (cancellation === 'user-input') {
+            runtime.cancelForegroundForUserInput();
+        } else if (cancellation === 'route-change') {
+            runtime.setPathname('/c/another-chat');
+        } else {
+            runtime.replaceForegroundLocator({locateMessage: async () => false});
+        }
+        finish();
+        await recovery;
+
+        assert.equal(lateScrolls, 0, cancellation);
+        assert.equal(search.cancelled, true, cancellation);
+        assert.equal(runtime.currentForegroundSearch(), newerSearch || null, cancellation);
+    }
+});
+
+test('failed native recovery and removed message membership stop further recovery attempts', async () => {
+    for (const result of ['not-found', 'error', 'removed']) {
+        const runtime = loadReplyNavigationRuntime();
+        runtime.install({ui: makeNavigationTestUI()});
+        const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: 'message-5'};
+        const oldTarget = makeMessageElement();
+        oldTarget.isConnected = false;
+        let finish;
+        let calls = 0;
+        const locator = {locateMessage() {
+            calls += 1;
+            return new Promise((resolve, reject) => {
+                finish = () => result === 'error'
+                    ? reject(new Error('Native scroll failed'))
+                    : resolve(result === 'removed');
+            });
+        }};
+        const search = runtime.beginForegroundSearch({entry, target: oldTarget, locator});
+        runtime.correctForeground(search);
+        const recovery = search.recoveryPromise;
+        if (result === 'removed') entry.userMessageId = 'replacement-message';
+        finish();
+        await recovery;
+        runtime.correctForeground(search);
+
+        assert.equal(calls, 1, result);
+        assert.equal(search.cancelled, true, result);
+        assert.equal(runtime.currentForegroundSearch(), null, result);
+    }
+});
+
+test('foreground recovery ends when its original settle budget has expired', () => {
+    const runtime = loadReplyNavigationRuntime();
+    runtime.install({ui: makeNavigationTestUI()});
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: 'message-5'};
+    const oldTarget = makeMessageElement();
+    oldTarget.isConnected = false;
+    let calls = 0;
+    const locator = {locateMessage() { calls += 1; return true; }};
+    const search = runtime.beginForegroundSearch({entry, target: oldTarget, locator, deadline: Date.now() - 1});
+    runtime.correctForeground(search);
+
+    assert.equal(calls, 0);
+    assert.equal(search.cancelled, true);
+    assert.equal(runtime.currentForegroundSearch(), null);
+});
+
+test('native-owned foreground correction observes the target without writing scroll state', () => {
+    const runtime = loadReplyNavigationRuntime();
+    const messageId = 'native-owned-message';
+    const unit = makeMessageElement({
+        'data-chatgpt-search-unit-key': 'turn-5:user',
+        'data-chatgpt-search-message-ids': messageId
+    });
+    const bubble = unit.appendChild(makeMessageElement({
+        'data-user-message-bubble': 'true'
+    }));
+    bubble.rect = {left: 300, right: 700, top: 60, bottom: 108, width: 400, height: 48};
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    runtime.install({ui: makeNavigationTestUI(), turns: [entry]});
+    runtime.setMessageElements([unit, bubble]);
+    const search = runtime.beginForegroundSearch({
+        entry,
+        target: bubble,
+        locator: {locateMessage: async () => true},
+        nativeScrollOwned: true
+    });
+
+    assert.equal(runtime.correctForeground(search), bubble);
+    assert.equal(search.nativeScrollOwned, true);
+    assert.equal(search.target, bubble);
+    assert.equal(search.scrollContext.container.scrollTop, 0);
+    assert.equal(search.scrollContext.container.style, undefined);
+});
+
+test('native-owned foreground alignment runs once after layout stabilizes and then stops recovery', async () => {
+    const runtime = loadReplyNavigationRuntime();
+    const messageId = 'native-aligned-message';
+    const unit = makeMessageElement({
+        'data-chatgpt-search-unit-key': 'turn-5:user',
+        'data-chatgpt-search-message-ids': messageId
+    });
+    const bubble = unit.appendChild(makeMessageElement({
+        'data-user-message-bubble': 'true'
+    }));
+    bubble.rect = {left: 300, right: 700, top: 60, bottom: 108, width: 400, height: 48};
+    const entry = {identity: 'user:turn-5', kind: 'user', userMessageId: messageId};
+    runtime.install({ui: makeNavigationTestUI(), turns: [entry]});
+    runtime.setMessageElements([unit, bubble]);
+    let nativeCalls = 0;
+    const search = runtime.beginForegroundSearch({
+        entry,
+        target: bubble,
+        locator: {locateMessage: async () => { nativeCalls += 1; return true; }},
+        nativeScrollOwned: true
+    });
+
+    const settled = runtime.settleForeground(search);
+    for (let frame = 0; frame < 12; frame += 1) {
+        await Promise.resolve();
+        runtime.advanceAnimation(16);
+    }
+    await settled;
+
+    assert.equal(search.scrollContext.container.scrollTop, 60);
+    assert.equal(search.nativeAlignmentComplete, true);
+    assert.equal(search.settled, true);
+
+    bubble.isConnected = false;
+    runtime.setMessageElements([]);
+    runtime.correctForeground(search);
+
+    assert.equal(nativeCalls, 0);
+    assert.equal(runtime.currentForegroundSearch(), null);
+});
+
 test('assistant reply navigation skips unanswered entries and advances pending virtual targets', () => {
     const runtime = loadReplyNavigationRuntime();
     const ui = makeNavigationTestUI();
@@ -1751,6 +2131,7 @@ function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
         currentReplyContext: null,
         sidebarGeometry: null,
         contentLayouts: [],
+        messageElements: [],
         jumpCalls: [],
         activeSearch: null,
         now: 0,
@@ -1792,7 +2173,7 @@ function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
         querySelectorAll(selector) {
             return selector === '[class*="thread-scroll-layout"]'
                 ? testState.contentLayouts
-                : [];
+                : testState.messageElements.filter(element => element.matches(selector));
         },
         getElementById() { return null; },
         createElement() { return makeTestElement(); },
@@ -1882,6 +2263,7 @@ function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
             setContentLayouts(layouts) {
                 testState.contentLayouts = layouts;
             },
+            setMessageElements(elements) { testState.messageElements = elements; },
             findContentLayout(context) {
                 return getReplyThreadContentLayout(context);
             },
@@ -1899,6 +2281,8 @@ function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
                 );
             },
             restoreContentShift: restoreReplyOutlineContentShift,
+            extendScrollRange: extendScrollRangeTo,
+            clearScrollRange: clearExtendedScrollRange,
             advanceAnimation(ms) {
                 testState.now += Number(ms) || 0;
                 const callbacks = Array.from(testState.rafQueue.values());
@@ -1984,6 +2368,53 @@ function loadReplyNavigationRuntime({localStorage, windowHeight = 800} = {}) {
                     messageId,
                     target: findMountedMessageForEntry(entry, messageId)
                 };
+            },
+            readingAnchor(scrollContainer) {
+                document.scrollingElement = scrollContainer;
+                return getVisibleReadingAnchor();
+            },
+            readingAnchorTarget: findReadingAnchorTarget,
+            beginForegroundSearch({
+                entry,
+                target,
+                locator,
+                deadline = Date.now() + 15000,
+                nativeScrollOwned = false
+            }) {
+                cancelJumpSearch();
+                currentChatIdentity = 'conversation:chat';
+                window.location.pathname = '/c/chat';
+                turns = [entry];
+                nativeLocator = locator;
+                nativeLocatorEpoch += 1;
+                document.scrollingElement = {scrollHeight: 1600, clientHeight: 800, scrollTop: 0};
+                window.scrollY = 0;
+                window.scrollTo = (_left, top) => { window.scrollY = top; };
+                activeJumpSearch = {
+                    identity: entry.identity,
+                    messageId: entry.userMessageId,
+                    chatIdentity: currentChatIdentity,
+                    options: {},
+                    userScrollGeneration,
+                    settled: true,
+                    cancelled: false,
+                    correctionFrame: null,
+                    target,
+                    settleDeadline: deadline,
+                    nativeScrollOwned
+                };
+                return activeJumpSearch;
+            },
+            correctForeground: correctForegroundTarget,
+            settleForeground: waitForForegroundSettle,
+            currentForegroundSearch() { return activeJumpSearch; },
+            cancelForegroundForUserInput() {
+                userScrollGeneration += 1;
+                cancelJumpSearch();
+            },
+            replaceForegroundLocator(locator) {
+                nativeLocator = locator;
+                nativeLocatorEpoch += 1;
             },
             updateAssistantReplyNavigationButtons,
             updateReplyTopButton,
@@ -2141,6 +2572,52 @@ function matchesTestHeadingSelector(element, selector) {
 function matchesTestBoxContainerSelector(element, selector) {
     return selector === '[data-d-component="box"]' &&
         element.getAttribute('data-d-component') === 'box';
+}
+
+function makeMessageElement(attributes = {}) {
+    const element = makeTestElement();
+    for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+    element.hasAttribute = name => element.getAttribute(name) !== null;
+    element.matches = selector => selector.split(',').some(part => {
+        const checks = Array.from(part.trim().matchAll(/\[([\w-]+)(?:([*$]?=)"([^"]*)")?\]/g));
+        return checks.length > 0 && checks.every(([, name, operator, expected]) => {
+            const value = element.getAttribute(name);
+            if (!operator) return value !== null;
+            if (value === null) return false;
+            if (operator === '$=') return value.endsWith(expected);
+            if (operator === '*=') return value.includes(expected);
+            return value === expected;
+        });
+    });
+    element.closest = selector => {
+        for (let node = element; node; node = node.parentElement) {
+            if (node.matches(selector)) return node;
+        }
+        return null;
+    };
+    element.querySelectorAll = selector => element.children.flatMap(child => [
+        ...(child.matches(selector) ? [child] : []),
+        ...child.querySelectorAll(selector)
+    ]);
+    element.querySelector = selector => element.querySelectorAll(selector)[0] || null;
+    return element;
+}
+
+function makeScrollRangeTestContext(originalValue, originalPriority) {
+    const container = makeTestElement();
+    let value = originalValue;
+    let priority = originalPriority;
+    container.style = {
+        get paddingBottom() { return value || '0px'; },
+        getPropertyValue() { return value; },
+        getPropertyPriority() { return priority; },
+        setProperty(_name, nextValue, nextPriority = '') {
+            value = nextValue;
+            priority = nextPriority;
+        },
+        removeProperty() { value = ''; priority = ''; }
+    };
+    return {container, maxTop: () => 90 + (parseFloat(value) || 0)};
 }
 
 function makeTestElement({
